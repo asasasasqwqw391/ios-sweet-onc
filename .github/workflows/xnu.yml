@@ -72,7 +72,9 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
 
       - name: Package build tree for local compiles
         if: always()
@@ -85,7 +87,7 @@ jobs:
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu build.log \
             -C .. sdk-kernel-platform
           ls -la buildtree.tgz
 
@@ -113,6 +115,7 @@ jobs:
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp dxb/build.log out/build.log 2>/dev/null || true
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 

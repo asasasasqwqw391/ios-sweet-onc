@@ -1,22 +1,28 @@
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -289,8 +289,18 @@
+@@ -289,8 +289,24 @@
  void
  pe_gic_send_ipi(void)
  {
 +	/*
 +	 * onc: this is the signalCPU() path.  The only user in this port is
-+	 * SweetCPU::initCPU()'s self-IPI (XNU's cpu_signal_handler clears
-+	 * cpu_data.cpu_signal SIGPdisabled there, and SweetCPU::startAll() waits
-+	 * for it).  "All PEs except self" therefore excludes the only CPU when
-+	 * cpus=1 -- use "all PEs including self".  NSATT=1 makes it a Group 1
-+	 * SGI, which is the group this driver puts the SGI in (IGROUPR0=all 1)
-+	 * and what sleh_irq() handles.
++	 * SweetCPU::initCPU()'s self-IPI (cpu_signal_handler() clears
++	 * cpu_data.cpu_signal SIGPdisabled there; SweetCPU::startAll() waits for
++	 * it).  With cpus=1 the old "all PEs except self" (0b01) reached no CPU
++	 * at all, so the self-IPI never arrived.
++	 *
++	 * GICv2 TargetListFilter: 0b00 = CPUTargetList, 0b01 = all but self,
++	 * 0b10 = the requesting PE only, 0b11 = reserved.  This port only ever
++	 * signals itself, so 0b10 is exactly right; a future SMP path that
++	 * signals another PE must encode it in CPUTargetList (bits 23:16).
++	 *
++	 * NSATT stays 0: the stock Android kernel for this SoC issues its
++	 * non-secure self-IPIs the same way.
 +	 */
  	__builtin_arm_dsb(DSB_ISHST);
 -	gicd_write32(GICD_SGIR, GICD_SGIR_ALL_BUT_SELF | GICD_SGIR_SGI(SWEET_IPI_SGI));
-+	gicd_write32(GICD_SGIR, GICD_SGIR_NSATT | GICD_SGIR_ALL_INCLUDING_SELF |
++	gicd_write32(GICD_SGIR, GICD_SGIR_SELF_ONLY |
 +	    GICD_SGIR_SGI(SWEET_IPI_SGI));
  	__builtin_arm_isb(ISB_SY);
  }
@@ -24,13 +30,11 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -74,7 +74,9 @@
- #define GICC_CTLR_ENABLEGRP1A     (1U << 1)
+@@ -76,6 +76,7 @@
  
  #define GICD_SGIR_SGI(intid)      ((uint32_t)((intid) & 0xf))
-+#define GICD_SGIR_NSATT           (1U << 15)   /* send as Group 1 (NS access) */
  #define GICD_SGIR_ALL_BUT_SELF    (1U << 24)   /* TargetListFilter = 0b01 */
-+#define GICD_SGIR_ALL_INCLUDING_SELF (2U << 24) /* TargetListFilter = 0b10 */
++#define GICD_SGIR_SELF_ONLY       (2U << 24)   /* TargetListFilter = 0b10 */
  
  #define GIC_INTID_SPURIOUS_MIN    1020
  

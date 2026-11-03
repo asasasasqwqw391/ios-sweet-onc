@@ -1,0 +1,68 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -313,6 +313,28 @@
+ 			panic("%s: cannot find GIC MMIO regions in DT", __func__);
+ 		}
+ 
++		/*
++		 * onc: the architected-timer PPI number is board specific.  The ADT
++		 * declares it in /arm-io/gic "virtual-timer-intid" (20 on onclite:
++		 * the phone's own timer node lists PPIs 1..4, so the virtual timer is
++		 * INTID 16 + 4).  The GICv3 driver reads the same property; the GICv2
++		 * path kept the SM7150 default 19, so the timer PPI was never enabled
++		 * and sleh_irq() never recognised it -- every IOSleep() then blocked
++		 * forever.
++		 */
++		{
++			void const *timer_prop;
++			unsigned int timer_size;
++			if (SecureDTGetProperty(entry, "virtual-timer-intid",
++			    &timer_prop, &timer_size) == kSuccess &&
++			    timer_size == sizeof(uint32_t)) {
++				uint32_t intid = *(const uint32_t *)timer_prop;
++				if (intid >= 16 && intid < 32) {
++					sweet_vtimer_intid = intid;
++				}
++			}
++		}
++
+ 		soc_base_phys = pe_arm_get_soc_base_phys();
+ 		gicd_base = ml_io_map(soc_base_phys + ((uint64_t const *) prop)[0],
+ 		    ((uint64_t const *) prop)[1]);
+@@ -322,7 +344,7 @@
+ 			panic("%s: cannot map GICD/GICC regions", __func__);
+ 		}
+ 		kprintf("SWEET GICv2: GICD %p GICC %p, vtimer INTID %u, SGI %u\n",
+-		    (void *) gicd_base, (void *) gicc_base, SWEET_VTIMER_INTID,
++		    (void *) gicd_base, (void *) gicc_base, sweet_vtimer_intid,
+ 		    SWEET_IPI_SGI);
+ 	}
+ 
+@@ -336,7 +358,7 @@
+ 		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicd_write32(GICD_ISENABLER0,
+-	    (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
++	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+ 
+ 	/* CPU interface of this PE: enable Group 1 and unmask priorities. */
+ 	gicc_write32(GICC_PMR, 0xFF);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -83,9 +83,11 @@
+ #endif /* ! ASSEMBLER */
+ 
+ /*
+- * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
+- * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+- * (CNTV) is INTID 16 + 3 = 19.
++ * Qualcomm numbers the architected timer PPIs differently per SoC instead of
++ * the usual 13/14/11/10: SM7150 uses 1/2/3/0 (secure phys, phys, virt, hyp),
++ * so CNTV is INTID 16 + 3 = 19.  SDM632 (onclite) uses 1/2/3/4, so CNTV is
++ * INTID 16 + 4 = 20.  This constant is only the fallback: both GIC drivers
++ * prefer /arm-io/gic "virtual-timer-intid" from the ADT.
+  */
+ #define SWEET_VTIMER_INTID        19
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals

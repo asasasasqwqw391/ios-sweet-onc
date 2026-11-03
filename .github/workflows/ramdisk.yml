@@ -28,47 +28,26 @@ jobs:
                    root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
 
-          ok=0
-          # --- method A: hdiutil volume image, read the raw bytes back ---------
-          set +e
+          # 1) HFS+ volume in a writable device image
           hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg
-          echo "create rc=$?"
-          if [ -f root.dmg ]; then
-            hdiutil attach -nomount root.dmg
-            DEV=$(hdiutil attach -nomount root.dmg | head -1 | awk '{print $1}')
-            echo "DEV=[$DEV]"
-            if [ -n "$DEV" ]; then
-              sudo dd if="$DEV" of=root.img bs=1m
-              echo "dd rc=$?"
-              hdiutil detach "$DEV" || true
-            fi
-          fi
-          hdiutil imageinfo root.dmg 2>&1 | head -20
-          [ -s root.img ] && ok=1
-
-          # --- method B: plain file + newfs_hfs -------------------------------
-          if [ "$ok" != 1 ]; then
-            rm -f root.img
-            mkfile 8m root.img
-            newfs_hfs -v root root.img
-            echo "newfs_hfs rc=$?"
-            [ -s root.img ] && ok=1
-          fi
-          set -e
-          [ "$ok" = 1 ] || { echo "NO IMAGE"; exit 1; }
-
-          # --- mount the raw image, populate, unmount ------------------------
+          # 2) mount it read-write (UDRW is writable) and populate the skeleton
           mkdir -p mnt
-          hdiutil attach -mountpoint "$PWD/mnt" root.img
+          hdiutil attach -readwrite -mountpoint "$PWD/mnt" root.dmg
           cp -a root/. mnt/
           sync
           hdiutil detach mnt
+          # 3) read the raw volume bytes back out of the device
+          DEV=$(hdiutil attach -nomount root.dmg | head -1 | awk '{print $1}')
+          echo "DEV=[$DEV]"
+          sudo dd if="$DEV" of=root.img bs=1m
+          hdiutil detach "$DEV" || true
           ls -l root.img
           shasum -a 256 root.img
           SH
           bash -x mkramdisk.sh > build.log 2>&1
           rc=$?
           cat build.log
+          ls -l root.img || true
           exit $rc
 
       - uses: actions/upload-artifact@v4

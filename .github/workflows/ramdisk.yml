@@ -1,9 +1,11 @@
 name: ramdisk
 
-# Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root).
+# Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root),
+# including a minimal arm64 Mach-O /sbin/launchd that only uses svc #0x80
+# (write + exit), to verify the kernel -> userland (EL0/syscall) handoff.
 # Runs only on its own file / manual dispatch, so it never triggers kernel builds.
-# The step's full output is uploaded as the `ramdisk-log` artifact even on
-# failure (job logs need repo admin rights we do not have through the tunnel).
+# Full step output is uploaded as `ramdisk-log` even on failure (job logs need
+# repo admin rights we do not have through the tunnel).
 
 on:
   push:
@@ -18,25 +20,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build minimal HFS+ root image
+      - name: Build minimal HFS+ root image + /sbin/launchd
         run: |
           cat > mkramdisk.sh <<'SH'
           set -x
-          rm -rf root mnt root.img root.dmg
+          rm -rf root mnt root.img root.dmg launchd start.S
           mkdir -p root/dev root/private/var/tmp root/private/var/mobile root/private/var/root \
                    root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp \
                    root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
 
-          # 1) HFS+ volume in a writable device image
+          # ---- minimal Mach-O arm64 init: write(1,"...") then exit(0) -------
+          cat > start.S <<'ASM'
+              .section __TEXT,__text,regular,pure_instructions
+              .globl _start
+          _start:
+              mov     x0, #1
+              adrp    x1, msg@PAGE
+              add     x1, x1, msg@PAGEOFF
+              mov     x2, #14
+              mov     x16, #4
+              svc     #0x80
+              mov     x0, #0
+              mov     x16, #1
+              svc     #0x80
+          1:  b       1b
+              .section __TEXT,__cstring,cstring_literals
+          msg: .ascii "ONC USERLAND\\n"
+          ASM
+          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -nostdlib \
+              -Wl,-e,_start -Wl,-platform_version,ios,14.0,14.0 \
+              -o launchd start.S
+          echo "clang rc=$?"
+          ls -l launchd || true
+          file launchd || true
+          otool -h launchd || true
+          cp launchd root/sbin/launchd
+          chmod 755 root/sbin/launchd
+
+          # ---- HFS+ volume in a writable device image ----------------------
           hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg
-          # 2) mount it read-write (UDRW is writable) and populate the skeleton
           mkdir -p mnt
           hdiutil attach -readwrite -mountpoint "$PWD/mnt" root.dmg
           cp -a root/. mnt/
           sync
           hdiutil detach mnt
-          # 3) read the raw volume bytes back out of the device
+          # ---- read the raw volume bytes back out of the device ------------
           DEV=$(hdiutil attach -nomount root.dmg | head -1 | awk '{print $1}')
           echo "DEV=[$DEV]"
           sudo dd if="$DEV" of=root.img bs=1m
@@ -47,7 +76,7 @@ jobs:
           bash -x mkramdisk.sh > build.log 2>&1
           rc=$?
           cat build.log
-          ls -l root.img || true
+          ls -l root.img launchd || true
           exit $rc
 
       - uses: actions/upload-artifact@v4

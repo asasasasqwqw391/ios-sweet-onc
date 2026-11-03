@@ -1,7 +1,7 @@
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 --- a/osfmk/vm/vm_kern.c
 +++ b/osfmk/vm/vm_kern.c
-@@ -3673,6 +3673,23 @@
+@@ -3651,6 +3651,23 @@
  	assert(kmem_claim_count < UINT16_MAX);
  	kmem_shuffle_claims();
  
@@ -10,7 +10,7 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 +	 * onc 4KB port: the zone map claim is the only claim with a min_address
 +	 * restriction, and its submaps must be placed inside the c_slot packing
 +	 * window (-64GB .. -32GB).  Put it first so the deterministic bottom-up
-+	 * placement below starts with it, just above virtual_space_start.
++	 * placement below starts with it.
 +	 */
 +	for (uint32_t i = 1; i < kmem_claim_count; i++) {
 +		if (kmem_claims[i].kc_range->min_address != 0) {
@@ -25,18 +25,16 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
  	/*
  	 * Apply restrictions and determine range for each claim
  	 */
-@@ -3680,6 +3697,27 @@
+@@ -3658,6 +3675,25 @@
  		vm_map_offset_t end = 0;
  		struct kmem_range_startup_spec sp = kmem_claims[i];
  		struct mach_vm_range *sp_range = sp.kc_range;
 +#if defined(ONC_SWEET_4K)
 +		/*
 +		 * onc 4KB port: place claims deterministically, bottom-up from
-+		 * the fuzz reservation.  The generic vm_map_locate_space() path
-+		 * applies the randomized kmem range policy, which for this tiny
-+		 * VA layout landed the claims outside the only gap that can hold
-+		 * them (zone_init() then found no temporary entry where it
-+		 * expected the zone submaps).
++		 * the fuzz reservation (all of them live in the single usable VA
++		 * gap above LOW_GLOBAL; the generic randomized locate path does
++		 * not respect that for this tiny layout).
 +		 */
 +		start = round_page(start);
 +		if (sp_range->min_address && start > sp_range->min_address) {
@@ -53,7 +51,7 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
  		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
  		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
  			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
-@@ -3697,6 +3735,7 @@
+@@ -3675,6 +3711,7 @@
  			sp_range->max_address = end;
  		}
  		start = end;
@@ -61,16 +59,39 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
  	}
  
  	/*
-@@ -3714,6 +3753,12 @@
- 			panic("kmem_range_init: vm_map_find_space failing for claim %s",
- 			    sp.kc_name);
+@@ -3687,6 +3724,27 @@
+ 		if (sp.kc_flags & KC_NO_ENTRY) {
+ 			continue;
  		}
 +#if defined(ONC_SWEET_4K)
-+		if (entry->vme_start != sp.kc_range->min_address) {
-+			panic("onc: claim %s entry at %p expected %p", sp.kc_name,
-+			    (void *)entry->vme_start, (void *)sp.kc_range->min_address);
++		/*
++		 * onc 4KB port: create the temporary claim entry at exactly the
++		 * assigned address (FIXED), like kmem_init() does for the
++		 * reserved regions.  vm_map_find_space() is free to return a
++		 * different slot, which then breaks zone_init()/kmem_suballoc().
++		 */
++		{
++			vm_map_offset_t addr = sp.kc_range->min_address;
++			vm_object_reference(kernel_object);
++			if (vm_map_enter(kernel_map, &addr, sp.kc_size, 0,
++			    VM_MAP_KERNEL_FLAGS_FIXED(.vmkf_no_pmap_check = true),
++			    kernel_object, (vm_object_offset_t)addr, FALSE,
++			    VM_PROT_NONE, VM_PROT_NONE,
++			    VM_INHERIT_DEFAULT) != KERN_SUCCESS ||
++			    addr != sp.kc_range->min_address) {
++				panic("onc: claim %s enter %p -> %p", sp.kc_name,
++				    (void *)sp.kc_range->min_address, (void *)addr);
++			}
 +		}
-+#endif
- 		vm_object_reference(kernel_object);
++#else /* !defined(ONC_SWEET_4K) */
+ 		if (vm_map_find_space(kernel_map, sp.kc_range->min_address, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &entry) != KERN_SUCCESS) {
+ 			panic("kmem_range_init: vm_map_find_space failing for claim %s",
+@@ -3696,6 +3754,7 @@
  		VME_OBJECT_SET(entry, kernel_object, false, 0);
  		VME_OFFSET_SET(entry, entry->vme_start);
+ 		vm_map_unlock(kernel_map);
++#endif /* !defined(ONC_SWEET_4K) */
+ 	}
+ 	/*
+ 	 * Now that we are done assigning all the ranges, reset

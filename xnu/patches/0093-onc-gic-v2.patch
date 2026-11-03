@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -19,6 +19,10 @@
+@@ -19,7 +19,11 @@
  #include <pexpert/pexpert.h>
  
  extern "C" void sweet_secondary_entry(void);

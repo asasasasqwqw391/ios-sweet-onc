@@ -1,36 +1,51 @@
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 --- a/osfmk/vm/vm_kern.c
 +++ b/osfmk/vm/vm_kern.c
-@@ -748,6 +748,21 @@
- 		from_right = type_hash & KMEM_DIRECTION_MASK;
- 	}
- 
+@@ -3388,6 +3388,39 @@
+ static vm_offset_t
+ kmem_fuzz_start(void)
+ {
 +#if defined(ONC_SWEET_4K)
 +	/*
 +	 * onc 4KB port: pmap_virtual_region() reserves the whole
-+	 * [VM_MIN, LOW_GLOBAL) range, so the kernel heap only has the gap
-+	 * [virtual_space_start, VM_MAX_KERNEL_ADDRESS].  The randomized front
-+	 * above can be the right/top one, which puts the early kmem claim cursor
-+	 * at the top of that gap and breaks kmem_range_init().  Always allocate
-+	 * from the bottom of the range for ONC.
++	 * [VM_MIN, LOW_GLOBAL) range plus the physical aperture, so the kernel
++	 * heap only has the single gap [virtual_space_start, VM_MAX).
++	 * kmem_alloc() would leave the allocation front to
++	 * kmem_apply_security_policy() (backtrace-hash based) and can land this
++	 * block in the small leftover gap just above LOW_GLOBAL instead.  Reserve
++	 * the fuzz block explicitly at the start of the real gap.
 +	 *
-+	 * (This only affects address selection inside kernel_map; the kmem range
-+	 * pointer packing is unaffected.)
++	 * Note: the aperture reservation is rounded up to 8MB, so the actual gap
++	 * start can differ from the hint; use the address the entry got.
 +	 */
-+	from_right = false;
-+#endif /* defined(ONC_SWEET_4K) */
++	extern vm_offset_t virtual_space_start;
++	uint32_t kmapoff_pgcnt = (early_random() & 0x1ff) + 1; /* 9 bits */
++	vm_map_size_t kmapoff_size = ptoa(kmapoff_pgcnt);
++	vm_offset_t kmapoff_kaddr = round_page(virtual_space_start);
++	vm_map_entry_t entry = NULL;
 +
- 	vmk_flags->vmkf_range_id = range_id;
- 	vmk_flags->vmkf_last_free = from_right;
- }
-@@ -3395,6 +3410,10 @@
- 	kmem_alloc(kernel_map, &kmapoff_kaddr, kmapoff_size,
++	if (vm_map_find_space(kernel_map, kmapoff_kaddr, kmapoff_size, 0,
++	    VM_MAP_KERNEL_FLAGS_NONE, &entry) != KERN_SUCCESS) {
++		panic("onc: cannot reserve kernel_map fuzz range at %p",
++		    (void *)kmapoff_kaddr);
++	}
++	/* vm_map_find_space() returns with kernel_map write-locked */
++	vm_object_reference(kernel_object);
++	VME_OBJECT_SET(entry, kernel_object, false, 0);
++	VME_OFFSET_SET(entry, entry->vme_start);
++	vm_map_unlock(kernel_map);
++	printf("ONC fuzz want=%p got=%p size=%llu\n", (void *)kmapoff_kaddr,
++	    (void *)entry->vme_start, (uint64_t)kmapoff_size);
++	return entry->vme_start + kmapoff_size;
++#else /* !defined(ONC_SWEET_4K) */
+ 	vm_offset_t kmapoff_kaddr = 0;
+ 	uint32_t kmapoff_pgcnt = (early_random() & 0x1ff) + 1; /* 9 bits */
+ 	vm_map_size_t kmapoff_size = ptoa(kmapoff_pgcnt);
+@@ -3396,6 +3429,7 @@
  	    KMA_NOFAIL | KMA_KOBJECT | KMA_PERMANENT | KMA_VAONLY,
  	    VM_KERN_MEMORY_OSFMK);
-+#if defined(ONC_SWEET_4K)
-+	printf("ONC fuzz %p size=%llu\n", (void *)kmapoff_kaddr,
-+	    (uint64_t)kmapoff_size);
-+#endif
  	return kmapoff_kaddr + kmapoff_size;
++#endif /* !defined(ONC_SWEET_4K) */
  }
  
+ /*

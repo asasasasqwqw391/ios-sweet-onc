@@ -1,7 +1,7 @@
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 --- a/osfmk/vm/vm_kern.c
 +++ b/osfmk/vm/vm_kern.c
-@@ -3651,6 +3651,23 @@
+@@ -3666,6 +3666,26 @@
  	assert(kmem_claim_count < UINT16_MAX);
  	kmem_shuffle_claims();
  
@@ -20,21 +20,24 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 +			break;
 +		}
 +	}
++	printf("ONC zones_restriction=%p (claims=%u, first=%s)\n",
++	    (void *)kmem_claims[0].kc_range->min_address, kmem_claim_count,
++	    kmem_claims[0].kc_name);
 +#endif /* defined(ONC_SWEET_4K) */
 +
  	/*
  	 * Apply restrictions and determine range for each claim
  	 */
-@@ -3658,6 +3675,25 @@
+@@ -3673,6 +3693,27 @@
  		vm_map_offset_t end = 0;
  		struct kmem_range_startup_spec sp = kmem_claims[i];
  		struct mach_vm_range *sp_range = sp.kc_range;
 +#if defined(ONC_SWEET_4K)
 +		/*
 +		 * onc 4KB port: place claims deterministically, bottom-up from
-+		 * the fuzz reservation (all of them live in the single usable VA
-+		 * gap above LOW_GLOBAL; the generic randomized locate path does
-+		 * not respect that for this tiny layout).
++		 * the fuzz reservation, which sits at the start of the only
++		 * usable VA gap.  The generic randomized locate path does not
++		 * respect this tiny layout.
 +		 */
 +		start = round_page(start);
 +		if (sp_range->min_address && start > sp_range->min_address) {
@@ -45,21 +48,26 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 +		sp_range->min_address = start;
 +		sp_range->max_address = end;
 +		start = end;
-+		printf("ONC claim[%u] %s %p-%p\n", i, sp.kc_name,
-+		    (void *)sp_range->min_address, (void *)sp_range->max_address);
++		if (i == 0 || i + 1 == kmem_claim_count || sp_range->min_address != 0) {
++			printf("ONC claim[%u] %s %p-%p\n", i, sp.kc_name,
++			    (void *)sp_range->min_address, (void *)sp_range->max_address);
++		}
 +#else /* !defined(ONC_SWEET_4K) */
  		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
  		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
  			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
-@@ -3675,6 +3711,7 @@
+@@ -3690,7 +3731,9 @@
  			sp_range->max_address = end;
  		}
  		start = end;
+-	}
 +#endif /* !defined(ONC_SWEET_4K) */
- 	}
++	}
++	printf("ONC claims end=%p\n", (void *)start);
  
  	/*
-@@ -3687,6 +3724,27 @@
+ 	 * We have settled on the ranges, now create temporary entries for the
+@@ -3702,6 +3745,28 @@
  		if (sp.kc_flags & KC_NO_ENTRY) {
  			continue;
  		}
@@ -67,27 +75,28 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 +		/*
 +		 * onc 4KB port: create the temporary claim entry at exactly the
 +		 * assigned address (FIXED), like kmem_init() does for the
-+		 * reserved regions.  vm_map_find_space() is free to return a
-+		 * different slot, which then breaks zone_init()/kmem_suballoc().
++		 * reserved regions.
 +		 */
 +		{
 +			vm_map_offset_t addr = sp.kc_range->min_address;
++			kern_return_t kr;
++
 +			vm_object_reference(kernel_object);
-+			if (vm_map_enter(kernel_map, &addr, sp.kc_size, 0,
++			kr = vm_map_enter(kernel_map, &addr, sp.kc_size, 0,
 +			    VM_MAP_KERNEL_FLAGS_FIXED(.vmkf_no_pmap_check = true),
 +			    kernel_object, (vm_object_offset_t)addr, FALSE,
 +			    VM_PROT_NONE, VM_PROT_NONE,
-+			    VM_INHERIT_DEFAULT) != KERN_SUCCESS ||
-+			    addr != sp.kc_range->min_address) {
-+				panic("onc: claim %s enter %p -> %p", sp.kc_name,
-+				    (void *)sp.kc_range->min_address, (void *)addr);
++			    VM_INHERIT_DEFAULT);
++			if (kr != KERN_SUCCESS || addr != sp.kc_range->min_address) {
++				panic("onc: claim %s enter %p -> %p kr=%d", sp.kc_name,
++				    (void *)sp.kc_range->min_address, (void *)addr, kr);
 +			}
 +		}
 +#else /* !defined(ONC_SWEET_4K) */
  		if (vm_map_find_space(kernel_map, sp.kc_range->min_address, sp.kc_size, 0,
  		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &entry) != KERN_SUCCESS) {
  			panic("kmem_range_init: vm_map_find_space failing for claim %s",
-@@ -3696,6 +3754,7 @@
+@@ -3711,6 +3776,7 @@
  		VME_OBJECT_SET(entry, kernel_object, false, 0);
  		VME_OFFSET_SET(entry, entry->vme_start);
  		vm_map_unlock(kernel_map);

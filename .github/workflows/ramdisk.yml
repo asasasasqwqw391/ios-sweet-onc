@@ -1,0 +1,52 @@
+name: ramdisk
+
+# Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root).
+# Runs only on its own file / manual dispatch, so it never triggers kernel builds.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ramdisk.yml"
+  workflow_dispatch:
+
+jobs:
+  mkramdisk:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show tools
+        run: |
+          sw_vers
+          which newfs_hfs hdiutil
+          newfs_hfs 2>&1 | head -3 || true
+
+      - name: Build minimal HFS+ root image
+        run: |
+          set -eux
+          rm -rf root mnt root.img root.dmg
+          mkdir -p root/dev root/private/var/tmp root/private/var/mobile root/private/var/root \
+                   root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp root/cores root/etc root/private/etc
+          chmod 1777 root/tmp root/private/var/tmp
+          # 1) create an HFS+ volume inside a copy-on-write device image
+          hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg
+          # 2) read the raw volume bytes back out of that device
+          DEV=$(hdiutil attach -nomount root.dmg | awk 'NR==1{print $1}')
+          echo "device: $DEV"
+          sudo dd if="$DEV" of=root.img bs=1m
+          hdiutil detach "$DEV"
+          # 3) mount the raw image, populate the minimal skeleton, unmount
+          mkdir -p mnt
+          hdiutil attach -mountpoint "$PWD/mnt" root.img
+          cp -a root/. mnt/
+          sync
+          hdiutil detach mnt
+          ls -l root.img
+          shasum -a 256 root.img
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hfs-root
+          path: root.img
+          retention-days: 30

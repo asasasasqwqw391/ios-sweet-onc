@@ -1,0 +1,35 @@
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -565,6 +565,18 @@
+ 		  $(BOUND_CHECKS_DEFINES) \
+ 		  $(DEFINES)
+ 
++# ONC: the Redmi 7's Cortex-A73 is ARMv8.0.  Apple clang derives the default
++# CPU from the deployment target (macOS 14 => Apple silicon feature set), so
++# plain -march=armv8-a still emits ARMv8.1 LSE atomics (ldadd/swp/cas/...),
++# which are UNDEFINED on the A73 and kill the kernel right after
++# cpu_bootstrap.  Pin the CPU to a generic ARMv8.0 core and disable LSE
++# explicitly, for the kernel arch only (host tools are x86_64).
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq (,$(filter ARM64,$(CURRENT_ARCH_CONFIG)))
++CFLAGS += -mcpu=generic -Xclang -target-feature -Xclang -lse
++endif
++endif
++
+ #
+ # Default C++ flags
+ #
+@@ -576,6 +588,13 @@
+ CXXFLAGS      = $(CXXFLAGS_GEN) \
+ 		  $($(addsuffix $(CURRENT_ARCH_CONFIG),CXXFLAGS_)) \
+ 		  $($(addsuffix $(CURRENT_KERNEL_CONFIG),CXXFLAGS_))
++
++# Same for C++ (IOKit/kext code): stay ARMv8.0-only.
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq (,$(filter ARM64,$(CURRENT_ARCH_CONFIG)))
++CXXFLAGS += -mcpu=generic -Xclang -target-feature -Xclang -lse
++endif
++endif
+ 
+ #
+ # Assembler command

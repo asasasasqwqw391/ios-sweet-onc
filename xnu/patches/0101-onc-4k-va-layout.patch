@@ -1,0 +1,76 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,10 +160,13 @@
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++#if XNU_PLATFORM_MacOSX && !defined(ONC_SWEET_4K)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+-#else /* XNU_PLATFORM_MacOSX */
++#else /* XNU_PLATFORM_MacOSX && !defined(ONC_SWEET_4K) */
++/* onc 4KB: the non-large-memory kernel VA range (~112GB) cannot host the
++ * macOS 128GB zone map claim; use the iOS sizes (the hardware has ~3GB RAM so
++ * 8GB of physical zone map is already far more than enough). */
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+ #endif /* !XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -228,16 +228,16 @@
+  */
+ #if defined(ONC_SWEET_4K)
+ /*
+- * onc 4KB build: TTBR1 is 39-bit (T1SZ = 25), so kernel VA can start at the
+- * 39-bit boundary and span ~496GB.  The stock non-large-memory layout starts
+- * at -128GB and only exposes ~115GB, which is too small for the macOS-sized
+- * kmem claims (the zone map alone asks for 24GB, plus IPC maps, compressor,
+- * kext and pmap ranges): kmem_range_init() then panics with
+- * "vm_map_locate_space failing for claim zones".  Keep VM_MAX_KERNEL_ADDRESS
+- * and widen the bottom of the kernel VA range instead.
+- */
+-#define VM_KERNEL_POINTER_SIGNIFICANT_BITS  38
+-#define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) 0xffffff8000000000ULL)
++ * onc 4KB build: keep the stock non-large-memory -128GB kernel VA base.
++ *
++ * Do NOT widen this towards the 39-bit TB1 boundary: VM_PAGE_PACKED_PTR_BASE is
++ * VM_MIN_KERNEL_AND_KEXT_ADDRESS with a 128GB reach (31 bits << 6), so moving
++ * VM_MIN down would push the static vm_pages[] array (at -64GB) out of the
++ * packable window.  The reason the macOS-sized `zones` claim (128GB) did not
++ * fit is fixed in zalloc.c instead (ONC uses the iOS 24GB zone VA size).
++ */
++#define VM_KERNEL_POINTER_SIGNIFICANT_BITS  37
++#define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) 0xffffffe000000000ULL)
+ #elif defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ #define VM_KERNEL_POINTER_SIGNIFICANT_BITS  38
+ #define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) (0ULL - GiB(144)))
+diff --git a/osfmk/vm/vm_compressor.h b/osfmk/vm/vm_compressor.h
+--- a/osfmk/vm/vm_compressor.h
++++ b/osfmk/vm/vm_compressor.h
+@@ -89,6 +89,23 @@
+ #define C_SLOT_C_CODEC_BITS             1
+ #define C_SLOT_C_POPCOUNT_BITS          0
+ #define C_SLOT_C_PADDING_BITS           3
++
++#elif defined(ONC_SWEET_4K)             /* 32G from the kernel VA base */
++/*
++ * The ONC 4KB layout has no KTRR/CTRR, so KERNEL_PMAP_HEAP_RANGE_START falls
++ * back to LOW_GLOBAL_BASE_ADDRESS (-64GB) while the zone VM submap is placed
++ * just above VM_MIN_KERNEL_ADDRESS (-128GB) by zone_init().  Anchor the c_slot
++ * packing window at VM_MIN instead, exactly like the KTRR configs do, so that
++ * vm_packing_verify_range("vm_compressor", ...) accepts the submap.
++ */
++#define C_SLOT_PACKED_PTR_BITS          33
++#define C_SLOT_PACKED_PTR_SHIFT         2
++#define C_SLOT_PACKED_PTR_BASE          ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
++
++#define C_SLOT_C_SIZE_BITS              14
++#define C_SLOT_C_CODEC_BITS             1
++#define C_SLOT_C_POPCOUNT_BITS          0
++#define C_SLOT_C_PADDING_BITS           0
+ 
+ #elif defined(__arm64__)                /* 32G from the heap start */
+ #define C_SLOT_PACKED_PTR_BITS          33

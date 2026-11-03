@@ -1,0 +1,24 @@
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -226,7 +226,19 @@
+  * |                       |        |        | PMAP_HEAP_RANGE_START  | >= H9
+  * +-----------------------+--------+--------+------------------------+
+  */
+-#if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
++#if defined(ONC_SWEET_4K)
++/*
++ * onc 4KB build: TTBR1 is 39-bit (T1SZ = 25), so kernel VA can start at the
++ * 39-bit boundary and span ~496GB.  The stock non-large-memory layout starts
++ * at -128GB and only exposes ~115GB, which is too small for the macOS-sized
++ * kmem claims (the zone map alone asks for 24GB, plus IPC maps, compressor,
++ * kext and pmap ranges): kmem_range_init() then panics with
++ * "vm_map_locate_space failing for claim zones".  Keep VM_MAX_KERNEL_ADDRESS
++ * and widen the bottom of the kernel VA range instead.
++ */
++#define VM_KERNEL_POINTER_SIGNIFICANT_BITS  38
++#define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) 0xffffff8000000000ULL)
++#elif defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ #define VM_KERNEL_POINTER_SIGNIFICANT_BITS  38
+ #define VM_MIN_KERNEL_ADDRESS   ((vm_address_t) (0ULL - GiB(144)))
+ #else /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */

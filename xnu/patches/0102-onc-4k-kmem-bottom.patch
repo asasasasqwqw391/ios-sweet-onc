@@ -1,0 +1,51 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3388,6 +3388,39 @@
+ static vm_offset_t
+ kmem_fuzz_start(void)
+ {
++#if defined(ONC_SWEET_4K)
++	/*
++	 * onc 4KB port: the non-large-memory kernel VA range is only ~112GB.
++	 * The generic path below lets kmem_apply_security_policy() pick the
++	 * allocation front from a backtrace hash; in this build it picks the
++	 * right/top front, so the fuzz block lands near VM_MAX and the claim
++	 * cursor starts high.  The claims are sized from the (largest) lower gap
++	 * but would then be placed into the ~45GB upper gap: kmem_range_init
++	 * fails (and the `zones` claim, which has a min_address restriction,
++	 * trips "vm_kern.c:3439 assert(cur_idx != 0)").
++	 *
++	 * Reserve the fuzz block at the bottom of kernel_map instead.  A plain
++	 * unreserved entry is all kmem_scramble_ranges() needs (it only wants
++	 * the cursor to start a little above VM_MIN), and it keeps the claim
++	 * cursor low so the claims fill the lower gap exactly.
++	 */
++	uint32_t kmapoff_pgcnt = (early_random() & 0x1ff) + 1; /* 9 bits */
++	vm_map_size_t kmapoff_size = ptoa(kmapoff_pgcnt);
++	vm_offset_t kmapoff_kaddr = VM_MIN_KERNEL_AND_KEXT_ADDRESS;
++	vm_map_entry_t entry = NULL;
++
++	if (vm_map_find_space(kernel_map, kmapoff_kaddr, kmapoff_size, 0,
++	    VM_MAP_KERNEL_FLAGS_NONE, &entry) != KERN_SUCCESS) {
++		panic("onc: cannot reserve kernel_map fuzz range at %p",
++		    (void *)kmapoff_kaddr);
++	}
++	/* vm_map_find_space() returns with kernel_map write-locked */
++	vm_object_reference(kernel_object);
++	VME_OBJECT_SET(entry, kernel_object, false, 0);
++	VME_OFFSET_SET(entry, entry->vme_start);
++	vm_map_unlock(kernel_map);
++	return kmapoff_kaddr + kmapoff_size;
++#else
+ 	vm_offset_t kmapoff_kaddr = 0;
+ 	uint32_t kmapoff_pgcnt = (early_random() & 0x1ff) + 1; /* 9 bits */
+ 	vm_map_size_t kmapoff_size = ptoa(kmapoff_pgcnt);
+@@ -3396,6 +3429,7 @@
+ 	    KMA_NOFAIL | KMA_KOBJECT | KMA_PERMANENT | KMA_VAONLY,
+ 	    VM_KERN_MEMORY_OSFMK);
+ 	return kmapoff_kaddr + kmapoff_size;
++#endif /* defined(ONC_SWEET_4K) */
+ }
+ 
+ /*

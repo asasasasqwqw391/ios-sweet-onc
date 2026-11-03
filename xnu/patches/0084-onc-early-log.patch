@@ -1,0 +1,59 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 9427dc1..52c4e75 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -27,6 +27,46 @@ static unsigned int early_bpp = 4;		/* 3 = RGB888, 4 = ABGR8888 */
+ #define EARLY_ROWS ((early_height - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (early_width / EARLY_CELL_W)
+ 
++/*
++ * onc: persistent early-console log.
++ *
++ * The panel cannot serve as a crash record -- ABL repaints its own splash
++ * before the shim runs on the next boot. So mirror the console into plain
++ * DRAM the shim reads back after the watchdog reset.
++ *
++ * Address matters: the bootstrap V=P mapping covers only what
++ * create_bootstrap_mapping() laid down for boot_args memSize, so most of
++ * /pram is UNMAPPED and a store there data-aborts once the MMU is on. The
++ * 0xBE000000 32MB block is mapped explicitly by the onc start.s patch, is
++ * outside memSize, and XNU never manages it -- so it both accepts writes
++ * and survives the reset.
++ *
++ * Layout at ONC_LOG_PA:
++ *   u32 magic = 'ONCL'
++ *   u32 length
++ *   char text[]
++ */
++#define ONC_LOG_MAGIC  0x4f4e434cU
++#define ONC_LOG_PA     0xBFFA0000UL
++#define ONC_LOG_MAX    0x0000f000U
++
++static void
++onc_early_log_char(char c)
++{
++	volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)ONC_LOG_PA;
++	volatile char *buf = (volatile char *)(uintptr_t)(ONC_LOG_PA + 8);
++	uint32_t len = h[1];
++
++	if (h[0] != ONC_LOG_MAGIC) {
++		h[0] = ONC_LOG_MAGIC;
++		len = 0;
++	}
++	if (len < ONC_LOG_MAX - 1) {
++		buf[len] = c;
++		h[1] = len + 1;
++	}
++}
++
+ extern unsigned char iso_font[256 * 16];
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+@@ -88,6 +128,7 @@ sweet_early_putc(char c)
+ 	if (early_disabled) {
+ 		return;
+ 	}
++	onc_early_log_char(c);
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();

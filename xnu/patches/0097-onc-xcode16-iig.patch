@@ -1,0 +1,20 @@
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,17 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/*
++	 * ONC: Xcode 16's iig generates IOKit RPC stubs that initialise
++	 * IORPC::kernelContent; xnu-8796's header predates that field.
++	 * Adding it (last, KERNEL-only, matching newer open-source xnu)
++	 * keeps those stubs compiling on macos-15 runners, where only
++	 * Xcode 16 is available since the macOS 14 + Xcode 15 image was
++	 * retired on 2026-11-02.
++	 */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 

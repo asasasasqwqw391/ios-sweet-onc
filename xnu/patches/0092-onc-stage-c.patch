@@ -1,0 +1,163 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,8 +347,14 @@
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	ONC_STAGE(0x40);            /* in C code at last */
++
+ 	sweet_early_init(args);
++	ONC_STAGE(0x41);            /* early console configured */
++
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
++	/* onc: stage 0x42 */
++	ONC_STAGE(0x42);
+ 
+ 	arm_setup_pre_sign();
+ 
+@@ -367,6 +373,8 @@
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
+ 	sweet_early_mark(2, "PE_init_platform done");
++	/* onc: stage 0x43 */
++	ONC_STAGE(0x43);
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -429,6 +437,8 @@
+ 
+ 	ml_parse_cpu_topology();
+ 	sweet_early_mark(3, "ml_parse_cpu_topology done");
++	/* onc: stage 0x44 */
++	ONC_STAGE(0x44);
+ 
+ 
+ 	master_cpu = ml_get_boot_cpu_number();
+@@ -460,12 +470,16 @@
+ 	thread->machine.preemption_count = 0;
+ 	cpu_bootstrap();
+ 	sweet_early_mark(4, "cpu_bootstrap done");
++	/* onc: stage 0x45 */
++	ONC_STAGE(0x45);
+ 
+ 	rtclock_early_init();
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
+ 	sweet_early_mark(5, "kernel_startup_bootstrap done");
++	/* onc: stage 0x46 */
++	ONC_STAGE(0x46);
+ 
+ 	/*
+ 	 * Initialize the timer callout world
+@@ -475,6 +489,8 @@
+ 	cpu_init();
+ 
+ 	sweet_early_mark(6, "cpu_init done");
++	/* onc: stage 0x47 */
++	ONC_STAGE(0x47);
+ 	processor_bootstrap();
+ 
+ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
+@@ -523,8 +539,12 @@
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+ 	sweet_early_mark(7, "entering arm_vm_init");
++	/* onc: stage 0x48 */
++	ONC_STAGE(0x48);
+ 	arm_vm_init(xmaxmem, args);
+ 	sweet_early_mark(15, "arm_vm_init returned");
++	/* onc: stage 0x49 */
++	ONC_STAGE(0x49);
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+@@ -538,11 +558,17 @@
+ 
+ 	/* Setup debugging output. */
+ 	sweet_early_mark(16, "calling serial_init");
++	/* onc: stage 0x4a */
++	ONC_STAGE(0x4a);
+ 	const unsigned int serial_exists = serial_init();
+ 	sweet_early_mark(19, "serial_init returned");
++	/* onc: stage 0x4b */
++	ONC_STAGE(0x4b);
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
++	/* onc: stage 0x4c */
++	ONC_STAGE(0x4c);
+ 	if (serial_exists) {
+ 		sweet_early_disable();
+ 	}
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2204,11 +2204,15 @@
+ 
+ 	flush_mmu_tlb();
+ 	sweet_early_mark(10, "TTBR0 off; TLB flushed");
++	/* onc: stage 0x4d */
++	ONC_STAGE(0x4d);
+ 	kva_active = TRUE;
+ 	// global table pointers may need to be different due to physical aperture remapping
+ 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+ 	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
+ 	sweet_early_mark(11, "physmap table pointers rebound");
++	/* onc: stage 0x4e */
++	ONC_STAGE(0x4e);
+ 
+ 	// From here on out, we're off the bootstrap translation tables.
+ 
+@@ -2302,8 +2306,12 @@
+ #endif
+ #endif
+ 	sweet_early_mark(12, "calling pmap_bootstrap");
++	/* onc: stage 0x4f */
++	ONC_STAGE(0x4f);
+ 	pmap_bootstrap(dynamic_memory_begin);
+ 	sweet_early_mark(13, "pmap_bootstrap done");
++	/* onc: stage 0x50 */
++	ONC_STAGE(0x50);
+ 
+ 	disable_preemption();
+ 
+@@ -2355,6 +2363,8 @@
+ 		cpu_l1_tte++;
+ 	}
+ 	sweet_early_mark(14, "early I/O page tables ready");
++	/* onc: stage 0x51 */
++	ONC_STAGE(0x51);
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ 	/*
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -10,6 +10,25 @@
+ #if defined(SWEET)
+ void sweet_early_init(const boot_args *args);
+ void sweet_early_mark(unsigned int stage, const char *label);
++
++/*
++ * onc: raw boot-stage counter the shim reads back on the next boot.
++ *
++ * sweet_early_mark() paints the panel and needs a working framebuffer; the shim
++ * cannot see the panel (ABL repaints it first).  This writes one word to
++ * 0xBFEE0000 instead -- the same slot the start.s markers use.  Values are HEX
++ * and must increase.  C-level milestones start at 0x40 so they never collide
++ * with start.s's 0x06..0x11.  The block is mapped once the MMU is on
++ * (0090-onc-sweet-4k-build rounds the bootstrap block count up).
++ */
++static inline void
++onc_stage_raw(unsigned long long stage)
++{
++	*(volatile unsigned long long *)0xBFEE0000ULL = (0x4f4e434d00ULL | stage);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++#define ONC_STAGE(n) onc_stage_raw((unsigned long long)(n))
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);

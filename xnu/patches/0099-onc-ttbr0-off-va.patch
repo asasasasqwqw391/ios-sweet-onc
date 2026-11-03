@@ -1,0 +1,182 @@
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,21 +12,24 @@ void sweet_early_init(const boot_args *args);
+ void sweet_early_mark(unsigned int stage, const char *label);
+ 
+ /*
+- * onc: raw boot-stage counter the shim reads back on the next boot.
++ * onc: raw boot-stage counter + early log the shim reads back on the next boot.
+  *
+  * sweet_early_mark() paints the panel and needs a working framebuffer; the shim
+- * cannot see the panel (ABL repaints it first).  This writes one word to
+- * 0xBFEE0000 instead -- the same slot the start.s markers use.  Values are HEX
++ * cannot see the panel (ABL repaints it first).  This writes one word to the
++ * marker slot instead -- the same slot the start.s markers use.  Values are HEX
+  * and must increase.  C-level milestones start at 0x40 so they never collide
+- * with start.s's 0x06..0x11.  The block is mapped once the MMU is on
+- * (0090-onc-sweet-4k-build rounds the bootstrap block count up).
++ * with start.s's 0x06..0x11.
++ *
++ * Before TTBR0 is torn down the bootstrap V=P mapping makes the physical
++ * addresses 0xBFEE0000 / 0xBFFA0000 usable as VAs, and that is what the legacy
++ * code relied on.  After TTBR0 is off those VAs are unmapped: the very next
++ * marker write data-aborts (observed: MK stuck at 0x69, no panic text, no ELOG).
++ * arm_vm_init() therefore aliases the same physical blocks at VAs just below
++ * gVirtBase and onc_set_va() switches the marker/log over as soon as the final
++ * TTBR1 is live.
+  */
+-static inline void
+-onc_stage_raw(unsigned long long stage)
+-{
+-	*(volatile unsigned long long *)0xBFEE0000ULL = (0x4f4e434d00ULL | stage);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-}
++void onc_set_va(uintptr_t mk_va, uintptr_t log_va);
++void onc_stage_raw(unsigned long long stage);
+ 
+ #define ONC_STAGE(n) onc_stage_raw((unsigned long long)(n))
+ void sweet_early_putc(char c);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -48,22 +48,46 @@ static unsigned int early_bpp = 4;		/* 3 = RGB888, 4 = ABGR8888 */
+  */
+ #define ONC_LOG_MAGIC  0x4f4e434cU
+ #define ONC_LOG_PA     0xBFFA0000UL
++#define ONC_MK_PA      0xBFEE0000UL
+ #define ONC_LOG_MAX    0x0000f000U
+ 
++/*
++ * Physical addresses above are valid VAs only while the bootstrap V=P mapping
++ * (TTBR0) is live.  arm_vm_init() aliases the same blocks below gVirtBase and
++ * calls onc_set_va() once the final TTBR1 is live, before TTBR0 is turned off.
++ */
++static uintptr_t onc_mk_va = ONC_MK_PA;
++static uintptr_t onc_log_va = ONC_LOG_PA;
++
++void
++onc_set_va(uintptr_t mk_va, uintptr_t log_va)
++{
++	onc_mk_va = mk_va;
++	onc_log_va = log_va;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++void
++onc_stage_raw(unsigned long long stage)
++{
++	*(volatile unsigned long long *)onc_mk_va = (0x4f4e434d00ULL | stage);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ onc_early_log_char(char c)
+ {
+-	volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)ONC_LOG_PA;
+-	volatile char *buf = (volatile char *)(uintptr_t)(ONC_LOG_PA + 8);
+-	uint32_t len = h[1];
++	volatile uint32_t *h = (volatile uint32_t *)onc_log_va;
++	volatile char *buf = (volatile char *)(onc_log_va + 8);
++	uint32_t length = h[1];
+ 
+ 	if (h[0] != ONC_LOG_MAGIC) {
+ 		h[0] = ONC_LOG_MAGIC;
+-		len = 0;
++		length = 0;
+ 	}
+-	if (len < ONC_LOG_MAX - 1) {
+-		buf[len] = c;
+-		h[1] = len + 1;
++	if (length < ONC_LOG_MAX - 1) {
++		buf[length] = c;
++		h[1] = length + 1;
+ 	}
+ }
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1834,6 +1834,12 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
++/*
++ * 4KB onc: alias VAs for the early-console log (0xBFFA0000) and the raw boot
++ * marker (0xBFEE0000) blocks; filled in by sweet_early_map_final().
++ */
++static vm_map_address_t sweet_early_mk_va = 0xBFEE0000UL;
++static vm_map_address_t sweet_early_log_va = 0xBFFA0000UL;
+ 
+ static void
+ sweet_early_map_final(boot_args *args)
+@@ -1849,7 +1855,7 @@ sweet_early_map_final(boot_args *args)
+ 	 * the bootstrap kernel mapping) and cover the whole 720x1520x3 =
+ 	 * 3.28MB onc panel with three 2MB blocks.
+ 	 */
+-	const vm_map_address_t va = gVirtBase - (3 * ARM_TT_L2_SIZE);
++	const vm_map_address_t va = gVirtBase - (5 * ARM_TT_L2_SIZE);
+ #else
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ #endif
+@@ -1858,22 +1864,42 @@ sweet_early_map_final(boot_args *args)
+ 		fb = args->Video.v_baseAddr;
+ 	}
+ 	uint64_t block = fb & ~((uint64_t)ARM_TT_L2_SIZE - 1);
++#if defined(ONC_SWEET_4K)
++	sweet_early_fb_va = va + (2 * ARM_TT_L2_SIZE) + (vm_map_address_t)(fb - block);
++#else
+ 	sweet_early_fb_va = va + (vm_map_address_t)(fb - block);
++#endif
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ #if defined(ONC_SWEET_4K)
+-	for (int i = 0; i < 3; i++) {
++	/*
++	 * Layout below gVirtBase (5 x 2MB):
++	 *   +0MB  -> PA 0xBFE00000 (raw boot markers, 0xBFEE0000)
++	 *   +2MB  -> PA 0xBFF00000 (early console log, 0xBFFA0000)
++	 *   +4MB  -> PA of the splash framebuffer block (3 blocks, 6MB)
++	 */
++	for (int i = 0; i < 5; i++) {
+ 		assert(slot[i] == ARM_TTE_EMPTY);
+ 	}
++	slot[0] = (0xBFE00000ULL) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	slot[1] = (0xBFF00000ULL) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	for (int i = 0; i < 3; i++) {
+-		slot[i] = (block + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		slot[2 + i] = (block + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	}
++	sweet_early_mk_va = va + (0xBFEE0000UL - 0xBFE00000UL);
++	sweet_early_log_va = va + (2 * ARM_TT_L2_SIZE) + (0xBFFA0000UL - 0xBFF00000UL);
+ #else
+ 	assert(*slot == ARM_TTE_EMPTY);
+ 	*slot = block | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+@@ -2220,6 +2246,15 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	/*
++	 * The alias VAs above are live now; the physical-address VAs the early
++	 * marker/log still use stop being valid as soon as TTBR0 is disabled a
++	 * few lines below.
++	 */
++	onc_set_va(sweet_early_mk_va, sweet_early_log_va);
++#endif
++
+ 	ml_enable_monitor();
+ 
+ #if defined(SWEET)

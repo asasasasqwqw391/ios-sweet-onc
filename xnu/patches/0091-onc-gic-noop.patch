@@ -1,0 +1,46 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -12,6 +12,17 @@
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
+ 
++#if defined(SWEET) && !HAS_GIC_V3
++/*
++ * sleh_irq() references sweet_vtimer_intid unconditionally for SWEET, but the
++ * definition used to live inside the HAS_GIC_V3 block.  With the GICv3 driver
++ * compiled out we must still provide it, otherwise the kernel fails to link
++ * with "Undefined symbols: _sweet_vtimer_intid".
++ * The real GICv2 driver will start delivering the timer again.
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++#endif
++
+ 
+ #if HAS_GIC_V3
+ #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,20 @@
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+ 
+-#define HAS_GIC_V3                1
++/*
++ * ONC (Redmi 7 / SDM632): the interrupt controller is a GIC-400 (GICv2), not
++ * GICv3.  Leaving HAS_GIC_V3 set makes pe_init_fiq() touch the architected GICv3
++ * system registers (ICC_SRE_EL1, ICC_IAR1_EL1, ...) which UNDEF on this core --
++ * an early, silent death right after the MMU comes up.
++ *
++ * With HAS_GIC_V3 undefined pe_init_fiq() compiles to an empty function, so the
++ * kernel boots with no interrupt delivery at all: no timer ticks, no IPIs.  That
++ * is deliberate for now -- it avoids the guaranteed UNDEF and lets the boot
++ * markers show how far the kernel gets.  A real GICv2 driver (GICD/GICC MMIO,
++ * GICD_SGIR for IPIs, GICC_IAR/EOIR in sleh) is the next step; see HANDOFF
++ * section 20.
++ */
++/* #define HAS_GIC_V3             1 */
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED

@@ -1,0 +1,50 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index cd4a2cb..1eb2433 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1838,7 +1838,21 @@ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
+ static void
+ sweet_early_map_final(boot_args *args)
+ {
++#if defined(ONC_SWEET_4K)
++	/*
++	 * onc 4KB build: with ARM_LARGE_MEMORY off, VM_MIN_KERNEL_ADDRESS is
++	 * -128GB while gVirtBase is around -16GB, i.e. far more than the 1GB
++	 * span of one 4KB-build L1 entry.  The bootstrap KVA L1 table has no
++	 * table entry at VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE, so the old
++	 * sweet expression trips the assert below.  Put the alias in the
++	 * empty blocks directly below gVirtBase instead (same L1/L2 tables as
++	 * the bootstrap kernel mapping) and cover the whole 720x1520x3 =
++	 * 3.28MB onc panel with three 2MB blocks.
++	 */
++	const vm_map_address_t va = gVirtBase - (3 * ARM_TT_L2_SIZE);
++#else
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
++#endif
+ 	uint64_t fb = 0x9c000000ULL;
+ 	if (args != NULL && args->Video.v_baseAddr != 0) {
+ 		fb = args->Video.v_baseAddr;
+@@ -1850,11 +1864,23 @@ sweet_early_map_final(boot_args *args)
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++#if defined(ONC_SWEET_4K)
++	for (int i = 0; i < 3; i++) {
++		assert(slot[i] == ARM_TTE_EMPTY);
++	}
++	for (int i = 0; i < 3; i++) {
++		slot[i] = (block + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
++#else
+ 	assert(*slot == ARM_TTE_EMPTY);
+ 	*slot = block | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++#endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif

@@ -8,7 +8,7 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 +#if HAS_GIC_V2
 +	/* GIC-400: no ICC_SGI1R_EL1.  Broadcast "all but self" so this does not
 +	 * depend on the SoC's CPU-interface numbering. */
-+	extern void pe_gic_send_ipi(void);
++	extern "C" void pe_gic_send_ipi(void);
 +	(void) sgi;
 +	pe_gic_send_ipi();
 +#else

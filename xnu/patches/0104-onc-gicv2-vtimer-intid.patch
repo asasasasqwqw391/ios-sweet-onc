@@ -39,9 +39,16 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  		    SWEET_IPI_SGI);
  	}
  
-@@ -336,7 +358,7 @@
+@@ -335,8 +357,14 @@
+ 	for (unsigned int i = 0; i < 32; i += 4) {
  		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
++	/*
++	 * onc: ICFGR1 configures PPIs 16..31, two bits each.  The architected
++	 * timer PPI is level-sensitive and the reset value is implementation
++	 * defined, so force every PPI to level before enabling the timer.
++	 */
++	gicd_write32(GICD_ICFGR1, 0);
  	gicd_write32(GICD_ISENABLER0,
 -	    (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
 +	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
@@ -51,7 +58,15 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -83,9 +83,11 @@
+@@ -59,6 +59,7 @@
+ #define GICD_IGROUPR0             0x0080
+ #define GICD_ISENABLER0           0x0100
+ #define GICD_IPRIORITYR0          0x0400
++#define GICD_ICFGR1               0x0C04   /* PPI 16..31 config, 2 bits each */
+ #define GICD_SGIR                 0x0F00
+ 
+ #define GICC_CTLR                 0x0000
+@@ -83,9 +84,11 @@
  #endif /* ! ASSEMBLER */
  
  /*

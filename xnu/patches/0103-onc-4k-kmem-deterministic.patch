@@ -81,10 +81,10 @@ diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
 +			vm_map_offset_t addr = sp.kc_range->min_address;
 +			kern_return_t kr;
 +
-+			vm_object_reference(kernel_object);
++			/* plain reservation entry, like kmem_init() does */
 +			kr = vm_map_enter(kernel_map, &addr, sp.kc_size, 0,
 +			    VM_MAP_KERNEL_FLAGS_FIXED(.vmkf_no_pmap_check = true),
-+			    kernel_object, (vm_object_offset_t)addr, FALSE,
++			    VM_OBJECT_NULL, (vm_object_offset_t)0, FALSE,
 +			    VM_PROT_NONE, VM_PROT_NONE,
 +			    VM_INHERIT_DEFAULT);
 +			if (kr != KERN_SUCCESS || addr != sp.kc_range->min_address) {

@@ -1,0 +1,36 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -289,8 +289,18 @@
+ void
+ pe_gic_send_ipi(void)
+ {
++	/*
++	 * onc: this is the signalCPU() path.  The only user in this port is
++	 * SweetCPU::initCPU()'s self-IPI (XNU's cpu_signal_handler clears
++	 * cpu_data.cpu_signal SIGPdisabled there, and SweetCPU::startAll() waits
++	 * for it).  "All PEs except self" therefore excludes the only CPU when
++	 * cpus=1 -- use "all PEs including self".  NSATT=1 makes it a Group 1
++	 * SGI, which is the group this driver puts the SGI in (IGROUPR0=all 1)
++	 * and what sleh_irq() handles.
++	 */
+ 	__builtin_arm_dsb(DSB_ISHST);
+-	gicd_write32(GICD_SGIR, GICD_SGIR_ALL_BUT_SELF | GICD_SGIR_SGI(SWEET_IPI_SGI));
++	gicd_write32(GICD_SGIR, GICD_SGIR_NSATT | GICD_SGIR_ALL_INCLUDING_SELF |
++	    GICD_SGIR_SGI(SWEET_IPI_SGI));
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -74,7 +74,9 @@
+ #define GICC_CTLR_ENABLEGRP1A     (1U << 1)
+ 
+ #define GICD_SGIR_SGI(intid)      ((uint32_t)((intid) & 0xf))
++#define GICD_SGIR_NSATT           (1U << 15)   /* send as Group 1 (NS access) */
+ #define GICD_SGIR_ALL_BUT_SELF    (1U << 24)   /* TargetListFilter = 0b01 */
++#define GICD_SGIR_ALL_INCLUDING_SELF (2U << 24) /* TargetListFilter = 0b10 */
+ 
+ #define GIC_INTID_SPURIOUS_MIN    1020
+ 

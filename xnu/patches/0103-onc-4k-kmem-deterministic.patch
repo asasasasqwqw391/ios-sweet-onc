@@ -1,0 +1,95 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3419,7 +3419,15 @@
+ 	VME_OBJECT_SET(entry, kernel_object, false, 0);
+ 	VME_OFFSET_SET(entry, entry->vme_start);
+ 	vm_map_unlock(kernel_map);
+-	return kmapoff_kaddr + kmapoff_size;
++	{
++		vm_map_size_t onc_free = 0, onc_largest = 0;
++		vm_map_sizes(kernel_map, NULL, &onc_free, &onc_largest);
++		printf("ONC fuzz: entry=%p want=%p size=%llu free=%llu largest=%llu\n",
++		    (void *)entry->vme_start, (void *)kmapoff_kaddr,
++		    (uint64_t)kmapoff_size, (uint64_t)onc_free,
++		    (uint64_t)onc_largest);
++	}
++	return entry->vme_start + kmapoff_size;
+ #else
+ 	vm_offset_t kmapoff_kaddr = 0;
+ 	uint32_t kmapoff_pgcnt = (early_random() & 0x1ff) + 1; /* 9 bits */
+@@ -3666,6 +3674,23 @@
+ 	assert(kmem_claim_count < UINT16_MAX);
+ 	kmem_shuffle_claims();
+ 
++#if defined(ONC_SWEET_4K)
++	/*
++	 * onc 4KB port: the zone map claim is the only claim with a min_address
++	 * restriction, and the zone submaps must be placed near VM_MIN so they
++	 * fall inside the c_slot / vm_page pointer packing windows.  Put it
++	 * first so the deterministic bottom-up placement below starts with it.
++	 */
++	for (uint32_t i = 1; i < kmem_claim_count; i++) {
++		if (kmem_claims[i].kc_range->min_address != 0) {
++			struct kmem_range_startup_spec tmp = kmem_claims[0];
++			kmem_claims[0] = kmem_claims[i];
++			kmem_claims[i] = tmp;
++			break;
++		}
++	}
++#endif /* defined(ONC_SWEET_4K) */
++
+ 	/*
+ 	 * Apply restrictions and determine range for each claim
+ 	 */
+@@ -3673,6 +3698,28 @@
+ 		vm_map_offset_t end = 0;
+ 		struct kmem_range_startup_spec sp = kmem_claims[i];
+ 		struct mach_vm_range *sp_range = sp.kc_range;
++#if defined(ONC_SWEET_4K)
++		/*
++		 * onc 4KB port: place claims deterministically, bottom-up.  The
++		 * generic vm_map_locate_space() path applies the randomized kmem
++		 * range policy and, with the tiny 112GB VA, scatters the claims
++		 * into the upper gap; zone_init() then finds no entry where the
++		 * zone submaps are supposed to go.
++		 */
++		if ((start & PAGE_MASK) != 0) {
++			start = round_page(start);
++		}
++		if (sp_range->min_address && start > sp_range->min_address) {
++			panic("onc: claim %s would start at %p, past restriction %p",
++			    sp.kc_name, (void *)start, (void *)sp_range->min_address);
++		}
++		end = start + sp.kc_size;
++		sp_range->min_address = start;
++		sp_range->max_address = end;
++		start = end;
++		printf("ONC claim[%u] %-24s: %p - %p\n", i, sp.kc_name,
++		    (void *)sp_range->min_address, (void *)sp_range->max_address);
++#else /* !defined(ONC_SWEET_4K) */
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+@@ -3690,6 +3737,7 @@
+ 			sp_range->max_address = end;
+ 		}
+ 		start = end;
++#endif /* !defined(ONC_SWEET_4K) */
+ 	}
+ 
+ 	/*
+@@ -3707,6 +3755,13 @@
+ 			panic("kmem_range_init: vm_map_find_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
++#if defined(ONC_SWEET_4K)
++		if (entry->vme_start != sp.kc_range->min_address) {
++			panic("onc: claim %s entry at %p, expected %p", sp.kc_name,
++			    (void *)entry->vme_start,
++			    (void *)sp.kc_range->min_address);
++		}
++#endif /* defined(ONC_SWEET_4K) */
+ 		vm_object_reference(kernel_object);
+ 		VME_OBJECT_SET(entry, kernel_object, false, 0);
+ 		VME_OFFSET_SET(entry, entry->vme_start);

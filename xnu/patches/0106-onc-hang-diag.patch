@@ -1,0 +1,387 @@
+diff --git a/osfmk/arm64/onc_stage.h b/osfmk/arm64/onc_stage.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/onc_stage.h
+@@ -0,0 +1,32 @@
++/*
++ * onc: kernel-stage markers that survive a hang.
++ *
++ * onc_stage_raw() stores one word (0x4f4e434d00 | stage) in the marker slot the
++ * shim reads back on the next boot ("MK max=").  Stage ranges in use:
++ *   0x06..0x11  start.s
++ *   0x40..0x51  arm_init()/arm_vm_init()            (patch 0092)
++ *   0x61..0x74  sweet_early_mark() panel markers    (0084/0085)
++ *   0x80..0x90  kernel_startup_initialize_upto()    (this patch)
++ *   0xB0..0xB8  SweetCPU::startAll()                (this patch)
++ *   0xC0..0xCC  bsd_init() / vfs_mountroot()        (this patch)
++ * Keep values inside 0x00..0xff: the shim compares the high 56 bits against
++ * 0x4f4e434d.
++ */
++#ifndef _ARM64_ONC_STAGE_H_
++#define _ARM64_ONC_STAGE_H_
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++void onc_stage_raw(unsigned long long stage);
++#ifdef __cplusplus
++}
++#endif
++
++#ifndef ONC_STAGE
++#define ONC_STAGE(n) onc_stage_raw((unsigned long long)(n))
++#endif
++
++#endif /* _ARM64_ONC_STAGE_H_ */
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -302,6 +302,32 @@
+ 	gicd_write32(GICD_SGIR, GICD_SGIR_NSATT | GICD_SGIR_ALL_INCLUDING_SELF |
+ 	    GICD_SGIR_SGI(SWEET_IPI_SGI));
+ 	__builtin_arm_isb(ISB_SY);
++}
++
++/*
++ * onc: dump the GICv2 state from a hang-safe context (idle).  Reads GICC_HPPIR
++ * only -- reading GICC_IAR would acknowledge an interrupt.
++ */
++void
++pe_gic_dump(void)
++{
++	if (!gicd_base || !gicc_base) {
++		kprintf("ONC GIC: not mapped (gicd=%p gicc=%p)\n",
++		    (void *) gicd_base, (void *) gicc_base);
++		return;
++	}
++	kprintf("ONC GIC: vt=%u D_CTLR=%x EN0=%x GRP0=%x PRI%u=%x "
++	    "C_CTLR=%x PMR=%x BPR=%x HPPIR=%x\n",
++	    sweet_vtimer_intid,
++	    gicd_read32(GICD_CTLR),
++	    gicd_read32(GICD_ISENABLER0),
++	    gicd_read32(GICD_IGROUPR0),
++	    sweet_vtimer_intid,
++	    gicd_read32(GICD_IPRIORITYR0 + (sweet_vtimer_intid & ~3U)),
++	    gicc_read32(GICC_CTLR),
++	    gicc_read32(GICC_PMR),
++	    gicc_read32(GICC_BPR),
++	    gicc_read32(GICC_HPPIR));
+ }
+ 
+ void
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -66,6 +66,7 @@
+ #define GICC_BPR                  0x0008
+ #define GICC_IAR                  0x000C
+ #define GICC_EOIR                 0x0010
++#define GICC_HPPIR                0x0018
+ 
+ /* Non-secure view of a GICv2 with two security states: */
+ #define GICD_CTLR_ENABLEGRP1      (1U << 0)
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -37,6 +37,9 @@
+ 
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++void pe_gic_dump(void);
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,13 @@
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(SWEET)
++/* onc: interrupt observability for the idle heartbeat / hang diagnosis. */
++uint64_t onc_irq_count;
++uint32_t onc_last_intid = 0xffffffffu;
++uint64_t onc_vtimer_count;
++#endif /* defined(SWEET) */
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1874,10 +1881,14 @@
+ 	uint64_t iar = SWEET_GIC_ACK();
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
++	onc_irq_count++;
++	onc_last_intid = intid;
++
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
++		onc_vtimer_count++;
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -346,6 +346,44 @@
+ 	 * Idle_load_context()
+ 	 */
+ 	assert((__builtin_arm_rsr("DAIF") & (DAIF_IRQF | DAIF_FIQF)) == (DAIF_IRQF | DAIF_FIQF));
++#if defined(SWEET)
++	/*
++	 * onc: idle heartbeat.  If a thread blocks waiting for a timer (e.g. the
++	 * IOSleep() in SweetCPU::startAll()) and the CPU goes idle, this proves
++	 * whether the idle loop keeps running and whether any interrupt -- in
++	 * particular the architected virtual timer -- is delivered.  Uses
++	 * CNTVCT/CNTFRQ, which do not depend on any interrupt being taken.
++	 */
++	{
++		extern uint64_t onc_irq_count;
++		extern uint32_t onc_last_intid;
++		extern uint64_t onc_vtimer_count;
++		static uint64_t onc_last_hb;
++		static uint32_t onc_hb_count;
++		uint64_t onc_now = __builtin_arm_rsr64("CNTVCT_EL0");
++		uint64_t onc_frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++
++		if (onc_frq < 1000000) {
++			/* CNTFRQ not programmed yet (or bogus): use the board default
++			 * so the heartbeat cannot flood the console. */
++			onc_frq = 24000000;
++		}
++		if (onc_last_hb == 0 || onc_now - onc_last_hb >= onc_frq * 2) {
++			onc_last_hb = onc_now;
++			onc_hb_count++;
++			kprintf("ONC IDLE hb=%u irq=%llu vt=%llu last=%u cntv_ctl=%llx "
++			    "cntv_tval=%llx frq=%llu daif=%llx\n",
++			    onc_hb_count, onc_irq_count, onc_vtimer_count, onc_last_intid,
++			    __builtin_arm_rsr64("CNTV_CTL_EL0"),
++			    __builtin_arm_rsr64("CNTV_TVAL_EL0"),
++			    onc_frq, __builtin_arm_rsr64("DAIF"));
++			if (onc_hb_count == 1) {
++				extern void pe_gic_dump(void);
++				pe_gic_dump();
++			}
++		}
++	}
++#endif /* defined(SWEET) */
+ 	/* Check for, and act on, a WFE recommendation.
+ 	 * Bypasses context spill/fill for a minor perf. increment.
+ 	 * May unmask and restore IRQ+FIQ mask.
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -74,6 +74,7 @@
+ #include <mach/thread_act.h>
+ #include <mach/task_special_ports.h>
+ #include <mach/vm_param.h>
++#include <arm64/onc_stage.h>
+ #include <kern/assert.h>
+ #include <kern/mach_param.h>
+ #include <kern/misc_protos.h>
+@@ -406,10 +407,13 @@
+ 			    cur->subsystem, cur->rank, cur->func, cur->arg);
+ 		}
+ 		startup_phase = cur->subsystem - 1;
++		ONC_STAGE(0x80u + (unsigned long long)cur->subsystem);
+ 		kernel_startup_log(cur->subsystem);
+ 		cur->func(cur->arg);
+ 		startup_entry_cur = ++cur;
+ 	}
++	ONC_STAGE(upto == STARTUP_SUB_LOCKDOWN ? 0x8fu
++	    : 0x80u + (unsigned long long)upto);
+ 	kernel_startup_log(upto);
+ 
+ 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -102,6 +102,7 @@
+ #include <sys/codesign.h>
+ 
+ #include <kern/startup.h>
++#include <arm64/onc_stage.h>
+ #include <kern/thread.h>
+ #include <kern/task.h>
+ #include <kern/ast.h>
+@@ -490,7 +491,10 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
+-#define DEBUG_BSDINIT 0
++/* onc: keep the bsd_init progress prints; they are the only trace of the long
++ * IOKit/BSD initialisation that happens between the startup phases and the
++ * root mount. */
++#define DEBUG_BSDINIT 1
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+@@ -498,6 +502,8 @@
+ #define bsd_init_kprintf(x, ...)
+ #endif
+ 
++	ONC_STAGE(0xC0);
++	kprintf("ONC: bsd_init entry\n");
+ 	throttle_init();
+ 
+ 	printf(copyright);
+@@ -680,6 +686,7 @@
+ 	 */
+ 	bsd_init_kprintf("calling bsd_bufferinit\n");
+ 	bsd_bufferinit();
++	ONC_STAGE(0xC1);
+ 
+ 	/*
+ 	 * Initialize the calendar.
+@@ -690,6 +697,8 @@
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++	ONC_STAGE(0xC2);
++	kprintf("ONC: bsd_init after vfsinit\n");
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+@@ -869,9 +878,12 @@
+ 	inittodr(0);
+ 
+ 	/* Mount the root file system. */
++	ONC_STAGE(0xC3);
++	kprintf("ONC: bsd_init entering root mount loop\n");
+ 	while (TRUE) {
+ 		int err;
+ 
++		ONC_STAGE(0xC4);
+ 		bsd_init_kprintf("calling setconf\n");
+ 		setconf();
+ #if CONFIG_NETBOOT
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -84,6 +84,7 @@
+ #include <sys/mount_internal.h>
+ #include <sys/time.h>
+ #include <sys/lock.h>
++#include <arm64/onc_stage.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/stat.h>
+@@ -1227,6 +1228,9 @@
+ 	vfs_unmountall_started = vfs_unmountall_finished = 0;
+ 	OSMemoryBarrier();
+ 
++	ONC_STAGE(0xC5);
++	kprintf("ONC: vfs_mountroot rootdev=%d mountroot=%p\n",
++	    (int)rootdev, (void *)mountroot);
+ 	KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_START);
+ 	if (mountroot != NULL) {
+ 		/*
+@@ -1239,6 +1243,8 @@
+ 	}
+ 	if ((error = bdevvp(rootdev, &rootvp))) {
+ 		printf("vfs_mountroot: can't setup bdevvp\n");
++		kprintf("ONC: bdevvp(rootdev=%d) failed %d\n", (int)rootdev, error);
++		ONC_STAGE(0xC6);
+ 
+ 		KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error, 1);
+ 		return error;
+@@ -1249,7 +1255,10 @@
+ 	 */
+ 	bdevvp_rootvp = rootvp;
+ 
++	ONC_STAGE(0xC7);
+ 	for (vfsp = vfsconf; vfsp; vfsp = vfsp->vfc_next) {
++		kprintf("ONC: mountroot try %s\n", vfsp->vfc_name);
++		ONC_STAGE(0xC8);
+ 		if (vfsp->vfc_mountroot == NULL
+ 		    && !ISSET(vfsp->vfc_vfsflags, VFC_VFSCANMOUNTROOT)) {
+ 			continue;
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,13 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <arm64/onc_stage.h>
++
++extern "C" {
++extern uint64_t onc_irq_count;
++extern uint64_t onc_vtimer_count;
++extern uint32_t onc_last_intid;
++}
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -134,6 +141,10 @@
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
++	ONC_STAGE(0xB0);
++	IOLog("ONC: startAll entered (registered=%u/%u irq=%llu vt=%llu)\n",
++	    __atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE),
++	    topology->num_cpus, onc_irq_count, onc_vtimer_count);
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -154,14 +165,34 @@
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		ONC_STAGE(0xB1);
++		IOLog("ONC: cpu%u processor_start (init=%u sig_en=%u irq=%llu vt=%llu)\n",
++		    i, (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++		    (unsigned)sweet_cpu_signal_is_enabled(i), onc_irq_count, onc_vtimer_count);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		ONC_STAGE(0xB2);
++		IOLog("ONC: cpu%u processor_start -> %d (init=%u sig_en=%u irq=%llu vt=%llu)\n",
++		    i, kr, (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++		    (unsigned)sweet_cpu_signal_is_enabled(i), onc_irq_count, onc_vtimer_count);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		uint32_t onc_waits = 0;
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
++			ONC_STAGE(0xB3);
++			if (onc_waits < 5 || (onc_waits % 1000) == 0) {
++				IOLog("ONC: wait cpu%u #%u init=%u sig_en=%u irq=%llu "
++				    "vt=%llu last=%u cntv=%llx\n",
++				    i, onc_waits,
++				    (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    (unsigned)sweet_cpu_signal_is_enabled(i), onc_irq_count,
++				    onc_vtimer_count, onc_last_intid,
++				    __builtin_arm_rsr64("CNTVCT_EL0"));
++			}
++			onc_waits++;
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+ 				    i, topology->cpus[i].phys_id);
+@@ -169,13 +200,18 @@
+ 			}
+ 			IOSleep(1);
+ 		}
++		ONC_STAGE(0xB4);
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
++	ONC_STAGE(0xB5);
+ 	ml_cpu_init_completed();
++	ONC_STAGE(0xB6);
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
++	ONC_STAGE(0xB7);
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
++	ONC_STAGE(0xB8);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);

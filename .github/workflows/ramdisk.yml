@@ -30,33 +30,13 @@ jobs:
                    root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
 
-          # ---- minimal Mach-O arm64 init: write(1,"...") then exit(0) -------
-          cat > start.S <<'ASM'
-              .section __TEXT,__text,regular,pure_instructions
-              .globl _start
-          _start:
-              mov     x0, #1
-              adrp    x1, msg@PAGE
-              add     x1, x1, msg@PAGEOFF
-              mov     x2, #14
-              mov     x16, #4
-              svc     #0x80
-              mov     x0, #0
-              mov     x16, #1
-              svc     #0x80
-          1:  b       1b
-              .section __TEXT,__cstring,cstring_literals
-          msg: .ascii "ONC USERLAND\\n"
-          ASM
-          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -nostdlib \
-              -Wl,-e,_start -Wl,-platform_version,ios,14.0,14.0 \
-              -o launchd start.S
-          echo "clang rc=$?"
-          ls -l launchd || true
-          file launchd || true
-          otool -h launchd || true
-          cp launchd root/sbin/launchd
+          # ---- /sbin/launchd: hand-written static arm64 Mach-O (tmp/mklaunchd.py)
+          cp ramdisk/launchd.bin root/sbin/launchd
           chmod 755 root/sbin/launchd
+          codesign --force -s - root/sbin/launchd
+          echo "codesign rc=$?"
+          codesign -dvvv root/sbin/launchd 2>&1 | head -20 || true
+          file root/sbin/launchd || true
 
           # ---- HFS+ volume in a writable device image ----------------------
           hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg

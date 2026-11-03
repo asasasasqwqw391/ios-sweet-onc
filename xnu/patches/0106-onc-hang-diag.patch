@@ -38,8 +38,8 @@ new file mode 100644
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -302,6 +302,32 @@
- 	gicd_write32(GICD_SGIR, GICD_SGIR_NSATT | GICD_SGIR_ALL_INCLUDING_SELF |
+@@ -308,6 +308,32 @@
+ 	gicd_write32(GICD_SGIR, GICD_SGIR_SELF_ONLY |
  	    GICD_SGIR_SGI(SWEET_IPI_SGI));
  	__builtin_arm_isb(ISB_SY);
 +}
@@ -74,7 +74,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -66,6 +66,7 @@
+@@ -67,6 +67,7 @@
  #define GICC_BPR                  0x0008
  #define GICC_IAR                  0x000C
  #define GICC_EOIR                 0x0010
@@ -186,7 +186,7 @@ diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
  #include <kern/assert.h>
  #include <kern/mach_param.h>
  #include <kern/misc_protos.h>
-@@ -406,10 +407,13 @@
+@@ -406,9 +407,15 @@
  			    cur->subsystem, cur->rank, cur->func, cur->arg);
  		}
  		startup_phase = cur->subsystem - 1;
@@ -194,12 +194,14 @@ diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
  		kernel_startup_log(cur->subsystem);
  		cur->func(cur->arg);
  		startup_entry_cur = ++cur;
++	}
++	if ((uint32_t)upto == (uint32_t)STARTUP_SUB_LOCKDOWN) {
++		ONC_STAGE(0x8f);
++	} else {
++		ONC_STAGE(0x80u + (unsigned long long)(uint32_t)upto);
  	}
-+	ONC_STAGE(upto == STARTUP_SUB_LOCKDOWN ? 0x8fu
-+	    : 0x80u + (unsigned long long)upto);
  	kernel_startup_log(upto);
  
- 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
@@ -320,7 +322,35 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
  
  extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
-@@ -134,6 +141,10 @@
+@@ -61,6 +68,27 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetCPU, IOCPU);
++
++/*
++ * onc: interrupt-independent microsecond wait.
++ *
++ * The CPU wait loops below used IOSleep(1), which blocks on a timer interrupt;
++ * while the GICv2 architected timer was broken, that turned a diagnosable 5 s
++ * timeout into a silent hang.  Busy-wait on CNTVCT/CNTFRQ instead (the counter
++ * itself does not need any interrupt).
++ */
++static void
++onc_spin_us(uint32_t us)
++{
++	uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	if (frq < 1000000) {
++		frq = 24000000;
++	}
++	uint64_t until = __builtin_arm_rsr64("CNTVCT_EL0") + (frq * us) / 1000000;
++	while (__builtin_arm_rsr64("CNTVCT_EL0") < until) {
++		__asm__ volatile("yield" ::: "memory");
++	}
++}
+ 
+ bool
+ SweetCPU::start(IOService *provider)
+@@ -134,6 +162,10 @@
  	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
  	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
  	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
@@ -331,7 +361,16 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
  
  	uint64_t deadline;
  	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
-@@ -154,14 +165,34 @@
+@@ -146,7 +178,7 @@
+ 			}
+ 			panic("SWEET CPU: CPU registration timeout");
+ 		}
+-		IOSleep(1);
++		onc_spin_us(1000);
+ 	}
+ 	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+@@ -154,28 +186,53 @@
  	}
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
@@ -366,9 +405,10 @@ diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
  			if (mach_absolute_time() > deadline) {
  				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
  				    i, topology->cpus[i].phys_id);
-@@ -169,13 +200,18 @@
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
  			}
- 			IOSleep(1);
+-			IOSleep(1);
++			onc_spin_us(1000);
  		}
 +		ONC_STAGE(0xB4);
  		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",

@@ -60,7 +60,7 @@ jobs:
           static const char cpath[] = "/dev/console";
 
           void
-          _start(void)
+          start(void)
           {
               long r1 = onc_syscall(SYS_write, 1, (long)msg1, sizeof(msg1) - 1);
               long fd = onc_syscall(SYS_open, (long)cpath, 1 /* O_WRONLY */, 0);

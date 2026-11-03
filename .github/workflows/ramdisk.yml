@@ -1,17 +1,17 @@
 name: ramdisk
 
 # Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root)
-# with a minimal arm64 Mach-O /sbin/launchd, to verify the kernel -> userland
-# (EL0/syscall) handoff.
+# with a minimal arm64 Mach-O /sbin/launchd.
 #
-# launchd candidates, in order:
-#   1. ld64 -static executable built from start.S (structurally guaranteed by
-#      the Apple toolchain; the earlier hand-built Mach-O was rejected by
-#      load_machfile with EXEC_EXIT_REASON_BAD_MACHO)
-#   2. hand-built ramdisk/launchd.bin (v2: page-aligned __TEXT + __LINKEDIT)
-# Each candidate is ad-hoc signed; the first one codesign accepts wins, and the
-# choice is printed to build.log.
+# launchd is built from C with the Apple toolchain (`clang -c` + `ld -static`),
+# ad-hoc signed, and only issues Darwin arm64 syscalls (svc #0x80):
+#   1. write(1, "ONC USERLAND\n", 14)
+#   2. open("/dev/console", O_WRONLY) -> if fd >= 0: write(fd, "ONC CONSOLE OK\n")
+#      then exit(200); otherwise exit(100 + ret_of_write_1)
+# The exit status shows up in the kernel's "initproc failed to start ...
+# exit status N" panic, which tells us what the syscalls returned.
 #
+# Fallbacks (in order): ld-static from start.S (previous), hand-built Mach-O v2.
 # Runs only on its own file / manual dispatch, so it never triggers kernel builds.
 
 on:
@@ -31,13 +31,57 @@ jobs:
         run: |
           cat > mkramdisk.sh <<'SH'
           set -x
-          rm -rf root mnt root.img root.dmg launchd launchd_* start.S start.o
+          rm -rf root mnt root.img root.dmg launchd launchd_* start.c start.S start.o
           mkdir -p root/dev root/private/var/tmp root/private/var/mobile root/private/var/root \
                    root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp \
                    root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
 
-          # ---- minimal arm64 init source: write(1, msg) then exit(0) --------
+          # ---- launchd C source (freestanding, raw svc #0x80 syscalls) ------
+          cat > start.c <<'CSRC'
+          typedef long isize;
+          static inline long
+          onc_syscall(long n, long a, long b, long c)
+          {
+              register long x0 __asm__("x0") = a;
+              register long x1 __asm__("x1") = b;
+              register long x2 __asm__("x2") = c;
+              register long x16 __asm__("x16") = n;
+              __asm__ volatile("svc #0x80"
+                  : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "cc");
+              return x0;
+          }
+          #define SYS_exit  1
+          #define SYS_write 4
+          #define SYS_open  5
+
+          static const char msg1[] = "ONC USERLAND\n";
+          static const char msg2[] = "ONC CONSOLE OK\n";
+          static const char cpath[] = "/dev/console";
+
+          void
+          _start(void)
+          {
+              long r1 = onc_syscall(SYS_write, 1, (long)msg1, sizeof(msg1) - 1);
+              long fd = onc_syscall(SYS_open, (long)cpath, 1 /* O_WRONLY */, 0);
+              if (fd >= 0) {
+                  (void)onc_syscall(SYS_write, fd, (long)msg2, sizeof(msg2) - 1);
+                  onc_syscall(SYS_exit, 200, 0, 0);
+              }
+              onc_syscall(SYS_exit, 100 + r1, 0, 0);
+          }
+          CSRC
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -O1 -ffreestanding \
+              -fno-builtin -fno-stack-protector -c start.c -o start.o
+          echo "compile rc=$?"
+          ls -l start.o || true
+
+          ld -arch arm64 -static -e _start -o launchd_c start.o
+          echo "ld-static C rc=$?"
+
+          # fallback A: ld-static from assembly (previous working build)
           cat > start.S <<'ASM'
               .section __TEXT,__text,regular,pure_instructions
               .globl _start
@@ -55,26 +99,14 @@ jobs:
               .section __TEXT,__cstring,cstring_literals
           msg: .ascii "ONC USERLAND\n"
           ASM
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK=$SDK"
-          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -c start.S -o start.o
-          echo "compile rc=$?"
-          ls -l start.o || true
-
-          # candidate 1a: ld64 directly, static
-          ld -arch arm64 -static -e _start -o launchd_ldstatic start.o
-          echo "ld-static rc=$?"
-          # candidate 1b: clang driver, static
-          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -static -nostdlib \
-              -Wl,-e,_start -o launchd_clangstatic start.S
-          echo "clang-static rc=$?"
-          ls -l launchd_ldstatic launchd_clangstatic || true
-
-          # candidate 2: hand-built Mach-O v2 from the repo
+          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -c start.S -o start_asm.o
+          ld -arch arm64 -static -e _start -o launchd_asm start_asm.o
+          echo "ld-static asm rc=$?"
+          # fallback B: hand-built Mach-O v2 from the repo
           cp ramdisk/launchd.bin launchd_handbuilt
 
           launchd=""
-          for cand in launchd_ldstatic launchd_clangstatic launchd_handbuilt; do
+          for cand in launchd_c launchd_asm launchd_handbuilt; do
             [ -f "$cand" ] || continue
             echo "== candidate $cand"
             file "$cand"

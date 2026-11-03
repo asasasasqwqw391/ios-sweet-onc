@@ -1,14 +1,25 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -224,9 +224,17 @@
+@@ -19,6 +19,10 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++
++#if HAS_GIC_V2
++extern "C" void pe_gic_send_ipi(void);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -224,9 +224,16 @@
  	    (((mpidr >> 16) & 0xff) << 32) |
  	    (((mpidr >> 8) & 0xff) << 16) |
  	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
 +#if HAS_GIC_V2
 +	/* GIC-400: no ICC_SGI1R_EL1.  Broadcast "all but self" so this does not
 +	 * depend on the SoC's CPU-interface numbering. */
-+	extern "C" void pe_gic_send_ipi(void);
 +	(void) sgi;
 +	pe_gic_send_ipi();
 +#else

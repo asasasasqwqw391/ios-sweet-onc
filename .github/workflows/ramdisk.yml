@@ -2,6 +2,8 @@ name: ramdisk
 
 # Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root).
 # Runs only on its own file / manual dispatch, so it never triggers kernel builds.
+# The step's full output is uploaded as the `ramdisk-log` artifact even on
+# failure (job logs need repo admin rights we do not have through the tunnel).
 
 on:
   push:
@@ -16,27 +18,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show tools
-        run: |
-          sw_vers
-          which newfs_hfs hdiutil
-          newfs_hfs 2>&1 | head -3 || true
-
       - name: Build minimal HFS+ root image
         run: |
-          set -eux
+          cat > mkramdisk.sh <<'SH'
+          set -x
           rm -rf root mnt root.img root.dmg
           mkdir -p root/dev root/private/var/tmp root/private/var/mobile root/private/var/root \
-                   root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp root/cores root/etc root/private/etc
+                   root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp \
+                   root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
-          # 1) create an HFS+ volume inside a copy-on-write device image
+
+          ok=0
+          # --- method A: hdiutil volume image, read the raw bytes back ---------
+          set +e
           hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg
-          # 2) read the raw volume bytes back out of that device
-          DEV=$(hdiutil attach -nomount root.dmg | awk 'NR==1{print $1}')
-          echo "device: $DEV"
-          sudo dd if="$DEV" of=root.img bs=1m
-          hdiutil detach "$DEV"
-          # 3) mount the raw image, populate the minimal skeleton, unmount
+          echo "create rc=$?"
+          if [ -f root.dmg ]; then
+            hdiutil attach -nomount root.dmg
+            DEV=$(hdiutil attach -nomount root.dmg | head -1 | awk '{print $1}')
+            echo "DEV=[$DEV]"
+            if [ -n "$DEV" ]; then
+              sudo dd if="$DEV" of=root.img bs=1m
+              echo "dd rc=$?"
+              hdiutil detach "$DEV" || true
+            fi
+          fi
+          hdiutil imageinfo root.dmg 2>&1 | head -20
+          [ -s root.img ] && ok=1
+
+          # --- method B: plain file + newfs_hfs -------------------------------
+          if [ "$ok" != 1 ]; then
+            rm -f root.img
+            mkfile 8m root.img
+            newfs_hfs -v root root.img
+            echo "newfs_hfs rc=$?"
+            [ -s root.img ] && ok=1
+          fi
+          set -e
+          [ "$ok" = 1 ] || { echo "NO IMAGE"; exit 1; }
+
+          # --- mount the raw image, populate, unmount ------------------------
           mkdir -p mnt
           hdiutil attach -mountpoint "$PWD/mnt" root.img
           cp -a root/. mnt/
@@ -44,6 +65,18 @@ jobs:
           hdiutil detach mnt
           ls -l root.img
           shasum -a 256 root.img
+          SH
+          bash -x mkramdisk.sh > build.log 2>&1
+          rc=$?
+          cat build.log
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ramdisk-log
+          path: build.log
+          retention-days: 14
 
       - uses: actions/upload-artifact@v4
         with:

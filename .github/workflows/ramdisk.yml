@@ -1,11 +1,18 @@
 name: ramdisk
 
-# Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root),
-# including a minimal arm64 Mach-O /sbin/launchd that only uses svc #0x80
-# (write + exit), to verify the kernel -> userland (EL0/syscall) handoff.
+# Build a minimal raw HFS+ root volume for the onc XNU port (md0 ramdisk root)
+# with a minimal arm64 Mach-O /sbin/launchd, to verify the kernel -> userland
+# (EL0/syscall) handoff.
+#
+# launchd candidates, in order:
+#   1. ld64 -static executable built from start.S (structurally guaranteed by
+#      the Apple toolchain; the earlier hand-built Mach-O was rejected by
+#      load_machfile with EXEC_EXIT_REASON_BAD_MACHO)
+#   2. hand-built ramdisk/launchd.bin (v2: page-aligned __TEXT + __LINKEDIT)
+# Each candidate is ad-hoc signed; the first one codesign accepts wins, and the
+# choice is printed to build.log.
+#
 # Runs only on its own file / manual dispatch, so it never triggers kernel builds.
-# Full step output is uploaded as `ramdisk-log` even on failure (job logs need
-# repo admin rights we do not have through the tunnel).
 
 on:
   push:
@@ -24,19 +31,66 @@ jobs:
         run: |
           cat > mkramdisk.sh <<'SH'
           set -x
-          rm -rf root mnt root.img root.dmg launchd start.S
+          rm -rf root mnt root.img root.dmg launchd launchd_* start.S start.o
           mkdir -p root/dev root/private/var/tmp root/private/var/mobile root/private/var/root \
                    root/System/Library root/usr/lib root/usr/bin root/bin root/sbin root/tmp \
                    root/cores root/etc root/private/etc
           chmod 1777 root/tmp root/private/var/tmp
 
-          # ---- /sbin/launchd: hand-written static arm64 Mach-O (tmp/mklaunchd.py)
-          cp ramdisk/launchd.bin root/sbin/launchd
+          # ---- minimal arm64 init source: write(1, msg) then exit(0) --------
+          cat > start.S <<'ASM'
+              .section __TEXT,__text,regular,pure_instructions
+              .globl _start
+          _start:
+              mov     x0, #1
+              adrp    x1, msg@PAGE
+              add     x1, x1, msg@PAGEOFF
+              mov     x2, #14
+              mov     x16, #4
+              svc     #0x80
+              mov     x0, #0
+              mov     x16, #1
+              svc     #0x80
+          1:  b       1b
+              .section __TEXT,__cstring,cstring_literals
+          msg: .ascii "ONC USERLAND\n"
+          ASM
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -c start.S -o start.o
+          echo "compile rc=$?"
+          ls -l start.o || true
+
+          # candidate 1a: ld64 directly, static
+          ld -arch arm64 -static -e _start -o launchd_ldstatic start.o
+          echo "ld-static rc=$?"
+          # candidate 1b: clang driver, static
+          xcrun --sdk iphoneos clang -target arm64-apple-ios14.0 -static -nostdlib \
+              -Wl,-e,_start -o launchd_clangstatic start.S
+          echo "clang-static rc=$?"
+          ls -l launchd_ldstatic launchd_clangstatic || true
+
+          # candidate 2: hand-built Mach-O v2 from the repo
+          cp ramdisk/launchd.bin launchd_handbuilt
+
+          launchd=""
+          for cand in launchd_ldstatic launchd_clangstatic launchd_handbuilt; do
+            [ -f "$cand" ] || continue
+            echo "== candidate $cand"
+            file "$cand"
+            otool -h "$cand" 2>&1 | head -6 || true
+            if codesign --force -s - "$cand"; then
+              codesign -dvvv "$cand" 2>&1 | head -8 || true
+              launchd="$cand"
+              echo "CHOSEN $cand"
+              break
+            else
+              echo "codesign failed for $cand"
+            fi
+          done
+          [ -n "$launchd" ] || { echo "NO USABLE launchd"; exit 1; }
+          cp "$launchd" root/sbin/launchd
           chmod 755 root/sbin/launchd
-          codesign --force -s - root/sbin/launchd
-          echo "codesign rc=$?"
-          codesign -dvvv root/sbin/launchd 2>&1 | head -20 || true
-          file root/sbin/launchd || true
 
           # ---- HFS+ volume in a writable device image ----------------------
           hdiutil create -size 8m -fs HFS+ -volname root -layout NONE root.dmg
@@ -56,7 +110,7 @@ jobs:
           bash -x mkramdisk.sh > build.log 2>&1
           rc=$?
           cat build.log
-          ls -l root.img launchd || true
+          ls -l root.img launchd launchd_* 2>/dev/null || true
           exit $rc
 
       - uses: actions/upload-artifact@v4

@@ -11,12 +11,22 @@ set -euo pipefail
 # is committed next to this script as sweet_bearssl.tar.gz, so stage offline.
 here=$(cd "$(dirname "$0")" && pwd)
 target=libkern/crypto/sweet_bearssl
-if [[ -f "$here/sweet_bearssl.tar.gz" ]]; then
+# The workflow only copies *.patch and *.sh into dxb/patches, so also look for
+# the tarball where the checked-out repository keeps it.
+tarfile=""
+for cand in "$here/sweet_bearssl.tar.gz" \
+            "${GITHUB_WORKSPACE:-/nonexistent}/xnu/patches/sweet_bearssl.tar.gz"; do
+    if [[ -f "$cand" ]]; then
+        tarfile="$cand"
+        break
+    fi
+done
+if [[ -n "$tarfile" ]]; then
     if [[ ! -f "$target/src/inner.h" ]]; then
-        tar xzf "$here/sweet_bearssl.tar.gz" -C libkern/crypto
+        tar xzf "$tarfile" -C libkern/crypto
     fi
     [[ -f "$target/src/inner.h" ]] || { echo "ERROR: bad sweet_bearssl.tar.gz" >&2; exit 1; }
-    echo "Staged BearSSL (offline tarball) constant-time AES, MD5, SHA-1, SHA-384/512 for SWEET"
+    echo "Staged BearSSL (offline tarball $tarfile) constant-time AES, MD5, SHA-1, SHA-384/512 for SWEET"
     exit 0
 fi
 

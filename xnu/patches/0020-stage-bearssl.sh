@@ -3,6 +3,23 @@
 set -euo pipefail
 [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
 [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
+
+# 2026-11-04: www.bearssl.org has been returning HTTP 502 for extended periods,
+# which failed every CI build before compilation even started (three runs in a
+# row).  The exact staged tree for commit 7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
+# (inc/, src/, LICENSE.txt, with the XNU machine/limits.h patch already applied)
+# is committed next to this script as sweet_bearssl.tar.gz, so stage offline.
+here=$(cd "$(dirname "$0")" && pwd)
+target=libkern/crypto/sweet_bearssl
+if [[ -f "$here/sweet_bearssl.tar.gz" ]]; then
+    if [[ ! -f "$target/src/inner.h" ]]; then
+        tar xzf "$here/sweet_bearssl.tar.gz" -C libkern/crypto
+    fi
+    [[ -f "$target/src/inner.h" ]] || { echo "ERROR: bad sweet_bearssl.tar.gz" >&2; exit 1; }
+    echo "Staged BearSSL (offline tarball) constant-time AES, MD5, SHA-1, SHA-384/512 for SWEET"
+    exit 0
+fi
+
 bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT

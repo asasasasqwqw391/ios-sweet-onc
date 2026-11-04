@@ -52,6 +52,7 @@ jobs:
               return x0;
           }
           #define SYS_exit  1
+          #define SYS_read  3
           #define SYS_write 4
           #define SYS_open  5
 
@@ -62,13 +63,21 @@ jobs:
           void
           start(void)
           {
+              char c;
               long r1 = onc_syscall(SYS_write, 1, (long)msg1, sizeof(msg1) - 1);
               long fd = onc_syscall(SYS_open, (long)cpath, 1 /* O_WRONLY */, 0);
+              (void)r1;
               if (fd >= 0) {
                   (void)onc_syscall(SYS_write, fd, (long)msg2, sizeof(msg2) - 1);
-                  onc_syscall(SYS_exit, 200, 0, 0);
               }
-              onc_syscall(SYS_exit, 100 + r1, 0, 0);
+              /* Stay resident: exiting makes the kernel panic on init exit
+               * ("initproc failed to start"). Block on console reads, or spin
+               * in userland when there is no usable console fd. */
+              for (;;) {
+                  if (fd >= 0) {
+                      (void)onc_syscall(SYS_read, fd, (long)&c, 1);
+                  }
+              }
           }
           CSRC
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)

@@ -1,0 +1,1276 @@
+--- /dev/null
++++ b/bsd/dev/onc_emmc.c
+@@ -0,0 +1,1236 @@
++/*
++ * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
++ *
++ * The eMMC is soldered to the Qualcomm SDCC1 controller: the standard SDHCI
++ * core lives at 0x7824900 ("hc_mem" in the device tree, 0x500 bytes), the
++ * vendor/MCI block that holds HC_MODE and the PWRCTL registers lives at
++ * 0x7824000 ("core_mem", 0x800 bytes), and the applications clock is a GCC
++ * root at 0x1800000.  None of this needs a device tree node: the addresses,
++ * the register sequence and the command/read logic below are the exact
++ * sequence proven from non-secure EL1 on the phone by the shim probe
++ * (xnuios/shim-onc/emmc.c v15, HANDOFF.md section H.13).  That probe
++ * enumerated the soldered eMMC and read its GPT:
++ *
++ *	RCA=1, EXT_CSD SEC_COUNT=0x0747C000 (64 GiB device),
++ *	LBA0 signature 0xAA55, GPT partition names, and 512-byte PIO
++ *	reads of any block (CMD17).
++ *
++ * Four details from that probe matter and are easy to get wrong here:
++ *
++ *  1. The COMMAND register has to be written with a 16-bit store to 0x0e
++ *     (and the transfer mode with a 16-bit store to 0x0c), exactly like
++ *     Linux drivers/mmc/host/sdhci.c does writew(cmd, ioaddr + SDHCI_COMMAND).
++ *     A 32-bit merged store to 0x0c is silently dropped by this controller:
++ *     the command never starts and INT_STATUS stays 0 forever.
++ *  2. The GCC sdcc1_apps root has to be forced on unconditionally
++ *     (CMD_ROOT_EN, bit1) together with the UPDATE latch (bit0).  Left alone
++ *     the root stays parked and the apps branch keeps reading back halted.
++ *  3. HC_MODE and the PWRCTL registers (0x78, 0xdc/0xe0/0xe4/0xe8) are in
++ *     "core_mem" (0x7824000), not at the SDHCI base; only DLL_CONFIG and
++ *     VENDOR_SPEC are at hc_mem + 0x100/0x10c.
++ *  4. 400 kHz identification only needs the always-on XO, so no PLL is
++ *     involved: M=1, N=~3, D=~4 and CFG_RCGR=0x2017 (div 23 = /24, source
++ *     XO, dual-edge MND mode).
++ *
++ * This driver is read-only.  It identifies the card, reads EXT_CSD, walks the
++ * GPT (the header CRC32 is validated so a bogus entry-array location cannot
++ * be trusted silently), prints every non-empty partition, picks one by name
++ * (boot-arg emmcroot=, default "userdata") and exposes it as the BSD disk
++ * "emmcroot0" (block) / "remmcroot0" (character) with 512-byte sectors.
++ * Reads are done with polled PIO, one 512-byte block per CMD17; writes are
++ * refused with EROFS.  Root on it with rd=emmcroot0.
++ *
++ * No interrupt is used and none is enabled: INTEN is held at 0 so the
++ * controller can never raise an IRQ into a kernel that has no handler for it,
++ * and every command polls INT_STATUS instead.  The card stays in 400 kHz
++ * legacy timing / 1-bit bus (no CMD6 HS_TIMING/BUS_WIDTH switch), which is
++ * slow but is exactly what the probe read blocks with.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <machine/machine_routines.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* Root device for rd=emmcroot0 (iokit/bsddev/IOKitBSDInit.cpp). */
++int onc_emmc_rootdev(dev_t *dev);
++
++/* -------------------------------------------------------------------------
++ * Measured address map (onclite, no ADT node needed)
++ *   /soc/sdhci@7824900  reg = <0x7824900 0x500>, <0x7824000 0x800>
++ *                       reg-names = "hc_mem", "core_mem"
++ *   /soc/qcom,gcc@1800000 reg = <0x1800000 0x80000>
++ * ---------------------------------------------------------------------- */
++#define OE_SDCC_HC_PHYS		0x07824900UL
++#define OE_SDCC_HC_SIZE		0x00000500UL
++#define OE_SDCC_CORE_PHYS	0x07824000UL
++#define OE_SDCC_CORE_SIZE	0x00000800UL
++#define OE_GCC_PHYS		0x01800000UL
++#define OE_GCC_SIZE		0x00080000UL
++
++/* ---- SDHCI registers at hc_mem ---------------------------------------- */
++#define R_BLK			0x04	/* block size | block count */
++#define R_ARG			0x08
++#define R_CMD			0x0c	/* transfer mode (16) | command (16) */
++#define R_RESP			0x10	/* 4 x 32 response words */
++#define R_BUF			0x20	/* data port */
++#define R_PRESENT		0x24
++#define R_HOSTPWR		0x28	/* host control (8) | power control (8) */
++#define R_CLK			0x2c	/* clock (16) | timeout (8) | sw reset (8) */
++#define R_INT			0x30	/* normal status (16) | error status (16) */
++#define R_INTEN			0x34
++#define R_CAPA			0x40
++#define R_DLL_CFG		0x100
++#define R_DLL_STS		0x108
++#define R_VENDOR_SPEC		0x10c
++
++#define OE_VENDOR_SPEC_POR	0xA9Cu	/* CORE_VENDOR_SPEC_POR_VAL (sdhci-msm) */
++#define OE_POWER_3V3_ON		0x0Fu	/* power control byte: bus on + 3.3 V */
++#define OE_CLK_TIMEOUT_BYTE	0x0Eu	/* data timeout counter: max */
++#define OE_SW_RESET_ALL		0x07000000u
++#define OE_INT_CLK_EN		0x0001u
++#define OE_INT_CLK_STABLE	0x0002u	/* read-only */
++#define OE_SD_CLK_EN		0x0004u
++
++/* ---- vendor / MCI registers at core_mem (sdhci-msm.c:233-261) --------- */
++#define M_MCI_VERSION		0x050
++#define M_GENERICS		0x070
++#define M_HC_MODE		0x078
++#define M_PWR_STATUS		0x0dc
++#define M_PWR_MASK		0x0e0
++#define M_PWR_CLEAR		0x0e4
++#define M_PWR_CTL		0x0e8
++
++#define OE_HC_MODE_EN		0x0001u
++#define OE_FF_CLK_SW_RST_DIS	0x2000u	/* BIT(13) */
++#define OE_PWR_BUS_SUCCESS	0x0001u
++#define OE_PWR_IO_SUCCESS	0x0004u
++
++/* ---- GCC sdcc1_apps root and branch gates (gcc-msm8953.c) ------------- */
++#define G_SDCC1_BCR		0x42000	/* block reset */
++#define G_APPS_CMD		0x42004	/* RCG CMD_RCGR */
++#define G_APPS_CFG		0x42008	/* RCG CFG_RCGR */
++#define G_APPS_M		0x4200c
++#define G_APPS_N		0x42010
++#define G_APPS_D		0x42014
++#define G_APPS_BRANCH		0x42018	/* apps clock branch */
++#define G_AHB_BRANCH		0x4201c	/* iface/AHB clock branch */
++
++#define OE_RCG_CMD_UPDATE	0x1u
++#define OE_RCG_CMD_ROOT_EN	0x2u
++#define OE_RCG_CFG_DIV_MASK	0x1fu	/* hid_width = 5 */
++#define OE_RCG_CFG_SEL_MASK	0x700u	/* src_sel[10:8] */
++#define OE_RCG_CFG_MODE_MASK	0x3000u	/* mode[13:12] */
++#define OE_RCG_CFG_MODE_DUAL_EDGE 0x2000u
++/* 400 kHz from XO is div 23 (/24) | dual edge | src_sel 0 = 0x2017 */
++
++/* ---- SDHCI command word (Linux SDHCI_MAKE_CMD layout) ----------------- */
++#define OE_RSP_NONE		0x0u
++#define OE_RSP_136		0x1u	/* R2: 136-bit */
++#define OE_RSP_48		0x2u	/* R1/R3/R6: 48-bit */
++#define OE_RSP_48_BUSY		0x3u	/* R1b */
++#define OE_CC_CRC		0x8u
++#define OE_CC_IDX		0x10u
++#define OE_CC_DATA		0x20u
++#define OE_CMD_IDX(n)		((uint32_t)(n) << 8)
++
++/* ---- SDHCI normal interrupt status bits ------------------------------- */
++#define OE_INT_CC		0x0001u	/* command complete */
++#define OE_INT_TC		0x0002u	/* transfer complete */
++#define OE_INT_BRR		0x0020u	/* buffer read ready */
++#define OE_INT_ERR		0xFFFF8000u /* error status half + error bit */
++
++/* ---- transfer mode (0x0c) -------------------------------------------- */
++#define OE_TM_READ		0x0010u	/* data transfer direction: read */
++
++#define OE_BLOCK_SIZE		512u
++#define OE_CMD_TIMEOUT_NS	(100ull * NSEC_PER_MSEC)
++#define OE_DATA_TIMEOUT_NS	(200ull * NSEC_PER_MSEC)
++#define OE_REG_TIMEOUT_NS	(50ull * NSEC_PER_MSEC)
++#define OE_CLK_TIMEOUT_NS	(100ull * NSEC_PER_MSEC)
++#define OE_GPT_MAX_PRINT	80u
++
++static struct {
++	vm_offset_t hc;		/* SDHCI registers (hc_mem) */
++	vm_offset_t core;	/* MCI/HC_MODE/PWRCTL registers (core_mem) */
++	vm_offset_t gcc;	/* GCC clock controller */
++	uint32_t rca;		/* relative card address */
++	uint32_t sec_count;	/* EXT_CSD SEC_COUNT, in 512-byte sectors */
++	uint32_t ext_csd_rev;	/* EXT_CSD_REV */
++	uint64_t first_lba;	/* selected partition, first 512-byte LBA */
++	uint64_t nblocks;	/* selected partition, length in 512-byte blocks */
++	uint32_t secsize;	/* logical sector size exposed to the BSD layer */
++	bool cmd32;		/* CMD0 only worked through the 32-bit window */
++	bool writable;		/* always false: writes are not implemented */
++	bool attempted;		/* a full init was already tried */
++	bool ready;
++	int error;		/* result of the first init attempt */
++	int bmajor;
++	int cmajor;
++	dev_t bdev;
++} oe;
++
++static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
++static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
++
++static uint8_t oe_sector[OE_BLOCK_SIZE];	/* PIO landing buffer */
++static uint8_t oe_bounce[OE_BLOCK_SIZE];	/* strategy bounce buffer */
++
++/* -------------------------------------------------------------------------
++ * MMIO accessors.  Every register access goes through these three; the
++ * 16-bit store is not an optimisation, it is required for R_CMD.
++ * ---------------------------------------------------------------------- */
++static inline uint32_t
++oe_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++oe_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static inline void
++oe_wr16(vm_offset_t base, uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(base + off) = v;
++}
++
++/* -------------------------------------------------------------------------
++ * Time helpers.  Polled operation, so every wait is bounded by a deadline
++ * derived from the machine's absolute time counter (as in sweet_ufs.c).
++ * ---------------------------------------------------------------------- */
++static uint64_t
++oe_deadline(uint64_t ns)
++{
++	uint64_t interval;
++
++	nanoseconds_to_absolutetime(ns, &interval);
++	return mach_absolute_time() + interval;
++}
++
++static bool
++oe_expired(uint64_t deadline)
++{
++	return mach_absolute_time() > deadline;
++}
++
++/* Poll until (value & mask) == 0.  Returns 0 or ETIMEDOUT. */
++static int
++oe_poll_clear(vm_offset_t base, uint32_t off, uint32_t mask, uint64_t ns)
++{
++	uint64_t deadline = oe_deadline(ns);
++
++	for (;;) {
++		if ((oe_rd(base, off) & mask) == 0) {
++			return 0;
++		}
++		if (oe_expired(deadline)) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/* Poll until (value & mask) != 0.  Returns 0 or ETIMEDOUT. */
++static int
++oe_poll_set(vm_offset_t base, uint32_t off, uint32_t mask, uint64_t ns)
++{
++	uint64_t deadline = oe_deadline(ns);
++
++	for (;;) {
++		if ((oe_rd(base, off) & mask) != 0) {
++			return 0;
++		}
++		if (oe_expired(deadline)) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
++ * Switch a GCC branch on: write the enable bit (bit0) and poll it, since bit0
++ * reads back 1 while the branch is still halted.  Returns the last value read.
++ */
++static uint32_t
++oe_branch_on(uint32_t off)
++{
++	int i;
++
++	oe_wr(oe.gcc, off, oe_rd(oe.gcc, off) | 1u);
++	for (i = 0; i < 1000; i++) {
++		if ((oe_rd(oe.gcc, off) & 1u) == 0) {
++			break;
++		}
++		delay(1);
++	}
++	return oe_rd(oe.gcc, off);
++}
++
++/* Little-endian readers for the GPT/EXT_CSD on-card structures. */
++static uint32_t
++oe_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint64_t
++oe_le64(const uint8_t *p)
++{
++	uint64_t v = 0;
++	int i;
++
++	for (i = 7; i >= 0; i--) {
++		v = (v << 8) | (uint64_t)p[i];
++	}
++	return v;
++}
++
++/* Standard reflected CRC-32 (polynomial 0xEDB88320), as used by GPT. */
++static uint32_t
++oe_crc32(uint32_t crc, const uint8_t *p, uint32_t len)
++{
++	uint32_t i;
++	int b;
++
++	for (i = 0; i < len; i++) {
++		crc ^= (uint32_t)p[i];
++		for (b = 0; b < 8; b++) {
++			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
++		}
++	}
++	return crc;
++}
++
++/* -------------------------------------------------------------------------
++ * Commands
++ * ---------------------------------------------------------------------- */
++
++/*
++ * One command without data.
++ *
++ * Returns 0 on command complete, EIO on an error interrupt status and
++ * ETIMEDOUT if the controller never completes it.  resp[] (may be NULL)
++ * receives the four response words when the command completed; ist (may be
++ * NULL) receives the last INT_STATUS value seen.
++ *
++ * The command is stored 16-bit at 0x0e; see the file comment.
++ */
++static int
++oe_issue16(uint32_t cmdw, uint32_t arg, uint32_t *resp, uint32_t *ist)
++{
++	uint32_t st = 0;
++	uint64_t deadline;
++	int rc = ETIMEDOUT;
++
++	if (resp != NULL) {
++		resp[0] = 0;
++		resp[1] = 0;
++		resp[2] = 0;
++		resp[3] = 0;
++	}
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_ARG, arg);
++	(void)oe_rd(oe.hc, R_CMD);			/* flush the window */
++	oe_wr16(oe.hc, R_CMD, 0);			/* transfer mode: no data */
++	(void)oe_rd(oe.hc, R_CMD);			/* barrier between the stores */
++	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(cmdw & 0xFFFFu));
++
++	deadline = oe_deadline(OE_CMD_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			break;
++		}
++		if ((st & OE_INT_CC) != 0) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			break;
++		}
++		delay(1);
++	}
++	if (rc == 0 && resp != NULL) {
++		resp[0] = oe_rd(oe.hc, R_RESP + 0x0);
++		resp[1] = oe_rd(oe.hc, R_RESP + 0x4);
++		resp[2] = oe_rd(oe.hc, R_RESP + 0x8);
++		resp[3] = oe_rd(oe.hc, R_RESP + 0xc);
++	}
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	if (ist != NULL) {
++		*ist = st;
++	}
++	return rc;
++}
++
++/*
++ * Diagnostic variant of oe_issue16() that uses the 32-bit merged window at
++ * 0x0c (the encoding the v10..v13 probe used).  It is only kept so CMD0 can
++ * report which path the controller answered on; measured on the phone, this
++ * path never completes a command.
++ */
++static int
++oe_issue32(uint32_t cmdw, uint32_t arg, uint32_t *resp, uint32_t *ist)
++{
++	uint32_t st = 0;
++	uint64_t deadline;
++	int rc = ETIMEDOUT;
++
++	if (resp != NULL) {
++		resp[0] = 0;
++		resp[1] = 0;
++		resp[2] = 0;
++		resp[3] = 0;
++	}
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_ARG, arg);
++	oe_wr(oe.hc, R_CMD, (cmdw << 16) | 0);
++
++	deadline = oe_deadline(OE_CMD_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			break;
++		}
++		if ((st & OE_INT_CC) != 0) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			break;
++		}
++		delay(1);
++	}
++	if (rc == 0 && resp != NULL) {
++		resp[0] = oe_rd(oe.hc, R_RESP + 0x0);
++		resp[1] = oe_rd(oe.hc, R_RESP + 0x4);
++		resp[2] = oe_rd(oe.hc, R_RESP + 0x8);
++		resp[3] = oe_rd(oe.hc, R_RESP + 0xc);
++	}
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	if (ist != NULL) {
++		*ist = st;
++	}
++	return rc;
++}
++
++static int
++oe_issue(uint32_t cmdw, uint32_t arg, uint32_t *resp, uint32_t *ist)
++{
++	if (oe.cmd32) {
++		return oe_issue32(cmdw, arg, resp, ist);
++	}
++	return oe_issue16(cmdw, arg, resp, ist);
++}
++
++/*
++ * One 512-byte PIO data read.  cmdw carries OE_CC_DATA; arg is the card
++ * argument (block address for CMD17, 0 for CMD8/EXT_CSD).  The data port is
++ * 32-bit, so 128 reads fill the block; then transfer complete is awaited so
++ * the next command starts from a clean interrupt state.
++ */
++static int
++oe_pio_read(uint32_t cmdw, uint32_t arg, uint8_t *out)
++{
++	uint32_t st = 0;
++	uint64_t deadline;
++	int rc = ETIMEDOUT;
++	int i;
++
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_BLK, (1u << 16) | OE_BLOCK_SIZE);
++	oe_wr(oe.hc, R_ARG, arg);
++	(void)oe_rd(oe.hc, R_CMD);			/* flush the window */
++	oe_wr16(oe.hc, R_CMD, OE_TM_READ);		/* transfer mode: read */
++	(void)oe_rd(oe.hc, R_CMD);			/* barrier between the stores */
++	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(cmdw & 0xFFFFu));
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & (OE_INT_CC | OE_INT_BRR)) == (OE_INT_CC | OE_INT_BRR)) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			goto out;
++		}
++		delay(1);
++	}
++
++	for (i = 0; i < (int)(OE_BLOCK_SIZE / 4u); i++) {
++		uint32_t w = oe_rd(oe.hc, R_BUF);
++
++		out[i * 4 + 0] = (uint8_t)(w & 0xffu);
++		out[i * 4 + 1] = (uint8_t)((w >> 8) & 0xffu);
++		out[i * 4 + 2] = (uint8_t)((w >> 16) & 0xffu);
++		out[i * 4 + 3] = (uint8_t)((w >> 24) & 0xffu);
++	}
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & OE_INT_TC) != 0) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			/* The bytes are already in out; still report the error. */
++			rc = ETIMEDOUT;
++			goto out;
++		}
++		delay(1);
++	}
++
++out:
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	if (rc != 0) {
++		printf("ONC EMMC: data command 0x%04x arg 0x%08x failed (rc %d int 0x%08x)\n",
++		    cmdw, arg, rc, st);
++	}
++	return rc;
++}
++
++/* One 512-byte block by LBA, the only read primitive the BSD layer uses. */
++static int
++oe_read_lba(uint64_t lba, uint8_t *out)
++{
++	if (lba > (uint64_t)UINT32_MAX) {
++		/* CMD17 takes a 32-bit block address. */
++		return EINVAL;
++	}
++	return oe_pio_read(OE_CMD_IDX(17) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
++	    OE_CC_DATA, (uint32_t)lba, out);
++}
++
++/* -------------------------------------------------------------------------
++ * Controller bring-up (measured sequence, see file comment)
++ * ---------------------------------------------------------------------- */
++
++/*
++ * GCC: gate the AHB branch, reset SDCC1, program sdcc1_apps for 400 kHz from
++ * the always-on XO, force the root on and latch it, then gate the apps
++ * branch.  No PLL is needed for 400 kHz.
++ */
++static void
++oe_gcc_clock_init(void)
++{
++	uint32_t v;
++	uint32_t update_stuck = 1;
++
++	printf("ONC EMMC: gcc pre cmd=0x%08x cfg=0x%08x branch=0x%08x ahb=0x%08x bcr=0x%08x\n",
++	    oe_rd(oe.gcc, G_APPS_CMD), oe_rd(oe.gcc, G_APPS_CFG),
++	    oe_rd(oe.gcc, G_APPS_BRANCH), oe_rd(oe.gcc, G_AHB_BRANCH),
++	    oe_rd(oe.gcc, G_SDCC1_BCR));
++
++	oe_wr(oe.gcc, G_AHB_BRANCH, oe_rd(oe.gcc, G_AHB_BRANCH) | 1u);
++	oe_wr(oe.gcc, G_SDCC1_BCR, 1u);		/* assert SDCC1 reset */
++	delay(200);				/* >= 125 us */
++	oe_wr(oe.gcc, G_SDCC1_BCR, 0u);		/* deassert */
++	delay(200);
++	(void)oe_branch_on(G_AHB_BRANCH);
++
++	/* 400 kHz: M = m = 1, N = ~(n - m) = ~3, D = ~clamp(n, m, 2(n-m)) = ~4 */
++	oe_wr(oe.gcc, G_APPS_M, 0x1u);
++	oe_wr(oe.gcc, G_APPS_N, 0xFCu);
++	oe_wr(oe.gcc, G_APPS_D, 0xFBu);
++	v = oe_rd(oe.gcc, G_APPS_CFG);
++	v &= ~(OE_RCG_CFG_DIV_MASK | OE_RCG_CFG_SEL_MASK | OE_RCG_CFG_MODE_MASK);
++	v |= 23u;				/* pre_div = 2*12-1 (XO/12) */
++	v |= OE_RCG_CFG_MODE_DUAL_EDGE;		/* m=1 != n=4 */
++	oe_wr(oe.gcc, G_APPS_CFG, v);		/* src_sel = P_XO = 0 */
++
++	/* Force the root on (bit1, sticky) and latch it with UPDATE (bit0). */
++	v = oe_rd(oe.gcc, G_APPS_CMD);
++	v |= OE_RCG_CMD_UPDATE | OE_RCG_CMD_ROOT_EN;
++	oe_wr(oe.gcc, G_APPS_CMD, v);
++	if (oe_poll_clear(oe.gcc, G_APPS_CMD, OE_RCG_CMD_UPDATE,
++	    OE_REG_TIMEOUT_NS) == 0) {
++		update_stuck = 0;
++	}
++	(void)oe_branch_on(G_APPS_BRANCH);
++
++	printf("ONC EMMC: gcc cmd=0x%08x cfg=0x%08x m=%u n=0x%02x d=0x%02x apps=0x%08x ahb=0x%08x update_stuck=%u\n",
++	    oe_rd(oe.gcc, G_APPS_CMD), oe_rd(oe.gcc, G_APPS_CFG),
++	    oe_rd(oe.gcc, G_APPS_M), oe_rd(oe.gcc, G_APPS_N), oe_rd(oe.gcc, G_APPS_D),
++	    oe_rd(oe.gcc, G_APPS_BRANCH), oe_rd(oe.gcc, G_AHB_BRANCH), update_stuck);
++}
++
++/*
++ * core_mem: HC_MODE (0x78).  HC_MODE_EN latches the mode; FF_CLK_SW_RST_DIS
++ * must stay set or the core resets itself whenever the SDCLK feedback stops.
++ */
++static void
++oe_core_init(void)
++{
++	uint32_t v;
++
++	oe_wr(oe.core, M_HC_MODE, OE_HC_MODE_EN);
++	v = oe_rd(oe.core, M_HC_MODE);
++	oe_wr(oe.core, M_HC_MODE, v | OE_HC_MODE_EN | OE_FF_CLK_SW_RST_DIS);
++	printf("ONC EMMC: mci version=0x%08x generics=0x%08x hc_mode=0x%08x\n",
++	    oe_rd(oe.core, M_MCI_VERSION), oe_rd(oe.core, M_GENERICS),
++	    oe_rd(oe.core, M_HC_MODE));
++}
++
++/*
++ * Take the SDHCI core over from whatever state the bootloader left it in:
++ * reset it, restore the vendor POR latch, power the bus, complete the PWRCTL
++ * handshake and start the card clock.  The internal clock stable bit (bit1,
++ * read-only) is the hardware proof that the GCC root really toggles.
++ *
++ * INTEN is left at 0 on purpose: this driver polls INT_STATUS and must never
++ * let the controller raise an interrupt.
++ */
++static int
++oe_sdhci_takeover(void)
++{
++	uint32_t v;
++	uint32_t pst;
++	int error;
++
++	printf("ONC EMMC: sdhci pre present=0x%08x capa=0x%08x clk=0x%08x dll=0x%08x vs=0x%08x\n",
++	    oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CAPA), oe_rd(oe.hc, R_CLK),
++	    oe_rd(oe.hc, R_DLL_CFG), oe_rd(oe.hc, R_VENDOR_SPEC));
++
++	oe_wr(oe.hc, R_CLK, oe_rd(oe.hc, R_CLK) | OE_SW_RESET_ALL);
++	error = oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_ALL, OE_REG_TIMEOUT_NS);
++	if (error != 0) {
++		printf("ONC EMMC: software reset did not complete (clk=0x%08x)\n",
++		    oe_rd(oe.hc, R_CLK));
++		return error;
++	}
++
++	oe_wr(oe.hc, R_VENDOR_SPEC, OE_VENDOR_SPEC_POR);
++	v = oe_rd(oe.hc, R_HOSTPWR);
++	oe_wr(oe.hc, R_HOSTPWR, (v & ~0xFF00u) | (OE_POWER_3V3_ON << 8));
++
++	/* PWRCTL: clear the pending boot request, then acknowledge BUS/IO on. */
++	pst = oe_rd(oe.core, M_PWR_STATUS);
++	oe_wr(oe.core, M_PWR_CLEAR, pst & 0xFu);
++	delay(2000);
++	oe_wr(oe.core, M_PWR_CTL, OE_PWR_BUS_SUCCESS | OE_PWR_IO_SUCCESS);
++	delay(20000);
++	printf("ONC EMMC: pwrctl status=0x%08x mask=0x%08x ctl=0x%08x hostpwr=0x%08x\n",
++	    oe_rd(oe.core, M_PWR_STATUS), oe_rd(oe.core, M_PWR_MASK),
++	    oe_rd(oe.core, M_PWR_CTL), oe_rd(oe.hc, R_HOSTPWR));
++
++	/* Internal clock first; only then enable the SD clock. */
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	error = oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	if (error != 0) {
++		printf("ONC EMMC: internal clock never became stable (clk=0x%08x)\n",
++		    oe_rd(oe.hc, R_CLK));
++		return error;
++	}
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
++	    OE_INT_CLK_STABLE | OE_SD_CLK_EN);
++	delay(2000);
++
++	oe_wr(oe.hc, R_INTEN, 0);		/* polled operation, never IRQ */
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	printf("ONC EMMC: sdhci clk=0x%08x present=0x%08x\n",
++	    oe_rd(oe.hc, R_CLK), oe_rd(oe.hc, R_PRESENT));
++	return 0;
++}
++
++/*
++ * Card identification, exactly the sequence the probe proved:
++ * CMD0 -> CMD1 (repeat until OCR bit31) -> CMD2 -> CMD3 -> CMD9 -> CMD7 ->
++ * CMD13 -> CMD8 (EXT_CSD).  No CMD6: the card stays in 400 kHz legacy timing
++ * on a 1-bit bus, which is what the probe read blocks with.
++ */
++static int
++oe_card_init(void)
++{
++	uint32_t resp[4];
++	uint32_t ist = 0;
++	uint32_t ocr = 0;
++	int rc;
++	int i;
++
++	resp[0] = 0;
++	resp[1] = 0;
++	resp[2] = 0;
++	resp[3] = 0;
++
++	/* A card that was already selected (probe/shim) needs a reset first. */
++	(void)oe_issue16(OE_CMD_IDX(0) | OE_RSP_NONE, 0xF0F0F0F0u, NULL, &ist);
++	printf("ONC EMMC: cmd0 pre-idle int=0x%08x\n", ist);
++
++	rc = oe_issue16(OE_CMD_IDX(0) | OE_RSP_NONE, 0, NULL, &ist);
++	printf("ONC EMMC: cmd0 rc=%d int=0x%08x\n", rc, ist);
++	if (rc != 0) {
++		/*
++		 * The 32-bit merged window never worked on the phone, but if
++		 * 16-bit fails too, try it once so the console says whether
++		 * the controller answers at all.
++		 */
++		rc = oe_issue32(OE_CMD_IDX(0) | OE_RSP_NONE, 0, NULL, &ist);
++		printf("ONC EMMC: cmd0 (32-bit window) rc=%d int=0x%08x\n", rc, ist);
++		if (rc != 0) {
++			printf("ONC EMMC: controller does not execute commands\n");
++			return rc;
++		}
++		oe.cmd32 = true;
++	}
++
++	/* eMMC powers up slowly: repeat CMD1 (SEND_OP_COND) until OCR bit31. */
++	for (i = 0; i < 20; i++) {
++		(void)oe_issue(OE_CMD_IDX(1) | OE_RSP_48, 0x40FF8080u, resp, &ist);
++		ocr = resp[0];
++		if ((ocr & 0x80000000u) != 0) {
++			break;
++		}
++		delay(25000);
++	}
++	printf("ONC EMMC: cmd1 ocr=0x%08x int=0x%08x\n", ocr, ist);
++	if ((ocr & 0x80000000u) == 0) {
++		printf("ONC EMMC: card never signalled power-up (OCR bit31)\n");
++		return ETIMEDOUT;
++	}
++
++	rc = oe_issue(OE_CMD_IDX(2) | OE_RSP_136 | OE_CC_CRC, 0, resp, &ist);
++	if (rc != 0) {
++		printf("ONC EMMC: cmd2 (CID) failed rc=%d int=0x%08x\n", rc, ist);
++		return rc;
++	}
++	printf("ONC EMMC: cid=0x%08x%08x%08x%08x\n",
++	    resp[0], resp[1], resp[2], resp[3]);
++
++	rc = oe_issue(OE_CMD_IDX(3) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
++	    1u << 16, resp, &ist);
++	if (rc != 0) {
++		printf("ONC EMMC: cmd3 (RCA) failed rc=%d int=0x%08x\n", rc, ist);
++		return rc;
++	}
++	oe.rca = (resp[0] >> 16) & 0xFFFFu;
++	if (oe.rca == 0) {
++		oe.rca = 1;
++	}
++	printf("ONC EMMC: rca=%u status=0x%08x\n", oe.rca, resp[0]);
++
++	rc = oe_issue(OE_CMD_IDX(9) | OE_RSP_136 | OE_CC_CRC,
++	    oe.rca << 16, resp, &ist);
++	if (rc != 0) {
++		printf("ONC EMMC: cmd9 (CSD) failed rc=%d int=0x%08x\n", rc, ist);
++		return rc;
++	}
++	printf("ONC EMMC: csd=0x%08x%08x%08x%08x\n",
++	    resp[0], resp[1], resp[2], resp[3]);
++
++	rc = oe_issue(OE_CMD_IDX(7) | OE_RSP_48_BUSY | OE_CC_CRC | OE_CC_IDX,
++	    oe.rca << 16, resp, &ist);
++	if (rc != 0) {
++		printf("ONC EMMC: cmd7 (select) failed rc=%d int=0x%08x\n", rc, ist);
++		return rc;
++	}
++
++	(void)oe_issue(OE_CMD_IDX(13) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
++	    oe.rca << 16, resp, &ist);
++	printf("ONC EMMC: cmd13 status=0x%08x\n", resp[0]);
++
++	rc = oe_pio_read(OE_CMD_IDX(8) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
++	    OE_CC_DATA, 0, oe_sector);
++	if (rc != 0) {
++		printf("ONC EMMC: cmd8 (EXT_CSD) failed rc=%d\n", rc);
++		return rc;
++	}
++	oe.ext_csd_rev = oe_sector[192];
++	oe.sec_count = oe_le32(&oe_sector[212]);
++	printf("ONC EMMC: ext_csd rev=0x%02x sec_count=0x%08x (%llu MiB)\n",
++	    oe.ext_csd_rev, oe.sec_count, (uint64_t)(oe.sec_count >> 11));
++	if (oe.sec_count < 2) {
++		printf("ONC EMMC: EXT_CSD SEC_COUNT is invalid\n");
++		return ENXIO;
++	}
++	return 0;
++}
++
++/* -------------------------------------------------------------------------
++ * GPT
++ * ---------------------------------------------------------------------- */
++
++/* GPT partition names are UTF-16LE, 36 code units.  Non-ASCII becomes '?'. */
++static void
++oe_gpt_name(const uint8_t *e, char *out, int max)
++{
++	int i;
++
++	for (i = 0; i < max - 1 && i < 36; i++) {
++		uint16_t c = (uint16_t)(e[56 + 2 * i] |
++		    ((uint16_t)e[57 + 2 * i] << 8));
++
++		if (c == 0) {
++			break;
++		}
++		out[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
++	}
++	out[i] = 0;
++}
++
++static bool
++oe_guid_zero(const uint8_t *p)
++{
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		if (p[i] != 0) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Read and validate the GPT, print every non-empty partition, and point oe at
++ * the partition named `want`.
++ *
++ * The header CRC32 is verified: a CRC-valid header cannot lie about where the
++ * entry array is.  If the CRC does not match (or the header size is absurd)
++ * the standard layout -- entry array at LBA 2, 128 entries of 128 bytes -- is
++ * used instead and the console says so.
++ */
++static int
++oe_gpt_scan(const char *want)
++{
++	static uint8_t hdr[OE_BLOCK_SIZE];
++	uint8_t tmp[OE_BLOCK_SIZE];
++	char name[37];
++	uint64_t entries_lba;
++	uint64_t first_usable;
++	uint64_t last_usable;
++	uint32_t nent;
++	uint32_t esz;
++	uint32_t hsize;
++	uint32_t hcrc;
++	uint32_t printed = 0;
++	uint32_t e;
++	uint32_t sig;
++	bool crc_ok = false;
++	bool found = false;
++	int rc;
++
++	rc = oe_read_lba(0, oe_sector);
++	if (rc != 0) {
++		printf("ONC EMMC: LBA0 read failed rc=%d\n", rc);
++		return rc;
++	}
++	sig = (uint32_t)oe_sector[510] | ((uint32_t)oe_sector[511] << 8);
++	printf("ONC EMMC: lba0 signature=0x%04x\n", sig);
++
++	rc = oe_read_lba(1, hdr);
++	if (rc != 0) {
++		printf("ONC EMMC: LBA1 read failed rc=%d\n", rc);
++		return rc;
++	}
++	if (memcmp(hdr, "EFI PART", 8) != 0) {
++		printf("ONC EMMC: LBA1 is not a GPT header\n");
++		return ENXIO;
++	}
++
++	hsize = oe_le32(&hdr[12]);
++	hcrc = oe_le32(&hdr[16]);
++	first_usable = oe_le64(&hdr[40]);
++	last_usable = oe_le64(&hdr[48]);
++	entries_lba = oe_le64(&hdr[72]);
++	nent = oe_le32(&hdr[80]);
++	esz = oe_le32(&hdr[84]);
++	printf("ONC EMMC: gpt rev=0x%08x hsize=%u entries_lba=0x%llx nent=%u esz=%u\n",
++	    oe_le32(&hdr[8]), hsize, entries_lba, nent, esz);
++	printf("ONC EMMC: gpt usable=0x%llx..0x%llx crc=0x%08x (device %u sectors)\n",
++	    first_usable, last_usable, hcrc, oe.sec_count);
++
++	if (hsize >= 92 && hsize <= OE_BLOCK_SIZE) {
++		memcpy(tmp, hdr, hsize);
++		tmp[16] = 0;
++		tmp[17] = 0;
++		tmp[18] = 0;
++		tmp[19] = 0;
++		crc_ok = ((oe_crc32(0xFFFFFFFFu, tmp, hsize) ^ 0xFFFFFFFFu) == hcrc);
++	}
++	printf("ONC EMMC: gpt header crc %s\n", crc_ok ? "ok" : "BAD");
++
++	if (!crc_ok) {
++		printf("ONC EMMC: using the standard entry array (lba 2, 128 x 128)\n");
++		entries_lba = 2;
++		nent = 128;
++		esz = 128;
++	}
++	if (esz < 128 || esz > OE_BLOCK_SIZE || (OE_BLOCK_SIZE % esz) != 0 ||
++	    nent == 0 || nent > 1024 || entries_lba < 2 ||
++	    entries_lba >= (uint64_t)oe.sec_count) {
++		printf("ONC EMMC: unsupported GPT entry array (entries_lba=0x%llx nent=%u esz=%u)\n",
++		    entries_lba, nent, esz);
++		return ENXIO;
++	}
++
++	for (e = 0; e < nent; e++) {
++		uint64_t lba = entries_lba + ((uint64_t)e * esz) / OE_BLOCK_SIZE;
++		uint32_t off = (uint32_t)(((uint64_t)e * esz) % OE_BLOCK_SIZE);
++		const uint8_t *p;
++		uint64_t first;
++		uint64_t last;
++
++		if (off == 0) {
++			rc = oe_read_lba(lba, oe_sector);
++			if (rc != 0) {
++				printf("ONC EMMC: gpt entry sector 0x%llx read failed rc=%d\n",
++				    lba, rc);
++				return rc;
++			}
++		}
++		p = &oe_sector[off];
++		if (oe_guid_zero(p)) {
++			continue;	/* unused entry */
++		}
++		first = oe_le64(&p[32]);
++		last = oe_le64(&p[40]);
++		if (first == 0 || last < first) {
++			continue;
++		}
++		oe_gpt_name(p, name, (int)sizeof(name));
++		if (printed < OE_GPT_MAX_PRINT) {
++			printf("ONC EMMC: gpt%03u \"%s\" first=0x%llx last=0x%llx\n",
++			    e, name, first, last);
++		}
++		printed++;
++		if (!found && strcmp(name, want) == 0) {
++			found = true;
++			oe.first_lba = first;
++			oe.nblocks = last - first + 1;
++		}
++	}
++	if (printed > OE_GPT_MAX_PRINT) {
++		printf("ONC EMMC: %u non-empty partitions, only %u printed\n",
++		    printed, OE_GPT_MAX_PRINT);
++	}
++	if (!found) {
++		printf("ONC EMMC: no GPT partition named \"%s\" (boot-arg emmcroot)\n",
++		    want);
++		return ENOENT;
++	}
++	if (oe.first_lba + oe.nblocks - 1 > (uint64_t)oe.sec_count) {
++		printf("ONC EMMC: partition \"%s\" runs past the end of the card, refusing\n",
++		    want);
++		return ENXIO;
++	}
++	printf("ONC EMMC: root \"%s\" first=0x%llx blocks=0x%llx (%llu MiB)\n",
++	    want, oe.first_lba, oe.nblocks,
++	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20);
++	return 0;
++}
++
++/* -------------------------------------------------------------------------
++ * BSD block/character device layer (modelled on bsd/dev/sweet_ufs.c)
++ * ---------------------------------------------------------------------- */
++
++static int
++onc_emmc_open(__unused dev_t dev, int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	if (!oe.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !oe.writable) ? EROFS : 0;
++}
++
++static int
++onc_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++onc_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * oe.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = oe.nblocks * (uint64_t)oe.secsize;
++	uint32_t done = 0;
++	bool rd = (buf_flags(bp) & B_READ) != 0;
++
++	buf_setresid(bp, count);
++	if (!rd) {
++		error = EROFS;		/* read-only driver */
++		goto done;
++	}
++	if (off > part_bytes || (uint64_t)count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr) != 0) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&onc_emmc_lock);
++	while (done < count) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % oe.secsize);
++		uint32_t want = MIN(count - done, oe.secsize - skip);
++
++		error = oe_read_lba(oe.first_lba + pos / oe.secsize, oe_bounce);
++		if (error != 0) {
++			break;
++		}
++		memcpy(vaddr + done, (const char *)oe_bounce + skip, want);
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&onc_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error != 0) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++onc_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = oe.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		/* Only the natural 512-byte sector is supported. */
++		return (*f == oe.secsize) ? 0 : EINVAL;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = oe.secsize;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = oe.nblocks * ((uint64_t)oe.secsize / DEV_BSIZE);
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = oe.writable ? 1 : 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = 1;			/* one 512-byte block per CMD17 */
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++		*o = 1;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;		/* nothing is ever written */
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++onc_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return onc_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++onc_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return onc_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++onc_emmc_psize(__unused dev_t dev)
++{
++	if (!oe.ready) {
++		return -1;
++	}
++	return (int)MIN(oe.nblocks * ((uint64_t)oe.secsize / DEV_BSIZE),
++	    (uint64_t)INT_MAX);
++}
++
++static int
++onc_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(onc_emmc_strategy, NULL, dev, B_READ, minphys, uio,
++	    (int)oe.secsize);
++}
++
++static int
++onc_emmc_write(__unused dev_t dev, __unused struct uio *uio,
++    __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw onc_emmc_bdevsw = {
++	.d_open     = onc_emmc_open,
++	.d_close    = onc_emmc_close,
++	.d_strategy = onc_emmc_strategy,
++	.d_ioctl    = onc_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = onc_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw onc_emmc_cdevsw = {
++	.d_open       = onc_emmc_open,
++	.d_close      = onc_emmc_close,
++	.d_read       = onc_emmc_read,
++	.d_write      = onc_emmc_write,
++	.d_ioctl      = onc_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++/* -------------------------------------------------------------------------
++ * Init and the root-device entry point
++ * ---------------------------------------------------------------------- */
++static int
++onc_emmc_init(void)
++{
++	char want[40] = "userdata";
++	uint32_t orw = 0;
++	int error;
++
++	if (oe.attempted) {
++		return oe.error;
++	}
++	oe.attempted = true;
++
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw));
++	printf("ONC EMMC: onclite SDCC1 eMMC root driver, partition \"%s\"\n", want);
++	if (orw != 0) {
++		printf("ONC EMMC: emmcroot_orw=1 requested, but writes are not implemented; read-only\n");
++	}
++	oe.writable = false;
++	oe.secsize = OE_BLOCK_SIZE;
++
++	oe.hc = ml_io_map(OE_SDCC_HC_PHYS, OE_SDCC_HC_SIZE);
++	oe.core = ml_io_map(OE_SDCC_CORE_PHYS, OE_SDCC_CORE_SIZE);
++	oe.gcc = ml_io_map(OE_GCC_PHYS, OE_GCC_SIZE);
++	if (oe.hc == 0 || oe.core == 0 || oe.gcc == 0) {
++		printf("ONC EMMC: ml_io_map failed (hc=0x%lx core=0x%lx gcc=0x%lx)\n",
++		    (unsigned long)oe.hc, (unsigned long)oe.core,
++		    (unsigned long)oe.gcc);
++		error = ENOMEM;
++		goto fail;
++	}
++	printf("ONC EMMC: mapped hc=0x%lx core=0x%lx gcc=0x%lx\n",
++	    (unsigned long)oe.hc, (unsigned long)oe.core, (unsigned long)oe.gcc);
++
++	lck_mtx_lock(&onc_emmc_lock);
++	oe_gcc_clock_init();
++	oe_core_init();
++	error = oe_sdhci_takeover();
++	if (error == 0) {
++		error = oe_card_init();
++	}
++	if (error == 0) {
++		error = oe_gpt_scan(want);
++	}
++	lck_mtx_unlock(&onc_emmc_lock);
++	if (error != 0) {
++		printf("ONC EMMC: init failed: %d\n", error);
++		goto fail;
++	}
++
++	oe.bmajor = bdevsw_add(-1, &onc_emmc_bdevsw);
++	if (oe.bmajor < 0) {
++		printf("ONC EMMC: bdevsw_add failed\n");
++		error = ENXIO;
++		goto fail;
++	}
++	oe.cmajor = cdevsw_add_with_bdev(-1, &onc_emmc_cdevsw, oe.bmajor);
++	if (oe.cmajor < 0) {
++		printf("ONC EMMC: cdevsw_add_with_bdev failed\n");
++		error = ENXIO;
++		goto fail;
++	}
++	oe.bdev = makedev(oe.bmajor, 0);
++	devfs_make_node(oe.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
++	    "emmcroot0");
++	devfs_make_node(makedev(oe.cmajor, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_OPERATOR, 0640, "remmcroot0");
++
++	oe.ready = true;
++	printf("ONC EMMC: ready: %s b(%d,0) /dev/emmcroot0, /dev/remmcroot0, "
++	    "first lba 0x%llx, %llu MiB, 512-byte sectors, read-only\n",
++	    want, oe.bmajor, oe.first_lba,
++	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20);
++	return 0;
++
++fail:
++	oe.error = error;
++	return error;
++}
++
++/*
++ * Root device for rd=emmcroot0.  Called from IOFindBSDRoot() in
++ * iokit/bsddev/IOKitBSDInit.cpp; lazily brings the controller and the card up
++ * on the first call and returns the BSD device number afterwards.
++ */
++int
++onc_emmc_rootdev(dev_t *dev)
++{
++	int error = onc_emmc_init();
++
++	if (error != 0) {
++		return error;
++	}
++	*dev = oe.bdev;
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/onc_emmc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,24 @@
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++//
++//	ONC (Redmi 7 / onclite): root on a GPT partition of the internal eMMC
++//	(bsd/dev/onc_emmc.c).  MEASURED (HANDOFF H.13): the non-secure EL1 kernel
++//	can re-clock SDCC1 from XO and enumerate the card, so rd=emmcroot0 works
++//	without any loader/SCM/PMIC help.
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int onc_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = onc_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: ONC eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //

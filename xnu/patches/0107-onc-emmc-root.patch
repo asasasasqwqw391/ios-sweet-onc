@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1236 @@
+@@ -0,0 +1,1244 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -52,6 +52,7 @@
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +
 +#include <sys/param.h>
++#include <stdbool.h>
 +#include <sys/systm.h>
 +#include <sys/buf.h>
 +#include <sys/conf.h>
@@ -102,7 +103,12 @@
 +#define R_DLL_STS		0x108
 +#define R_VENDOR_SPEC		0x10c
 +
-+#define OE_VENDOR_SPEC_POR	0xA9Cu	/* CORE_VENDOR_SPEC_POR_VAL (sdhci-msm) */
++/*
++ * Vendor POR value for VENDOR_SPEC.  The vendor sdhci-msm.c defines
++ * CORE_VENDOR_SPEC_POR_VAL as 0xA1C, but 0xA9C is what the probe measured
++ * working on this phone, so that is what is kept here.
++ */
++#define OE_VENDOR_SPEC_POR	0xA9Cu
 +#define OE_POWER_3V3_ON		0x0Fu	/* power control byte: bus on + 3.3 V */
 +#define OE_CLK_TIMEOUT_BYTE	0x0Eu	/* data timeout counter: max */
 +#define OE_SW_RESET_ALL		0x07000000u
@@ -644,6 +650,8 @@
 +	delay(2000);
 +	oe_wr(oe.core, M_PWR_CTL, OE_PWR_BUS_SUCCESS | OE_PWR_IO_SUCCESS);
 +	delay(20000);
++	/* Mask the vendor power IRQ: nothing in this kernel handles it. */
++	oe_wr(oe.core, M_PWR_MASK, 0);
 +	printf("ONC EMMC: pwrctl status=0x%08x mask=0x%08x ctl=0x%08x hostpwr=0x%08x\n",
 +	    oe_rd(oe.core, M_PWR_STATUS), oe_rd(oe.core, M_PWR_MASK),
 +	    oe_rd(oe.core, M_PWR_CTL), oe_rd(oe.hc, R_HOSTPWR));

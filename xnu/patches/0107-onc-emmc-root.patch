@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1330 @@
+@@ -0,0 +1,1494 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -73,6 +73,9 @@
 +
 +/* Root device for rd=emmcroot0 (iokit/bsddev/IOKitBSDInit.cpp). */
 +int onc_emmc_rootdev(dev_t *dev);
++
++/* Optional high-speed switch; defined below oe_card_init(). */
++static int oe_card_hs_init(void);
 +
 +/* -------------------------------------------------------------------------
 + * Measured address map (onclite, no ADT node needed)
@@ -175,6 +178,18 @@
 +#define OE_REG_TIMEOUT_NS	(50ull * NSEC_PER_MSEC)
 +#define OE_CLK_TIMEOUT_NS	(100ull * NSEC_PER_MSEC)
 +#define OE_GPT_MAX_PRINT	80u
++
++/* ---- optional HS mode: CMD6 timing/bus + 25 MHz from GPLL0_DIV2 ------- */
++#define OE_CMD6_WORD		(OE_CMD_IDX(6) | OE_RSP_48_BUSY | OE_CC_CRC | \
++				 OE_CC_IDX)
++#define OE_CMD6_HS_TIMING_HS	0x03B90100u	/* EXT_CSD[185] = 1 (HS) */
++#define OE_CMD6_HS_TIMING_LG	0x03B90000u	/* EXT_CSD[185] = 0 (legacy) */
++#define OE_CMD6_BUS_4BIT	0x03B70100u	/* EXT_CSD[183] = 1 (4-bit) */
++#define OE_CMD6_BUS_1BIT	0x03B70000u	/* EXT_CSD[183] = 0 (1-bit) */
++#define OE_GCC_APPS_CFG_400K	0x2017u		/* div 23 (/24), dual edge, XO */
++#define OE_GCC_APPS_CFG_25M	0x041Fu		/* div 31 (/16), GPLL0_DIV2 = 4 */
++#define OE_HC_4BIT		0x02u		/* HOST_CONTROL bit1 */
++#define OE_HC_HISPD		0x04u		/* HOST_CONTROL bit2 */
 +
 +static struct {
 +	vm_offset_t hc;		/* SDHCI registers (hc_mem) */
@@ -871,6 +886,155 @@
 +	}
 +	printf("ONC EMMC: card ready rca=%u sec_count=0x%08x\n",
 +	    oe.rca, oe.sec_count);
++	/* Optional speed-up; a failure here is not fatal. */
++	(void)oe_card_hs_init();
++	return 0;
++}
++
++/* -------------------------------------------------------------------------
++ * Optional high-speed mode: CMD6 timing + 4-bit bus + 25 MHz.
++ *
++ * GCC sdcc1_apps 25 MHz is F(25000000, P_GPLL0_DIV2, 16, 0, 0): pre-div 16 ->
++ * register field 2*16-1 = 31, src_sel 4 = P_GPLL0_DIV2, and the non-MND path
++ * leaves M/N/D unused.  A failure rolls back to 400 kHz legacy / 1-bit, which
++ * still mounts root, so this is never fatal.  emmcroot_hs=0 disables it.
++ * ---------------------------------------------------------------------- */
++
++/* Reprogram only the sdcc1_apps divider/parent and latch it. */
++static void
++oe_gcc_set_apps_cfg(uint32_t cfg, bool mnd)
++{
++	uint32_t v;
++
++	if (mnd) {
++		oe_wr(oe.gcc, G_APPS_M, 0x1u);
++		oe_wr(oe.gcc, G_APPS_N, 0xFCu);
++		oe_wr(oe.gcc, G_APPS_D, 0xFBu);
++	}
++	v = oe_rd(oe.gcc, G_APPS_CFG);
++	v &= ~(OE_RCG_CFG_DIV_MASK | OE_RCG_CFG_SEL_MASK | OE_RCG_CFG_MODE_MASK);
++	v |= cfg;
++	oe_wr(oe.gcc, G_APPS_CFG, v);
++	v = oe_rd(oe.gcc, G_APPS_CMD);
++	v |= OE_RCG_CMD_UPDATE | OE_RCG_CMD_ROOT_EN;
++	oe_wr(oe.gcc, G_APPS_CMD, v);
++	(void)oe_poll_clear(oe.gcc, G_APPS_CMD, OE_RCG_CMD_UPDATE,
++	    OE_REG_TIMEOUT_NS);
++}
++
++/* CMD6 SWITCH: write one EXT_CSD byte (R1b). */
++static int
++oe_switch_byte(uint32_t arg)
++{
++	uint32_t resp[4] = { 0, 0, 0, 0 };
++	uint32_t ist = 0;
++
++	return oe_issue(OE_CMD6_WORD, arg, resp, &ist);
++}
++
++/* CMD13 poll: wait until the card is in tran(4) with no error bits. */
++static int
++oe_wait_tran(uint32_t *status_out)
++{
++	uint32_t resp[4];
++	uint32_t ist = 0;
++	uint32_t status = 0;
++	int i;
++
++	for (i = 0; i < 60; i++) {
++		resp[0] = 0;
++		if (oe_issue(OE_CMD_IDX(13) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
++		    oe.rca << 16, resp, &ist) == 0) {
++			status = resp[0];
++			/* bit7 SWITCH_ERROR, bit19 ERROR, bit20 CC_ERROR */
++			if ((status & ((1u << 7) | (1u << 19) | (1u << 20))) == 0 &&
++			    ((status >> 9) & 0xFu) == 4u) {
++				*status_out = status;
++				return 0;
++			}
++		}
++		delay(5000);
++	}
++	*status_out = status;
++	return ETIMEDOUT;
++}
++
++static int
++oe_card_hs_init(void)
++{
++	uint8_t probe[OE_BLOCK_SIZE];
++	uint32_t hc;
++	uint32_t status = 0;
++	uint32_t hs_on = 1;
++
++	PE_parse_boot_argn("emmcroot_hs", &hs_on, sizeof(hs_on));
++	if (hs_on == 0) {
++		printf("ONC EMMC: emmcroot_hs=0, staying at 400 kHz legacy/1-bit\n");
++		return 0;
++	}
++
++	/* 1) HS_TIMING = 1, still at 400 kHz / 1-bit. */
++	if (oe_switch_byte(OE_CMD6_HS_TIMING_HS) != 0) {
++		goto rollback_400k;
++	}
++	if (oe_wait_tran(&status) != 0) {
++		printf("ONC EMMC: hs: not in tran after HS_TIMING (st=0x%08x)\n",
++		    status);
++		goto rollback_hs;
++	}
++
++	/* 2) BUS_WIDTH = 1 (4-bit): the card switches, then the host. */
++	if (oe_switch_byte(OE_CMD6_BUS_4BIT) != 0) {
++		goto rollback_hs;
++	}
++	hc = oe_rd(oe.hc, R_HOSTPWR);
++	oe_wr(oe.hc, R_HOSTPWR, hc | OE_HC_4BIT | OE_HC_HISPD);
++	if (oe_wait_tran(&status) != 0) {
++		printf("ONC EMMC: hs: not in tran after BUS_WIDTH=4 (st=0x%08x)\n",
++		    status);
++		goto rollback_bus;
++	}
++
++	/* 3) SD clock off -> GCC 25 MHz -> internal clock stable -> SD clock on. */
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	oe_gcc_set_apps_cfg(OE_GCC_APPS_CFG_25M, false);
++	if (oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS) != 0) {
++		printf("ONC EMMC: hs: no stable clock at 25 MHz, rollback\n");
++		goto rollback_bus;
++	}
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
++	    OE_INT_CLK_STABLE | OE_SD_CLK_EN);
++	delay(2000);
++
++	/* 4) Verify: card in tran, and LBA0 still reads back 0xAA55. */
++	if (oe_wait_tran(&status) != 0) {
++		printf("ONC EMMC: hs: no tran at 25 MHz (st=0x%08x)\n", status);
++		goto rollback_all;
++	}
++	if (oe_read_lba(0, probe) != 0 ||
++	    ((uint32_t)probe[510] | ((uint32_t)probe[511] << 8)) != 0xAA55u) {
++		printf("ONC EMMC: hs: LBA0 bad at 25 MHz\n");
++		goto rollback_all;
++	}
++	printf("ONC EMMC: hs on: 25 MHz, 4-bit, clk=0x%08x hostctrl=0x%02x\n",
++	    oe_rd(oe.hc, R_CLK), (unsigned)(oe_rd(oe.hc, R_HOSTPWR) & 0xffu));
++	return 0;
++
++rollback_all:
++	(void)oe_switch_byte(OE_CMD6_BUS_1BIT);
++rollback_bus:
++	hc = oe_rd(oe.hc, R_HOSTPWR);
++	oe_wr(oe.hc, R_HOSTPWR, hc & ~(OE_HC_4BIT | OE_HC_HISPD));
++rollback_hs:
++	(void)oe_switch_byte(OE_CMD6_HS_TIMING_LG);
++rollback_400k:
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	oe_gcc_set_apps_cfg(OE_GCC_APPS_CFG_400K, true);
++	(void)oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
++	    OE_INT_CLK_STABLE | OE_SD_CLK_EN);
++	delay(2000);
++	printf("ONC EMMC: hs off, back to 400 kHz legacy/1-bit\n");
 +	return 0;
 +}
 +

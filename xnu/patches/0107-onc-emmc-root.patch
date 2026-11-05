@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1279 @@
+@@ -0,0 +1,1330 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -194,6 +194,7 @@
 +	int bmajor;
 +	int cmajor;
 +	dev_t bdev;
++	uint32_t last_int;	/* last INT_STATUS seen by the read primitive */
 +} oe;
 +
 +static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
@@ -296,6 +297,31 @@
 +	return oe_rd(oe.gcc, off);
 +}
 +
++/*
++ * Keep the controller clock alive across the long, print-heavy phases of the
++ * driver (the GPT dump, then the file-system mount seconds later).  The GCC
++ * apps branch can be hardware-gated while the core is idle, and the SDHCI
++ * clock enable bits are cleared by a software reset; either way the next
++ * command would then be silently dropped (measured on expU3: the HFS mount's
++ * first CMD17 timed out with INT_STATUS = 0).  Called before every command.
++ */
++static void
++oe_ensure_clock(void)
++{
++	uint32_t clk;
++	uint32_t want = OE_INT_CLK_EN | OE_INT_CLK_STABLE | OE_SD_CLK_EN;
++
++	(void)oe_branch_on(G_APPS_BRANCH);
++	clk = oe_rd(oe.hc, R_CLK);
++	if ((clk & want) == want) {
++		return;
++	}
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
++	    OE_SD_CLK_EN);
++	(void)oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | want);
++}
++
 +/* Little-endian readers for the GPT/EXT_CSD on-card structures. */
 +static uint32_t
 +oe_le32(const uint8_t *p)
@@ -353,6 +379,8 @@
 +	uint64_t deadline;
 +	int rc = ETIMEDOUT;
 +
++	oe_ensure_clock();
++
 +	if (resp != NULL) {
 +		resp[0] = 0;
 +		resp[1] = 0;
@@ -407,6 +435,8 @@
 +	uint32_t st = 0;
 +	uint64_t deadline;
 +	int rc = ETIMEDOUT;
++
++	oe_ensure_clock();
 +
 +	if (resp != NULL) {
 +		resp[0] = 0;
@@ -470,6 +500,8 @@
 +	int rc = ETIMEDOUT;
 +	int i;
 +
++	oe_ensure_clock();
++
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
 +	oe_wr(oe.hc, R_BLK, (1u << 16) | OE_BLOCK_SIZE);
 +	oe_wr(oe.hc, R_ARG, arg);
@@ -525,10 +557,7 @@
 +
 +out:
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
-+	if (rc != 0) {
-+		printf("ONC EMMC: data command 0x%04x arg 0x%08x failed (rc %d int 0x%08x)\n",
-+		    cmdw, arg, rc, st);
-+	}
++	oe.last_int = st;
 +	return rc;
 +}
 +
@@ -536,12 +565,34 @@
 +static int
 +oe_read_lba(uint64_t lba, uint8_t *out)
 +{
++	uint32_t cmdw = OE_CMD_IDX(17) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
++	    OE_CC_DATA;
++	int attempt;
++	int rc = EINVAL;
++
 +	if (lba > (uint64_t)UINT32_MAX) {
 +		/* CMD17 takes a 32-bit block address. */
 +		return EINVAL;
 +	}
-+	return oe_pio_read(OE_CMD_IDX(17) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
-+	    OE_CC_DATA, (uint32_t)lba, out);
++	for (attempt = 0; attempt < 3; attempt++) {
++		if (attempt != 0) {
++			/* Clear a stuck CMD/DAT inhibit, then restart the clock. */
++			oe_wr(oe.hc, R_CLK,
++			    oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
++			(void)oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
++			    OE_CLK_TIMEOUT_NS);
++			oe_ensure_clock();
++			delay(2000);
++		}
++		rc = oe_pio_read(cmdw, (uint32_t)lba, out);
++		if (rc == 0) {
++			return 0;
++		}
++	}
++	printf("ONC EMMC: rdfail lba=0x%x rc=%d\n", (uint32_t)lba, rc);
++	printf("ONC EMMC: int=0x%08x st=0x%08x clk=0x%08x\n",
++	    oe.last_int, oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CLK));
++	return rc;
 +}
 +
 +/* -------------------------------------------------------------------------

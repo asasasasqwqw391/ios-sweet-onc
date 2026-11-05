@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1255 @@
+@@ -0,0 +1,1279 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -97,7 +97,8 @@
 +#define R_HOSTPWR		0x28	/* host control (8) | power control (8) */
 +#define R_CLK			0x2c	/* clock (16) | timeout (8) | sw reset (8) */
 +#define R_INT			0x30	/* normal status (16) | error status (16) */
-+#define R_INTEN			0x34
++#define R_INTEN			0x34	/* interrupt status enable */
++#define R_INTSIG		0x38	/* interrupt signal enable */
 +#define R_CAPA			0x40
 +#define R_DLL_CFG		0x100
 +#define R_DLL_STS		0x108
@@ -112,6 +113,7 @@
 +#define OE_POWER_3V3_ON		0x0Fu	/* power control byte: bus on + 3.3 V */
 +#define OE_CLK_TIMEOUT_BYTE	0x0Eu	/* data timeout counter: max */
 +#define OE_SW_RESET_ALL		0x07000000u
++#define OE_SW_RESET_CMD_DAT	0x06000000u	/* CMD line + DAT line only */
 +#define OE_INT_CLK_EN		0x0001u
 +#define OE_INT_CLK_STABLE	0x0002u	/* read-only */
 +#define OE_SD_CLK_EN		0x0004u
@@ -614,12 +616,21 @@
 +
 +/*
 + * Take the SDHCI core over from whatever state the bootloader left it in:
-+ * reset it, restore the vendor POR latch, power the bus, complete the PWRCTL
-+ * handshake and start the card clock.  The internal clock stable bit (bit1,
-+ * read-only) is the hardware proof that the GCC root really toggles.
++ * restore the vendor POR latch, start the controller clock, reset the core,
++ * power the bus, complete the PWRCTL handshake and enable the card clock.
 + *
-+ * INTEN is left at 0 on purpose: this driver polls INT_STATUS and must never
-+ * let the controller raise an interrupt.
++ * The order matters and was measured the hard way (expU2 on the phone):
++ *
++ *  - The bootloader hands the core over with CLOCK_CONTROL = 0 (measured
++ *    clk=0x00000000).  The software-reset FSM is clocked by the controller's
++ *    internal clock, so the internal clock has to be started *before* the
++ *    reset: with the clock off the reset bits never self-clear (measured
++ *    clk=0x010e0003 afterwards) and, with the core held in reset, CMD0 never
++ *    completes (measured rc=60, INT=0x00000000).
++ *  - INT_STATUS_ENABLE (0x34) has to be all ones, exactly like the shim probe
++ *    sets it.  With 0x34 = 0 the command/transfer status bits never appear
++ *    (INT read 0x00000000 while polling).  INT_SIGNAL_ENABLE (0x38) is left 0
++ *    so the controller still cannot raise an interrupt into this kernel.
 + */
 +static int
 +oe_sdhci_takeover(void)
@@ -632,28 +643,41 @@
 +	    oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CAPA), oe_rd(oe.hc, R_CLK),
 +	    oe_rd(oe.hc, R_DLL_CFG), oe_rd(oe.hc, R_VENDOR_SPEC));
 +
++	/* Vendor POR latch first, like sdhci_msm_probe does before any reset. */
++	oe_wr(oe.hc, R_VENDOR_SPEC, OE_VENDOR_SPEC_POR);
++
++	/* Start the internal clock: the reset FSM needs it. */
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	error = oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	printf("ONC EMMC: int clk %s (clk=0x%08x)\n",
++	    error != 0 ? "NOT stable" : "stable", oe_rd(oe.hc, R_CLK));
++
++	/* Software reset for all; a stuck bit is retried with CMD/DAT only and
++	 * is never fatal (the shim probe tolerates it too). */
 +	oe_wr(oe.hc, R_CLK, oe_rd(oe.hc, R_CLK) | OE_SW_RESET_ALL);
-+	error = oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_ALL, OE_REG_TIMEOUT_NS);
++	error = oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_ALL, OE_CLK_TIMEOUT_NS);
 +	if (error != 0) {
-+		/*
-+		 * Not fatal.  The shim probe (v15, which enumerated this card on
-+		 * the phone and read its GPT) polls the same bits and then simply
-+		 * carries on: on this core they can still read back set even
-+		 * though the reset itself has taken effect.  Aborting here is
-+		 * what made the first on-device boot (expU1) panic with
-+		 * "eMMC root unavailable: 60" before the clock or the card was
-+		 * ever touched.  The clock-stable and CMD0/CMD1 phases below are
-+		 * the real test.
-+		 */
-+		printf("ONC EMMC: software reset bits still set (clk=0x%08x), continuing\n",
++		printf("ONC EMMC: sw reset ALL not clear (clk=0x%08x), try CMD/DAT\n",
 +		    oe_rd(oe.hc, R_CLK));
++		oe_wr(oe.hc, R_CLK, oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
++		error = oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
++		    OE_CLK_TIMEOUT_NS);
++	}
++	printf("ONC EMMC: sw reset %s (clk=0x%08x)\n",
++	    error != 0 ? "stuck, continuing" : "done", oe_rd(oe.hc, R_CLK));
++
++	/* A software reset clears CLOCK_CONTROL, so restart the internal clock. */
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	error = oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	if (error != 0) {
++		printf("ONC EMMC: internal clock never became stable (clk=0x%08x)\n",
++		    oe_rd(oe.hc, R_CLK));
++		return error;
 +	}
 +
-+	oe_wr(oe.hc, R_VENDOR_SPEC, OE_VENDOR_SPEC_POR);
++	/* Power the bus (3.3 V + bus on), then the vendor PWRCTL handshake. */
 +	v = oe_rd(oe.hc, R_HOSTPWR);
 +	oe_wr(oe.hc, R_HOSTPWR, (v & ~0xFF00u) | (OE_POWER_3V3_ON << 8));
-+
-+	/* PWRCTL: clear the pending boot request, then acknowledge BUS/IO on. */
 +	pst = oe_rd(oe.core, M_PWR_STATUS);
 +	oe_wr(oe.core, M_PWR_CLEAR, pst & 0xFu);
 +	delay(2000);
@@ -665,22 +689,21 @@
 +	    oe_rd(oe.core, M_PWR_STATUS), oe_rd(oe.core, M_PWR_MASK),
 +	    oe_rd(oe.core, M_PWR_CTL), oe_rd(oe.hc, R_HOSTPWR));
 +
-+	/* Internal clock first; only then enable the SD clock. */
-+	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
-+	error = oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
-+	if (error != 0) {
-+		printf("ONC EMMC: internal clock never became stable (clk=0x%08x)\n",
-+		    oe_rd(oe.hc, R_CLK));
-+		return error;
-+	}
++	/* Card clock on. */
 +	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
 +	    OE_INT_CLK_STABLE | OE_SD_CLK_EN);
 +	delay(2000);
 +
-+	oe_wr(oe.hc, R_INTEN, 0);		/* polled operation, never IRQ */
++	/*
++	 * Polled operation: status enable all (the status bits are what this
++	 * driver polls), signal enable none (no IRQ can reach the GIC).
++	 */
++	oe_wr(oe.hc, R_INTEN, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_INTSIG, 0);
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
-+	printf("ONC EMMC: sdhci clk=0x%08x present=0x%08x\n",
-+	    oe_rd(oe.hc, R_CLK), oe_rd(oe.hc, R_PRESENT));
++	printf("ONC EMMC: sdhci clk=0x%08x present=0x%08x inten=0x%08x sig=0x%08x\n",
++	    oe_rd(oe.hc, R_CLK), oe_rd(oe.hc, R_PRESENT),
++	    oe_rd(oe.hc, R_INTEN), oe_rd(oe.hc, R_INTSIG));
 +	return 0;
 +}
 +
@@ -719,7 +742,8 @@
 +		rc = oe_issue32(OE_CMD_IDX(0) | OE_RSP_NONE, 0, NULL, &ist);
 +		printf("ONC EMMC: cmd0 (32-bit window) rc=%d int=0x%08x\n", rc, ist);
 +		if (rc != 0) {
-+			printf("ONC EMMC: controller does not execute commands\n");
++			printf("ONC EMMC: controller does not execute commands (present=0x%08x clk=0x%08x)\n",
++			    oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CLK));
 +			return rc;
 +		}
 +		oe.cmd32 = true;

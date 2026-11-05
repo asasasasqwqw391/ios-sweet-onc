@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1494 @@
+@@ -0,0 +1,1621 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -167,6 +167,7 @@
 +#define OE_INT_CC		0x0001u	/* command complete */
 +#define OE_INT_TC		0x0002u	/* transfer complete */
 +#define OE_INT_BRR		0x0020u	/* buffer read ready */
++#define OE_INT_BWR		0x0010u	/* buffer write ready */
 +#define OE_INT_ERR		0xFFFF8000u /* error status half + error bit */
 +
 +/* ---- transfer mode (0x0c) -------------------------------------------- */
@@ -202,7 +203,7 @@
 +	uint64_t nblocks;	/* selected partition, length in 512-byte blocks */
 +	uint32_t secsize;	/* logical sector size exposed to the BSD layer */
 +	bool cmd32;		/* CMD0 only worked through the 32-bit window */
-+	bool writable;		/* always false: writes are not implemented */
++	bool writable;		/* emmcroot_orw=1: writes are implemented */
 +	bool attempted;		/* a full init was already tried */
 +	bool ready;
 +	int error;		/* result of the first init attempt */
@@ -605,6 +606,111 @@
 +		}
 +	}
 +	printf("ONC EMMC: rdfail lba=0x%x rc=%d\n", (uint32_t)lba, rc);
++	printf("ONC EMMC: int=0x%08x st=0x%08x clk=0x%08x\n",
++	    oe.last_int, oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CLK));
++	return rc;
++}
++
++/*
++ * One 512-byte PIO data write (CMD24).  The transfer-mode direction bit is
++ * clear for writes and the controller asks for the data with "buffer write
++ * ready" (INT bit4 = 0x10); transfer complete follows the CRC status.
++ */
++static int
++oe_pio_write(uint32_t cmdw, uint32_t arg, const uint8_t *in)
++{
++	uint32_t st = 0;
++	uint64_t deadline;
++	int rc = ETIMEDOUT;
++	int i;
++
++	oe_ensure_clock();
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_BLK, (1u << 16) | OE_BLOCK_SIZE);
++	oe_wr(oe.hc, R_ARG, arg);
++	(void)oe_rd(oe.hc, R_CMD);
++	oe_wr16(oe.hc, R_CMD, 0x0000u);			/* transfer mode: write */
++	(void)oe_rd(oe.hc, R_CMD);
++	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(cmdw & 0xFFFFu));
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & (OE_INT_CC | OE_INT_BWR)) ==
++		    (OE_INT_CC | OE_INT_BWR)) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			goto out;
++		}
++		delay(1);
++	}
++
++	for (i = 0; i < (int)(OE_BLOCK_SIZE / 4u); i++) {
++		uint32_t w = (uint32_t)in[i * 4 + 0] |
++		    ((uint32_t)in[i * 4 + 1] << 8) |
++		    ((uint32_t)in[i * 4 + 2] << 16) |
++		    ((uint32_t)in[i * 4 + 3] << 24);
++
++		oe_wr(oe.hc, R_BUF, w);
++	}
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & OE_INT_TC) != 0) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			rc = ETIMEDOUT;
++			goto out;
++		}
++		delay(1);
++	}
++
++out:
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe.last_int = st;
++	return rc;
++}
++
++/* One 512-byte block by LBA; retries with a CMD/DAT line reset. */
++static int
++oe_write_lba(uint64_t lba, const uint8_t *in)
++{
++	uint32_t cmdw = OE_CMD_IDX(24) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
++	    OE_CC_DATA;
++	int attempt;
++	int rc = EINVAL;
++
++	if (lba > (uint64_t)UINT32_MAX) {
++		return EINVAL;
++	}
++	for (attempt = 0; attempt < 3; attempt++) {
++		if (attempt != 0) {
++			oe_wr(oe.hc, R_CLK,
++			    oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
++			(void)oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
++			    OE_CLK_TIMEOUT_NS);
++			oe_ensure_clock();
++			delay(2000);
++		}
++		rc = oe_pio_write(cmdw, (uint32_t)lba, in);
++		if (rc == 0) {
++			return 0;
++		}
++	}
++	printf("ONC EMMC: wrfail lba=0x%x rc=%d\n", (uint32_t)lba, rc);
 +	printf("ONC EMMC: int=0x%08x st=0x%08x clk=0x%08x\n",
 +	    oe.last_int, oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CLK));
 +	return rc;
@@ -1245,8 +1351,8 @@
 +	bool rd = (buf_flags(bp) & B_READ) != 0;
 +
 +	buf_setresid(bp, count);
-+	if (!rd) {
-+		error = EROFS;		/* read-only driver */
++	if (!rd && !oe.writable) {
++		error = EROFS;		/* read-only unless emmcroot_orw=1 */
 +		goto done;
 +	}
 +	if (off > part_bytes || (uint64_t)count > part_bytes - off) {
@@ -1266,12 +1372,29 @@
 +		uint64_t pos = off + done;
 +		uint32_t skip = (uint32_t)(pos % oe.secsize);
 +		uint32_t want = MIN(count - done, oe.secsize - skip);
++		uint64_t lba = oe.first_lba + pos / oe.secsize;
 +
-+		error = oe_read_lba(oe.first_lba + pos / oe.secsize, oe_bounce);
-+		if (error != 0) {
-+			break;
++		if (rd) {
++			error = oe_read_lba(lba, oe_bounce);
++			if (error != 0) {
++				break;
++			}
++			memcpy(vaddr + done, (const char *)oe_bounce + skip,
++			    want);
++		} else {
++			/* Partial sectors need read-modify-write. */
++			if (skip != 0 || want != oe.secsize) {
++				error = oe_read_lba(lba, oe_bounce);
++				if (error != 0) {
++					break;
++				}
++			}
++			memcpy((char *)oe_bounce + skip, vaddr + done, want);
++			error = oe_write_lba(lba, oe_bounce);
++			if (error != 0) {
++				break;
++			}
 +		}
-+		memcpy(vaddr + done, (const char *)oe_bounce + skip, want);
 +		done += want;
 +		buf_setresid(bp, count - done);
 +	}
@@ -1315,7 +1438,7 @@
 +		*o = 1;			/* one 512-byte block per CMD17 */
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = oe.writable ? 1 : 0;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +		*o = 1;
@@ -1361,10 +1484,13 @@
 +}
 +
 +static int
-+onc_emmc_write(__unused dev_t dev, __unused struct uio *uio,
-+    __unused int ioflag)
++onc_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	if (!oe.writable) {
++		return EROFS;
++	}
++	return physio(onc_emmc_strategy, NULL, dev, B_WRITE, minphys, uio,
++	    (int)oe.secsize);
 +}
 +
 +static const struct bdevsw onc_emmc_bdevsw = {
@@ -1412,10 +1538,10 @@
 +	PE_parse_boot_argn("emmcroot", want, sizeof(want));
 +	PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw));
 +	printf("ONC EMMC: onclite SDCC1 eMMC root driver, partition \"%s\"\n", want);
-+	if (orw != 0) {
-+		printf("ONC EMMC: emmcroot_orw=1 requested, but writes are not implemented; read-only\n");
++	oe.writable = (orw != 0);
++	if (oe.writable) {
++		printf("ONC EMMC: emmcroot_orw=1, read-write mode\n");
 +	}
-+	oe.writable = false;
 +	oe.secsize = OE_BLOCK_SIZE;
 +
 +	oe.hc = ml_io_map(OE_SDCC_HC_PHYS, OE_SDCC_HC_SIZE);
@@ -1467,9 +1593,10 @@
 +
 +	oe.ready = true;
 +	printf("ONC EMMC: ready: %s b(%d,0) /dev/emmcroot0, /dev/remmcroot0, "
-+	    "first lba 0x%llx, %llu MiB, 512-byte sectors, read-only\n",
++	    "first lba 0x%llx, %llu MiB, 512-byte sectors, %s\n",
 +	    want, oe.bmajor, oe.first_lba,
-+	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20);
++	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
++	    oe.writable ? "read-write" : "read-only");
 +	return 0;
 +
 +fail:

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1244 @@
+@@ -0,0 +1,1255 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -635,9 +635,18 @@
 +	oe_wr(oe.hc, R_CLK, oe_rd(oe.hc, R_CLK) | OE_SW_RESET_ALL);
 +	error = oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_ALL, OE_REG_TIMEOUT_NS);
 +	if (error != 0) {
-+		printf("ONC EMMC: software reset did not complete (clk=0x%08x)\n",
++		/*
++		 * Not fatal.  The shim probe (v15, which enumerated this card on
++		 * the phone and read its GPT) polls the same bits and then simply
++		 * carries on: on this core they can still read back set even
++		 * though the reset itself has taken effect.  Aborting here is
++		 * what made the first on-device boot (expU1) panic with
++		 * "eMMC root unavailable: 60" before the clock or the card was
++		 * ever touched.  The clock-stable and CMD0/CMD1 phases below are
++		 * the real test.
++		 */
++		printf("ONC EMMC: software reset bits still set (clk=0x%08x), continuing\n",
 +		    oe_rd(oe.hc, R_CLK));
-+		return error;
 +	}
 +
 +	oe_wr(oe.hc, R_VENDOR_SPEC, OE_VENDOR_SPEC_POR);
@@ -717,7 +726,7 @@
 +	}
 +
 +	/* eMMC powers up slowly: repeat CMD1 (SEND_OP_COND) until OCR bit31. */
-+	for (i = 0; i < 20; i++) {
++	for (i = 0; i < 40; i++) {
 +		(void)oe_issue(OE_CMD_IDX(1) | OE_RSP_48, 0x40FF8080u, resp, &ist);
 +		ocr = resp[0];
 +		if ((ocr & 0x80000000u) != 0) {
@@ -785,6 +794,8 @@
 +		printf("ONC EMMC: EXT_CSD SEC_COUNT is invalid\n");
 +		return ENXIO;
 +	}
++	printf("ONC EMMC: card ready rca=%u sec_count=0x%08x\n",
++	    oe.rca, oe.sec_count);
 +	return 0;
 +}
 +

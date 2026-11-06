@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1970 @@
+@@ -0,0 +1,2041 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -171,6 +171,8 @@
 +#define OE_INT_ERR		0xFFFF8000u /* error status half + error bit */
 +
 +/* ---- PRESENT_STATE (0x24) -------------------------------------------- */
++#define OE_PS_CMD_INHIBIT	0x00000001u /* command line in use */
++#define OE_PS_DAT_INHIBIT	0x00000002u /* data lines in use */
 +#define OE_PS_DAT_ACTIVE	0x00000004u /* DAT line active (transfer running) */
 +
 +/* ---- transfer mode (0x0c) -------------------------------------------- */
@@ -223,6 +225,8 @@
 +	bool writable;		/* emmcroot_orw=1: writes are implemented */
 +	bool no_cmd18;		/* emmcroot_nocmd18=1: force single-block reads */
 +	bool auto_cmd12;	/* emmcroot_autocmd12=1: let the core stop CMD18 */
++	bool dat_wait;		/* emmcroot_datwait=0: do not wait for inhibit */
++	bool send_cmd16;	/* emmcroot_cmd16=0: do not send SET_BLOCKLEN */
 +	uint32_t batch_blocks;	/* emmcroot_batch=N: CMD18 blocks per command */
 +	bool attempted;		/* a full init was already tried */
 +	bool ready;
@@ -526,6 +530,30 @@
 +}
 +
 +/*
++ * Wait until the core is ready to accept a new command: neither the command
++ * nor the data lines may be inhibited.  expU9d failed its first CMD18 with a
++ * Command Timeout while PRESENT_STATE still had CMD/DAT inhibit set from the
++ * preceding single-block CMD17 -- i.e. the command was never sent.
++ */
++static int
++oe_wait_ready(uint64_t timeout_ns)
++{
++	uint64_t deadline = oe_deadline(timeout_ns);
++
++	for (;;) {
++		uint32_t st = oe_rd(oe.hc, R_PRESENT);
++
++		if ((st & (OE_PS_CMD_INHIBIT | OE_PS_DAT_INHIBIT)) == 0) {
++			return 0;
++		}
++		if (oe_expired(deadline)) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
 + * One 512-byte PIO data read.  cmdw carries OE_CC_DATA; arg is the card
 + * argument (block address for CMD17, 0 for CMD8/EXT_CSD).  The data port is
 + * 32-bit, so 128 reads fill the block; then transfer complete is awaited so
@@ -540,6 +568,9 @@
 +	int i;
 +
 +	oe_ensure_clock();
++	if (oe.dat_wait != 0) {
++		(void)oe_wait_ready(OE_DAT_IDLE_TIMEOUT_NS);
++	}
 +
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
 +	oe_wr(oe.hc, R_BLK, (1u << 16) | OE_BLOCK_SIZE);
@@ -592,6 +623,15 @@
 +			goto out;
 +		}
 +		delay(1);
++	}
++
++	/*
++	 * Let the core release the DAT line before the caller issues the next
++	 * command: a following CMD18 sent while DAT is still inhibited comes
++	 * back as a Command Timeout without ever reaching the card (expU9d).
++	 */
++	if (oe.dat_wait != 0) {
++		(void)oe_wait_dat_idle(OE_DAT_IDLE_TIMEOUT_NS);
 +	}
 +
 +out:
@@ -695,6 +735,9 @@
 +	int rc = ETIMEDOUT;
 +
 +	oe_ensure_clock();
++	if (oe.dat_wait != 0) {
++		(void)oe_wait_ready(OE_DAT_IDLE_TIMEOUT_NS);
++	}
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
 +	oe_wr(oe.hc, R_BLK, (nblocks << 16) | OE_BLOCK_SIZE);
 +	oe_wr(oe.hc, R_ARG, lba);
@@ -874,6 +917,9 @@
 +	int i;
 +
 +	oe_ensure_clock();
++	if (oe.dat_wait != 0) {
++		(void)oe_wait_ready(OE_DAT_IDLE_TIMEOUT_NS);
++	}
 +	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
 +	oe_wr(oe.hc, R_BLK, (1u << 16) | OE_BLOCK_SIZE);
 +	oe_wr(oe.hc, R_ARG, arg);
@@ -1224,6 +1270,20 @@
 +	(void)oe_issue(OE_CMD_IDX(13) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
 +	    oe.rca << 16, resp, &ist);
 +	printf("ONC EMMC: cmd13 status=0x%08x\n", resp[0]);
++
++	/*
++	 * SET_BLOCKLEN(512) once, before any data transfer: eMMC defaults to
++	 * 512, but the specs expect it explicitly before CMD18 and it costs
++	 * nothing.  emmcroot_cmd16=0 skips it for A/B runs.
++	 */
++	if (oe.send_cmd16) {
++		rc = oe_issue(OE_CMD_IDX(16) | OE_RSP_48 | OE_CC_CRC |
++		    OE_CC_IDX, 512, resp, &ist);
++		printf("ONC EMMC: cmd16 (set blocklen 512) rc=%d\n", rc);
++		if (rc != 0) {
++			printf("ONC EMMC: cmd16 failed int=0x%08x\n", ist);
++		}
++	}
 +
 +	rc = oe_pio_read(OE_CMD_IDX(8) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
 +	    OE_CC_DATA, 0, oe_sector);
@@ -1852,14 +1912,24 @@
 +		uint32_t nocmd18 = 0;
 +		uint32_t autocmd12 = 0;
 +		uint32_t batch = 0;
++		uint32_t nodatwait = 0;
++		uint32_t nocmd16 = 0;
 +
 +		PE_parse_boot_argn("emmcroot_nocmd18", &nocmd18,
 +		    sizeof(nocmd18));
 +		PE_parse_boot_argn("emmcroot_autocmd12", &autocmd12,
 +		    sizeof(autocmd12));
 +		PE_parse_boot_argn("emmcroot_batch", &batch, sizeof(batch));
++		PE_parse_boot_argn("emmcroot_datwait", &nodatwait,
++		    sizeof(nodatwait));
++		PE_parse_boot_argn("emmcroot_cmd16", &nocmd16,
++		    sizeof(nocmd16));
 +		oe.no_cmd18 = (nocmd18 != 0);
 +		oe.auto_cmd12 = (autocmd12 != 0);
++		/* Both default ON; emmcroot_datwait=0 / emmcroot_cmd16=0 turn
++		 * them off for A/B runs. */
++		oe.dat_wait = (nodatwait == 0);
++		oe.send_cmd16 = (nocmd16 == 0);
 +		if (batch != 0) {
 +			oe.batch_blocks = MIN(batch, OE_MULTI_MAX);
 +		} else {
@@ -1927,8 +1997,9 @@
 +	    want, oe.bmajor, oe.first_lba,
 +	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
 +	    oe.writable ? "read-write" : "read-only");
-+	printf("ONC EMMC: v9d cmd18=%u auto12=%d nocmd18=%d rdhb=%u KiB\n",
++	printf("ONC EMMC: v9e cmd18=%u auto12=%d nocmd18=%d datwait=%d cmd16=%d rdhb=%u KiB\n",
 +	    (unsigned)oe.batch_blocks, (int)oe.auto_cmd12, (int)oe.no_cmd18,
++	    (int)oe.dat_wait, (int)oe.send_cmd16,
 +	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
 +
 +	/*

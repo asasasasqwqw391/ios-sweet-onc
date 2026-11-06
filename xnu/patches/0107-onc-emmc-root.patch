@@ -554,6 +554,28 @@
 +}
 +
 +/*
++ * Wait until the core releases the DAT line (PRESENT_STATE bit2 == 0).  A
++ * multi-block transfer is only finished once this is clear; sending CMD12 or
++ * any new command before that lands as a Command Timeout with the controller
++ * stuck in data state (expU9b).
++ */
++static int
++oe_wait_dat_idle(uint64_t timeout_ns)
++{
++	uint64_t deadline = oe_deadline(timeout_ns);
++
++	for (;;) {
++		if ((oe_rd(oe.hc, R_PRESENT) & OE_PS_DAT_ACTIVE) == 0) {
++			return 0;
++		}
++		if (oe_expired(deadline)) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
 + * One 512-byte PIO data read.  cmdw carries OE_CC_DATA; arg is the card
 + * argument (block address for CMD17, 0 for CMD8/EXT_CSD).  The data port is
 + * 32-bit, so 128 reads fill the block; then transfer complete is awaited so
@@ -703,28 +725,6 @@
 + * back stale.  That was exactly the expU8 failure (HFS B-tree node 0 read back
 + * as zeros -> "offset #0 invalid").
 + */
-+/*
-+ * Wait until the core releases the DAT line (PRESENT_STATE bit2 == 0).  A
-+ * multi-block transfer is only finished once this is clear; sending CMD12 or
-+ * any new command before that lands as a Command Timeout with the controller
-+ * stuck in data state (expU9b).
-+ */
-+static int
-+oe_wait_dat_idle(uint64_t timeout_ns)
-+{
-+	uint64_t deadline = oe_deadline(timeout_ns);
-+
-+	for (;;) {
-+		if ((oe_rd(oe.hc, R_PRESENT) & OE_PS_DAT_ACTIVE) == 0) {
-+			return 0;
-+		}
-+		if (oe_expired(deadline)) {
-+			return ETIMEDOUT;
-+		}
-+		delay(1);
-+	}
-+}
-+
 +static int
 +oe_pio_read_multi(uint32_t lba, uint32_t nblocks, uint8_t *out)
 +{

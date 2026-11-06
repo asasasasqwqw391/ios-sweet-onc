@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1877 @@
+@@ -0,0 +1,1910 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -172,17 +172,15 @@
 +
 +/* ---- transfer mode (0x0c) -------------------------------------------- */
 +#define OE_TM_READ		0x0010u	/* data transfer direction: read */
-+#define OE_TM_READ_MULTI	0x0036u	/* auto-cmd12(2) | multi(5) | read(4) | block-count(1) */
++#define OE_TM_READ_MULTI	0x0034u	/* multi(5) | read(4) | block-count(1) */
 +
 +/* ---- multi-block read (CMD18) ---------------------------------------- */
 +#define OE_CMD18_READ		(OE_CMD_IDX(18) | OE_RSP_48 | OE_CC_CRC | \
 +				 OE_CC_IDX | OE_CC_DATA)
-+/*
-+ * Auto CMD12 Enable (bit2) lets the SDHCI core stop the multiple-block
-+ * transfer itself when the programmed block count is reached; this driver
-+ * never sends CMD12 by hand.
-+ */
-+#define OE_MULTI_BLOCKS		64u	/* 32 KiB per CMD18 */
++/* Multi-block reads are stopped with a manual CMD12 after the last block. */
++#define OE_CMD12_STOP		(OE_CMD_IDX(12) | OE_RSP_48_BUSY | OE_CC_CRC | \
++				 OE_CC_IDX)
++#define OE_MULTI_BLOCKS		16u	/* 8 KiB per CMD18 */
 +#define OE_RD_HEARTBEAT_BYTES	(8u * 1024u * 1024u)	/* console progress line */
 +
 +#define OE_BLOCK_SIZE		512u
@@ -217,6 +215,7 @@
 +	uint32_t secsize;	/* logical sector size exposed to the BSD layer */
 +	bool cmd32;		/* CMD0 only worked through the 32-bit window */
 +	bool writable;		/* emmcroot_orw=1: writes are implemented */
++	bool no_cmd18;		/* emmcroot_nocmd18=1: force single-block reads */
 +	bool attempted;		/* a full init was already tried */
 +	bool ready;
 +	int error;		/* result of the first init attempt */
@@ -648,9 +647,13 @@
 +
 +/*
 + * Multi-block PIO read: one CMD18 for nblocks, a buffer-read-ready interrupt
-+ * per 512-byte block, transfer complete after the last one, and the core stops
-+ * the transfer itself (Auto CMD12 Enable).  Removing the per-block CMD17 makes
-+ * the 3.1 GB dyld shared cache load several times faster.
++ * per 512-byte block, a manual CMD12 after the last one.
++ *
++ * Buffer Read Ready is a sticky status bit: it has to be acknowledged (write 1
++ * to clear) after every block before waiting for the next one, otherwise the
++ * next 512-byte read drains a buffer that is not ready yet and the block comes
++ * back stale.  That was exactly the expU8 failure (HFS B-tree node 0 read back
++ * as zeros -> "offset #0 invalid").
 + */
 +static int
 +oe_pio_read_multi(uint32_t lba, uint32_t nblocks, uint8_t *out)
@@ -670,6 +673,7 @@
 +	(void)oe_rd(oe.hc, R_CMD);
 +	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(OE_CMD18_READ & 0xFFFFu));
 +
++	/* First block: wait for command complete and buffer read ready. */
 +	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
 +	for (;;) {
 +		st = oe_rd(oe.hc, R_INT);
@@ -691,6 +695,8 @@
 +		uint8_t *dst;
 +
 +		if (blk != 0) {
++			/* Wait for this block's buffer; BRR stays set until
++			 * acknowledged below, so polling with delay() is safe. */
 +			deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
 +			for (;;) {
 +				st = oe_rd(oe.hc, R_INT);
@@ -704,6 +710,7 @@
 +				if (oe_expired(deadline)) {
 +					goto out;
 +				}
++				delay(1);
 +			}
 +		}
 +		dst = out + blk * OE_BLOCK_SIZE;
@@ -715,6 +722,8 @@
 +			dst[i * 4 + 2] = (uint8_t)((w >> 16) & 0xffu);
 +			dst[i * 4 + 3] = (uint8_t)((w >> 24) & 0xffu);
 +		}
++		/* Acknowledge this block so the core can assert BRR for the next. */
++		oe_wr(oe.hc, R_INT, OE_INT_BRR);
 +	}
 +
 +	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
@@ -733,6 +742,16 @@
 +			goto out;
 +		}
 +		delay(1);
++	}
++
++	/* End the transfer (the card stays in data state until CMD12). */
++	{
++		uint32_t resp[4] = { 0, 0, 0, 0 };
++		uint32_t ist = 0;
++
++		if (oe_issue16(OE_CMD12_STOP, 0, resp, &ist) != 0) {
++			printf("ONC EMMC: cmd12 failed int=0x%08x\n", ist);
++		}
 +	}
 +
 +out:
@@ -759,6 +778,9 @@
 +	if (nblocks == 1) {
 +		return oe_read_lba(lba, out);
 +	}
++	if (oe.no_cmd18) {
++		goto single;
++	}
 +
 +	for (attempt = 0; attempt < 2; attempt++) {
 +		if (attempt != 0) {
@@ -778,7 +800,8 @@
 +	printf("ONC EMMC: rdmfail lba=0x%x n=%u rc=%d,int=0x%08x\n",
 +	    (uint32_t)lba, nblocks, rc, oe.last_int);
 +
-+	/* Fall back to single-block reads for this batch. */
++single:
++	/* Single-block CMD17 fallback (or emmcroot_nocmd18=1). */
 +	for (i = 0; i < (int)nblocks; i++) {
 +		rc = oe_read_lba(lba + (uint64_t)i, out + i * OE_BLOCK_SIZE);
 +		if (rc != 0) {
@@ -1776,8 +1799,18 @@
 +	PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw));
 +	printf("ONC EMMC: onclite SDCC1 eMMC root driver, partition \"%s\"\n", want);
 +	oe.writable = (orw != 0);
++	{
++		uint32_t nocmd18 = 0;
++
++		PE_parse_boot_argn("emmcroot_nocmd18", &nocmd18,
++		    sizeof(nocmd18));
++		oe.no_cmd18 = (nocmd18 != 0);
++	}
 +	if (oe.writable) {
 +		printf("ONC EMMC: emmcroot_orw=1, read-write mode\n");
++	}
++	if (oe.no_cmd18) {
++		printf("ONC EMMC: emmcroot_nocmd18=1, single-block reads only\n");
 +	}
 +	oe.secsize = OE_BLOCK_SIZE;
 +
@@ -1834,9 +1867,9 @@
 +	    want, oe.bmajor, oe.first_lba,
 +	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
 +	    oe.writable ? "read-write" : "read-only");
-+	printf("ONC EMMC: v9 cmd18=%u rdhb=%u KiB\n",
++	printf("ONC EMMC: v9b cmd18=%u rdhb=%u KiB nocmd18=%d\n",
 +	    (unsigned)OE_MULTI_BLOCKS,
-+	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
++	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10), (int)oe.no_cmd18);
 +
 +	/*
 +	 * The Sweet process sampler (bsd/dev/sweet_sample.c, patch 0054) is only

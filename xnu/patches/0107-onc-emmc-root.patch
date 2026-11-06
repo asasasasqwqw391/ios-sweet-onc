@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1621 @@
+@@ -0,0 +1,1820 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -172,6 +172,18 @@
 +
 +/* ---- transfer mode (0x0c) -------------------------------------------- */
 +#define OE_TM_READ		0x0010u	/* data transfer direction: read */
++#define OE_TM_READ_MULTI	0x0036u	/* auto-cmd12(2) | multi(5) | read(4) | block-count(1) */
++
++/* ---- multi-block read (CMD18) ---------------------------------------- */
++#define OE_CMD18_READ		(OE_CMD_IDX(18) | OE_RSP_48 | OE_CC_CRC | \
++				 OE_CC_IDX | OE_CC_DATA)
++/*
++ * Auto CMD12 Enable (bit2) lets the SDHCI core stop the multiple-block
++ * transfer itself when the programmed block count is reached; this driver
++ * never sends CMD12 by hand.
++ */
++#define OE_MULTI_BLOCKS		32u	/* 16 KiB per CMD18 */
++#define OE_RD_HEARTBEAT_BYTES	(8u * 1024u * 1024u)	/* console progress line */
 +
 +#define OE_BLOCK_SIZE		512u
 +#define OE_CMD_TIMEOUT_NS	(100ull * NSEC_PER_MSEC)
@@ -211,6 +223,8 @@
 +	int cmajor;
 +	dev_t bdev;
 +	uint32_t last_int;	/* last INT_STATUS seen by the read primitive */
++	uint64_t blocks_read;	/* diagnostics: 512-byte blocks read so far */
++	uint64_t rd_print_at;	/* next bytes_read milestone to print */
 +} oe;
 +
 +static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
@@ -218,6 +232,7 @@
 +
 +static uint8_t oe_sector[OE_BLOCK_SIZE];	/* PIO landing buffer */
 +static uint8_t oe_bounce[OE_BLOCK_SIZE];	/* strategy bounce buffer */
++static uint8_t oe_multi[OE_MULTI_BLOCKS * OE_BLOCK_SIZE]; /* CMD18 landing */
 +
 +/* -------------------------------------------------------------------------
 + * MMIO accessors.  Every register access goes through these three; the
@@ -577,6 +592,24 @@
 +	return rc;
 +}
 +
++/*
++ * Console heartbeat for the read path: every 8 MiB read, print how much has
++ * been read so far.  During the dyld shared-cache load this is the only way to
++ * tell "still paging in, slowly" from "wedged in the kernel".
++ */
++static void
++oe_rd_account(uint32_t nblocks)
++{
++	uint64_t bytes;
++
++	oe.blocks_read += nblocks;
++	bytes = oe.blocks_read * (uint64_t)OE_BLOCK_SIZE;
++	if (bytes >= oe.rd_print_at) {
++		printf("ONC EMMC: rd %llu KiB\n", bytes >> 10);
++		oe.rd_print_at = bytes + OE_RD_HEARTBEAT_BYTES;
++	}
++}
++
 +/* One 512-byte block by LBA, the only read primitive the BSD layer uses. */
 +static int
 +oe_read_lba(uint64_t lba, uint8_t *out)
@@ -602,6 +635,7 @@
 +		}
 +		rc = oe_pio_read(cmdw, (uint32_t)lba, out);
 +		if (rc == 0) {
++			oe_rd_account(1);
 +			return 0;
 +		}
 +	}
@@ -609,6 +643,148 @@
 +	printf("ONC EMMC: int=0x%08x st=0x%08x clk=0x%08x\n",
 +	    oe.last_int, oe_rd(oe.hc, R_PRESENT), oe_rd(oe.hc, R_CLK));
 +	return rc;
++}
++
++/*
++ * Multi-block PIO read: one CMD18 for nblocks, a buffer-read-ready interrupt
++ * per 512-byte block, transfer complete after the last one, and the core stops
++ * the transfer itself (Auto CMD12 Enable).  Removing the per-block CMD17 makes
++ * the 3.1 GB dyld shared cache load several times faster.
++ */
++static int
++oe_pio_read_multi(uint32_t lba, uint32_t nblocks, uint8_t *out)
++{
++	uint32_t st = 0;
++	uint64_t deadline;
++	uint32_t blk;
++	int i;
++	int rc = ETIMEDOUT;
++
++	oe_ensure_clock();
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe_wr(oe.hc, R_BLK, (nblocks << 16) | OE_BLOCK_SIZE);
++	oe_wr(oe.hc, R_ARG, lba);
++	(void)oe_rd(oe.hc, R_CMD);
++	oe_wr16(oe.hc, R_CMD, OE_TM_READ_MULTI);
++	(void)oe_rd(oe.hc, R_CMD);
++	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(OE_CMD18_READ & 0xFFFFu));
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & (OE_INT_CC | OE_INT_BRR)) ==
++		    (OE_INT_CC | OE_INT_BRR)) {
++			break;
++		}
++		if (oe_expired(deadline)) {
++			goto out;
++		}
++		delay(1);
++	}
++
++	for (blk = 0; blk < nblocks; blk++) {
++		uint8_t *dst;
++
++		if (blk != 0) {
++			deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++			for (;;) {
++				st = oe_rd(oe.hc, R_INT);
++				if ((st & OE_INT_ERR) != 0) {
++					rc = EIO;
++					goto out;
++				}
++				if ((st & OE_INT_BRR) != 0) {
++					break;
++				}
++				if (oe_expired(deadline)) {
++					goto out;
++				}
++			}
++		}
++		dst = out + blk * OE_BLOCK_SIZE;
++		for (i = 0; i < (int)(OE_BLOCK_SIZE / 4u); i++) {
++			uint32_t w = oe_rd(oe.hc, R_BUF);
++
++			dst[i * 4 + 0] = (uint8_t)(w & 0xffu);
++			dst[i * 4 + 1] = (uint8_t)((w >> 8) & 0xffu);
++			dst[i * 4 + 2] = (uint8_t)((w >> 16) & 0xffu);
++			dst[i * 4 + 3] = (uint8_t)((w >> 24) & 0xffu);
++		}
++	}
++
++	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			rc = EIO;
++			goto out;
++		}
++		if ((st & OE_INT_TC) != 0) {
++			rc = 0;
++			break;
++		}
++		if (oe_expired(deadline)) {
++			rc = ETIMEDOUT;
++			goto out;
++		}
++		delay(1);
++	}
++
++out:
++	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
++	oe.last_int = st;
++	return rc;
++}
++
++/*
++ * Read nblocks 512-byte blocks at lba.  nblocks > 1 goes through CMD18 and
++ * falls back to per-block CMD17 if the multi-block path errors out, so reads
++ * stay correct even if this core mishandles a corner of the multi-block mode.
++ */
++static int
++oe_read_blocks(uint64_t lba, uint32_t nblocks, uint8_t *out)
++{
++	uint32_t attempt;
++	int i;
++	int rc;
++
++	if (lba > (uint64_t)UINT32_MAX || nblocks == 0) {
++		return EINVAL;
++	}
++	if (nblocks == 1) {
++		return oe_read_lba(lba, out);
++	}
++
++	for (attempt = 0; attempt < 2; attempt++) {
++		if (attempt != 0) {
++			oe_wr(oe.hc, R_CLK,
++			    oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
++			(void)oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
++			    OE_CLK_TIMEOUT_NS);
++			oe_ensure_clock();
++			delay(2000);
++		}
++		rc = oe_pio_read_multi((uint32_t)lba, nblocks, out);
++		if (rc == 0) {
++			oe_rd_account(nblocks);
++			return 0;
++		}
++	}
++	printf("ONC EMMC: rdmfail lba=0x%x n=%u rc=%d,int=0x%08x\n",
++	    (uint32_t)lba, nblocks, rc, oe.last_int);
++
++	/* Fall back to single-block reads for this batch. */
++	for (i = 0; i < (int)nblocks; i++) {
++		rc = oe_read_lba(lba + (uint64_t)i, out + i * OE_BLOCK_SIZE);
++		if (rc != 0) {
++			return rc;
++		}
++	}
++	return 0;
 +}
 +
 +/*
@@ -1375,6 +1551,29 @@
 +		uint64_t lba = oe.first_lba + pos / oe.secsize;
 +
 +		if (rd) {
++			uint32_t batch = 0;
++
++			/*
++			 * Whole sectors at a sector boundary: read a batch with
++			 * one CMD18 instead of one CMD17 per 512 bytes.
++			 */
++			if (skip == 0 && oe.secsize != 0) {
++				batch = (count - done) / oe.secsize;
++				if (batch > OE_MULTI_BLOCKS) {
++					batch = OE_MULTI_BLOCKS;
++				}
++			}
++			if (batch > 1) {
++				error = oe_read_blocks(lba, batch, oe_multi);
++				if (error != 0) {
++					break;
++				}
++				memcpy(vaddr + done, oe_multi,
++				    batch * oe.secsize);
++				done += batch * oe.secsize;
++				buf_setresid(bp, count - done);
++				continue;
++			}
 +			error = oe_read_lba(lba, oe_bounce);
 +			if (error != 0) {
 +				break;
@@ -1435,7 +1634,7 @@
 +		*f = oe.writable ? 1 : 0;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTREAD:
-+		*o = 1;			/* one 512-byte block per CMD17 */
++		*o = OE_MULTI_BLOCKS;	/* CMD18 batches of 16 KiB */
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
 +		*o = oe.writable ? 1 : 0;

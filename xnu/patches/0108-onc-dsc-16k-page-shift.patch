@@ -1,0 +1,43 @@
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -371,7 +371,17 @@
+ 	if (ntohl(cd->magic) != CSMAGIC_CODEDIRECTORY) {
+ 		return EBADEXEC;
+ 	}
+-	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
++	/*
++	 * ONC (Redmi 7, 4 KB kernel pages): iOS 16's dyld shared cache carries a
++	 * 16 KB-page (shift 14) CodeDirectory.  A 4 KB kernel can never compute
++	 * those per-page hashes and the dsc page offsets are not 16 KB aligned,
++	 * so cs_validate_hash() below treats such mappings as trusted; accept
++	 * the page shift here instead of rejecting the whole blob (dyld's
++	 * fcntl(F_ADDFILESIGS) on the shared cache would otherwise fail with
++	 * EBADEXEC 85).  Normal 4 KB-signed binaries are unaffected.
++	 * See HANDOFF.md H.14.
++	 */
++	if (cd->pageSize < PAGE_SHIFT_4K || cd->pageSize > 16) {
+ 		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+ 		return EBADEXEC;
+ 	}
+@@ -5719,6 +5729,21 @@
+ 		if (cd != NULL) {
+ 			/* all CD's that have been injected is already validated */
+ 
++			/*
++			 * ONC (Redmi 7, 4 KB kernel pages): a 16 KB-page
++			 * CodeDirectory (iOS dyld shared cache) cannot be hashed
++			 * out of one 4 KB pager page, and its 4 KB page offsets
++			 * are not 16 KB aligned, which would trip the "offset not
++			 * aligned to cshash boundary" panic below.  Treat the
++			 * mapping as trusted (the dsc is Apple-signed and comes
++			 * read-only from our root filesystem) and report one 4 KB
++			 * page of progress so the caller keeps walking.  See H.14.
++			 */
++			if (blob->csb_hash_pageshift > PAGE_SHIFT) {
++				*bytes_processed = PAGE_SIZE;
++				return TRUE;
++			}
++
+ 			hashtype = blob->csb_hashtype;
+ 			if (hashtype == NULL) {
+ 				panic("unknown hash type ?");

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1959 @@
+@@ -0,0 +1,1970 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -775,19 +775,30 @@
 +		delay(1);
 +	}
 +
-+	/* End the transfer (the card stays in data state until CMD12). */
++	/*
++	 * CMD12 has to go out immediately after TC.  The card is still in the
++	 * data state and keeps streaming until it sees CMD12, and PRESENT_STATE
++	 * DAT-active only clears once the stop command has completed -- so
++	 * waiting for DAT idle *before* CMD12 (expU9c) let the card overrun and
++	 * surfaced as Data CRC errors.  Order here: CMD12, then DAT idle.
++	 */
 +	if (!oe.auto_cmd12) {
 +		uint32_t resp[4] = { 0, 0, 0, 0 };
 +		uint32_t ist = 0;
 +
-+		/*
-+		 * Only stop once the core has released the DAT line: expU9b sent
-+		 * CMD12 while PRESENT_STATE still showed DAT active, got a
-+		 * Command Timeout and left the controller stuck in data state.
-+		 */
-+		(void)oe_wait_dat_idle(OE_DAT_IDLE_TIMEOUT_NS);
 +		if (oe_issue16(OE_CMD12_STOP, 0, resp, &ist) != 0) {
 +			printf("ONC EMMC: cmd12 failed int=0x%08x\n", ist);
++			oe_wr(oe.hc, R_CLK,
++			    oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
++			(void)oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
++			    OE_CLK_TIMEOUT_NS);
++			oe_ensure_clock();
++			(void)oe_wait_dat_idle(OE_DAT_IDLE_TIMEOUT_NS);
++			if (rc == 0) {
++				rc = EIO;
++			}
++		} else {
++			(void)oe_wait_dat_idle(OE_DAT_IDLE_TIMEOUT_NS);
 +		}
 +	}
 +
@@ -1916,7 +1927,7 @@
 +	    want, oe.bmajor, oe.first_lba,
 +	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
 +	    oe.writable ? "read-write" : "read-only");
-+	printf("ONC EMMC: v9c cmd18=%u auto12=%d nocmd18=%d rdhb=%u KiB\n",
++	printf("ONC EMMC: v9d cmd18=%u auto12=%d nocmd18=%d rdhb=%u KiB\n",
 +	    (unsigned)oe.batch_blocks, (int)oe.auto_cmd12, (int)oe.no_cmd18,
 +	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
 +

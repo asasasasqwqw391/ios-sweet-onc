@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,1820 @@
+@@ -0,0 +1,1877 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -182,7 +182,7 @@
 + * transfer itself when the programmed block count is reached; this driver
 + * never sends CMD12 by hand.
 + */
-+#define OE_MULTI_BLOCKS		32u	/* 16 KiB per CMD18 */
++#define OE_MULTI_BLOCKS		64u	/* 32 KiB per CMD18 */
 +#define OE_RD_HEARTBEAT_BYTES	(8u * 1024u * 1024u)	/* console progress line */
 +
 +#define OE_BLOCK_SIZE		512u
@@ -201,6 +201,7 @@
 +#define OE_CMD6_BUS_1BIT	0x03B70000u	/* EXT_CSD[183] = 0 (1-bit) */
 +#define OE_GCC_APPS_CFG_400K	0x2017u		/* div 23 (/24), dual edge, XO */
 +#define OE_GCC_APPS_CFG_25M	0x041Fu		/* div 31 (/16), GPLL0_DIV2 = 4 */
++#define OE_GCC_APPS_CFG_50M	0x040Fu		/* div 15 (/8), GPLL0_DIV2 = 4 */
 +#define OE_HC_4BIT		0x02u		/* HOST_CONTROL bit1 */
 +#define OE_HC_HISPD		0x04u		/* HOST_CONTROL bit2 */
 +
@@ -1241,6 +1242,42 @@
 +	return ETIMEDOUT;
 +}
 +
++/*
++ * Optional 50 MHz experiment (emmcroot_clk50=1): GPLL0_DIV2 / 8, CFG_RCGR div
++ * field 2*8-1 = 15.  The card must still read block 0; on any failure this
++ * falls back to 25 MHz, so it is never fatal.
++ */
++static int
++oe_card_clk50(void)
++{
++	uint8_t probe[OE_BLOCK_SIZE];
++	uint32_t want = 0;
++
++	PE_parse_boot_argn("emmcroot_clk50", &want, sizeof(want));
++	if (want == 0) {
++		return 0;
++	}
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	oe_gcc_set_apps_cfg(OE_GCC_APPS_CFG_50M, false);
++	if (oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS) == 0 &&
++	    oe_read_lba(0, probe) == 0 &&
++	    ((uint32_t)probe[510] | ((uint32_t)probe[511] << 8)) == 0xAA55u) {
++		oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) |
++		    OE_INT_CLK_EN | OE_INT_CLK_STABLE | OE_SD_CLK_EN);
++		delay(2000);
++		printf("ONC EMMC: clk50 on, clk=0x%08x\n", oe_rd(oe.hc, R_CLK));
++		return 0;
++	}
++	printf("ONC EMMC: 50 MHz failed, back to 25 MHz\n");
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN);
++	oe_gcc_set_apps_cfg(OE_GCC_APPS_CFG_25M, false);
++	(void)oe_poll_set(oe.hc, R_CLK, OE_INT_CLK_STABLE, OE_CLK_TIMEOUT_NS);
++	oe_wr(oe.hc, R_CLK, (OE_CLK_TIMEOUT_BYTE << 16) | OE_INT_CLK_EN |
++	    OE_INT_CLK_STABLE | OE_SD_CLK_EN);
++	delay(2000);
++	return -1;
++}
++
 +static int
 +oe_card_hs_init(void)
 +{
@@ -1300,6 +1337,7 @@
 +	}
 +	printf("ONC EMMC: hs on: 25 MHz, 4-bit, clk=0x%08x hostctrl=0x%02x\n",
 +	    oe_rd(oe.hc, R_CLK), (unsigned)(oe_rd(oe.hc, R_HOSTPWR) & 0xffu));
++	(void)oe_card_clk50();
 +	return 0;
 +
 +rollback_all:
@@ -1796,6 +1834,25 @@
 +	    want, oe.bmajor, oe.first_lba,
 +	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
 +	    oe.writable ? "read-write" : "read-only");
++	printf("ONC EMMC: v9 cmd18=%u rdhb=%u KiB\n",
++	    (unsigned)OE_MULTI_BLOCKS,
++	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
++
++	/*
++	 * The Sweet process sampler (bsd/dev/sweet_sample.c, patch 0054) is only
++	 * started by the UFS driver; start it here too when the boot-arg asks for
++	 * userland stack samples, which is how a hung launchd/dyld is diagnosed.
++	 */
++	{
++		char smp[40];
++
++		if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp))) {
++			extern void sweet_sample_start(void);
++
++			sweet_sample_start();
++			printf("ONC EMMC: sampler on for %s\n", smp);
++		}
++	}
 +	return 0;
 +
 +fail:

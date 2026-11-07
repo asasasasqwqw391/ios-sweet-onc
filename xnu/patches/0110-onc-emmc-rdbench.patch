@@ -1,0 +1,124 @@
+Diagnose the eMMC read speed wall seen during the dyld shared-cache page-in:
+the "ONC EMMC: rd" heartbeat now prints how long the last 8 MiB took, and the
+boot-arg emmcroot_bench=<MiB> runs a timed sequential CMD17 read at the root
+partition's first LBA before the HFS mount and prints KiB/s every 4 MiB.
+
+(Patch 0107 added this file, so the base for the diff is the CI-main version,
+saved as tmp/onc_emmc_before_bench.c; only bsd/dev/onc_emmc.c changes.)
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -673,17 +673,30 @@
+ /*
+  * Console heartbeat for the read path: every 8 MiB read, print how much has
+  * been read so far.  During the dyld shared-cache load this is the only way to
+- * tell "still paging in, slowly" from "wedged in the kernel".
+- */
++ * tell "still paging in, slowly" from "wedged in the kernel".  The elapsed
++ * milliseconds since the previous heartbeat make a slow card obvious.
++ */
++static uint64_t oe_rd_last_ts;		/* timestamp of the previous heartbeat */
++
+ static void
+ oe_rd_account(uint32_t nblocks)
+ {
+ 	uint64_t bytes;
++	uint64_t now;
+ 
+ 	oe.blocks_read += nblocks;
+ 	bytes = oe.blocks_read * (uint64_t)OE_BLOCK_SIZE;
+ 	if (bytes >= oe.rd_print_at) {
+-		printf("ONC EMMC: rd %llu KiB\n", bytes >> 10);
++		uint64_t nsec = 0;
++
++		now = mach_absolute_time();
++		if (oe_rd_last_ts != 0) {
++			absolutetime_to_nanoseconds(now - oe_rd_last_ts, &nsec);
++		}
++		oe_rd_last_ts = now;
++		printf("ONC EMMC: rd %llu KiB (+%llu KiB in %llu ms)\n",
++		    bytes >> 10, OE_RD_HEARTBEAT_BYTES >> 10,
++		    (nsec + 500000ull) / 1000000ull);
+ 		oe.rd_print_at = bytes + OE_RD_HEARTBEAT_BYTES;
+ 	}
+ }
+@@ -872,6 +885,63 @@
+ 		}
+ 	}
+ 	return 0;
++}
++
++/*
++ * Read benchmark (boot-arg emmcroot_bench=<MiB>): time a sequential read of
++ * that many MiB at the root partition's first LBA through the same CMD17
++ * primitive the filesystem uses, printing KiB/s every 4 MiB.  This separates
++ * "the card/controller is slow" from "the filesystem asks for scattered
++ * blocks": the numbers appear on the console before the HFS mount.
++ */
++static void
++oe_bench(uint32_t mib)
++{
++	uint64_t lba = oe.first_lba;
++	uint32_t blocks = mib * (1024u * 1024u / OE_BLOCK_SIZE);
++	uint32_t done = 0;
++	uint64_t t_start, t_now, t_last;
++	uint64_t nsec;
++	int rc = 0;
++
++	printf("ONC EMMC: bench start %u MiB single-block CMD17 at lba 0x%llx\n",
++	    mib, lba);
++	t_start = t_last = mach_absolute_time();
++	while (done < blocks) {
++		uint32_t n = blocks - done;
++		uint32_t i;
++
++		if (n > oe.batch_blocks) {
++			n = oe.batch_blocks;
++		}
++		for (i = 0; i < n; i++) {
++			rc = oe_read_lba(lba + done + i, oe_sector);
++			if (rc != 0) {
++				printf("ONC EMMC: bench read fail lba=0x%llx rc=%d\n",
++				    lba + done + i, rc);
++				goto out;
++			}
++		}
++		done += n;
++		if ((done % (1u * 1024u * 1024u / OE_BLOCK_SIZE)) == 0) {
++			t_now = mach_absolute_time();
++			nsec = 0;
++			absolutetime_to_nanoseconds(t_now - t_last, &nsec);
++			t_last = t_now;
++			printf("ONC EMMC: bench %u MiB: 1 MiB in %llu ms -> %llu KiB/s\n",
++			    done >> 11, (nsec + 500000ull) / 1000000ull,
++			    (uint64_t)(1 * 1024) * 1000000000ull /
++			    (nsec != 0 ? nsec : 1));
++		}
++	}
++out:
++	t_now = mach_absolute_time();
++	nsec = 0;
++	absolutetime_to_nanoseconds(t_now - t_start, &nsec);
++	printf("ONC EMMC: bench done %u KiB in %llu ms -> %llu KiB/s (rc=%d)\n",
++	    (done * OE_BLOCK_SIZE) >> 10, (nsec + 500000ull) / 1000000ull,
++	    (uint64_t)(done * OE_BLOCK_SIZE) * 1000000000ull /
++	    (nsec != 0 ? nsec : 1), rc);
+ }
+ 
+ /*
+@@ -1987,6 +2057,16 @@
+ 	    (int)oe.dat_wait, (int)oe.send_cmd16, (int)oe.bus8,
+ 	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
+ 
++	/* Optional read benchmark, see oe_bench() (emmcroot_bench=<MiB>). */
++	{
++		uint32_t bench = 0;
++
++		if (PE_parse_boot_argn("emmcroot_bench", &bench,
++		    sizeof(bench)) && bench != 0) {
++			oe_bench(MIN(bench, 64u));
++		}
++	}
++
+ 	/*
+ 	 * The Sweet process sampler (bsd/dev/sweet_sample.c, patch 0054) is only
+ 	 * started by the UFS driver; start it here too when the boot-arg asks for

@@ -1,0 +1,59 @@
+Read-path diagnostic/fix attempt: the phase profile shows ~32 ms between entering a
+block read and the command being written, while the data phases take <1 ms.  The
+only per-command work in that window is oe_ensure_clock() -> oe_branch_on(), which
+kicks the GCC apps branch and polls until the self-clearing enable bit reads 0
+(up to 1000 x 1 ms).
+
+  * emmcroot_rdprof now also prints the branch-kick time ("prof branch=<us>");
+  * emmcroot_nobranch=1 skips the branch kick entirely (the clock register is still
+    checked and fixed up), so the harness can measure whether that kick is the
+    32 ms.  If the benchmark jumps, the fix is to kick the branch only when needed.
+
+Base: tmp/onc_emmc_after_0111.c (= CI main after 0111).
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -238,6 +238,7 @@
+ 	uint64_t blocks_read;	/* diagnostics: 512-byte blocks read so far */
+ 	uint64_t rd_print_at;	/* next bytes_read milestone to print */
+ 	uint32_t rdprof_left;	/* emmcroot_rdprof=N: reads left to profile */
++	bool nobranch;		/* emmcroot_nobranch=1: skip the GCC branch kick */
+ } oe;
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+@@ -355,7 +356,20 @@
+ 	uint32_t clk;
+ 	uint32_t want = OE_INT_CLK_EN | OE_INT_CLK_STABLE | OE_SD_CLK_EN;
+ 
+-	(void)oe_branch_on(G_APPS_BRANCH);
++	if (!oe.nobranch) {
++		if (oe.rdprof_left != 0) {
++			uint64_t t0 = mach_absolute_time();
++			uint64_t nsec = 0;
++
++			(void)oe_branch_on(G_APPS_BRANCH);
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0,
++			    &nsec);
++			printf("ONC EMMC: prof branch=%llu us\n",
++			    (nsec + 500) / 1000);
++		} else {
++			(void)oe_branch_on(G_APPS_BRANCH);
++		}
++	}
+ 	clk = oe_rd(oe.hc, R_CLK);
+ 	if ((clk & want) == want) {
+ 		return;
+@@ -2035,10 +2049,14 @@
+ 		}
+ 		{
+ 			uint32_t prof = 0;
++			uint32_t nobr = 0;
+ 
+ 			PE_parse_boot_argn("emmcroot_rdprof", &prof,
+ 			    sizeof(prof));
+ 			oe.rdprof_left = prof;
++			PE_parse_boot_argn("emmcroot_nobranch", &nobr,
++			    sizeof(nobr));
++			oe.nobranch = (nobr != 0);
+ 		}
+ 	}
+ 	oe.rd_print_at = OE_RD_HEARTBEAT_BYTES;

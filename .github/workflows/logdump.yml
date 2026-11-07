@@ -11,10 +11,6 @@ on:
       - "tools/logdump/**"
       - ".github/workflows/logdump.yml"
 
-concurrency:
-  group: logdump-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: macos-14

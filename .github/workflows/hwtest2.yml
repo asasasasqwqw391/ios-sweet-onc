@@ -1,0 +1,12 @@
+name: hwtest2
+on:
+  workflow_dispatch:
+jobs:
+  hi13:
+    runs-on: macos-13
+    steps:
+      - run: sw_vers && xcrun --find clang
+  hi14:
+    runs-on: macos-14
+    steps:
+      - run: sw_vers && xcrun --find clang

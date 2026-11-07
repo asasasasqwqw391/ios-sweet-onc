@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/onc_emmc.c
-@@ -0,0 +1,2041 @@
+@@ -0,0 +1,2029 @@
 +/*
 + * ONC (Xiaomi Redmi 7 / onclite, Qualcomm SDM632) internal eMMC root device.
 + *
@@ -205,11 +205,13 @@
 +#define OE_CMD6_HS_TIMING_LG	0x03B90000u	/* EXT_CSD[185] = 0 (legacy) */
 +#define OE_CMD6_BUS_4BIT	0x03B70100u	/* EXT_CSD[183] = 1 (4-bit) */
 +#define OE_CMD6_BUS_1BIT	0x03B70000u	/* EXT_CSD[183] = 0 (1-bit) */
++#define OE_CMD6_BUS_8BIT	0x03B70200u	/* EXT_CSD[183] = 2 (8-bit) */
 +#define OE_GCC_APPS_CFG_400K	0x2017u		/* div 23 (/24), dual edge, XO */
 +#define OE_GCC_APPS_CFG_25M	0x041Fu		/* div 31 (/16), GPLL0_DIV2 = 4 */
 +#define OE_GCC_APPS_CFG_50M	0x040Fu		/* div 15 (/8), GPLL0_DIV2 = 4 */
 +#define OE_HC_4BIT		0x02u		/* HOST_CONTROL bit1 */
 +#define OE_HC_HISPD		0x04u		/* HOST_CONTROL bit2 */
++#define OE_HC_8BIT		0x20u		/* HOST_CONTROL bit5 (8-bit bus) */
 +
 +static struct {
 +	vm_offset_t hc;		/* SDHCI registers (hc_mem) */
@@ -226,6 +228,7 @@
 +	bool no_cmd18;		/* emmcroot_nocmd18=1: force single-block reads */
 +	bool auto_cmd12;	/* emmcroot_autocmd12=1: let the core stop CMD18 */
 +	bool dat_wait;		/* emmcroot_datwait=0: do not wait for inhibit */
++	bool bus8;		/* emmcroot_8bit=1: 8-bit bus after HS */
 +	bool send_cmd16;	/* emmcroot_cmd16=0: do not send SET_BLOCKLEN */
 +	uint32_t batch_blocks;	/* emmcroot_batch=N: CMD18 blocks per command */
 +	bool attempted;		/* a full init was already tried */
@@ -581,11 +584,44 @@
 + * 32-bit, so 128 reads fill the block; then transfer complete is awaited so
 + * the next command starts from a clean interrupt state.
 + */
++/*
++ * Wait for bits in INT_STATUS without the 1 ms sleep of a naive poll loop:
++ * a 512-byte block at 25 MHz needs about 0.4 ms, so a full millisecond of
++ * sleep per poll iteration capped the driver at ~0.5 MB/s.  Busy-poll
++ * briefly and only fall back to delay(1) for long waits.
++ */
++static int
++oe_wait_int(uint32_t mask, uint64_t timeout_ns, uint32_t *st_out)
++{
++	uint64_t deadline = oe_deadline(timeout_ns);
++	uint32_t spin = 0;
++	uint32_t st;
++
++	for (;;) {
++		st = oe_rd(oe.hc, R_INT);
++		if ((st & OE_INT_ERR) != 0) {
++			*st_out = st;
++			return EIO;
++		}
++		if ((st & mask) == mask) {
++			*st_out = st;
++			return 0;
++		}
++		if (oe_expired(deadline)) {
++			*st_out = st;
++			return ETIMEDOUT;
++		}
++		if (++spin >= 2000) {
++			spin = 0;
++			delay(1);
++		}
++	}
++}
++
 +static int
 +oe_pio_read(uint32_t cmdw, uint32_t arg, uint8_t *out)
 +{
 +	uint32_t st = 0;
-+	uint64_t deadline;
 +	int rc = ETIMEDOUT;
 +	int i;
 +
@@ -602,21 +638,9 @@
 +	(void)oe_rd(oe.hc, R_CMD);			/* barrier between the stores */
 +	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(cmdw & 0xFFFFu));
 +
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & (OE_INT_CC | OE_INT_BRR)) == (OE_INT_CC | OE_INT_BRR)) {
-+			rc = 0;
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_CC | OE_INT_BRR, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		goto out;
 +	}
 +
 +	for (i = 0; i < (int)(OE_BLOCK_SIZE / 4u); i++) {
@@ -628,23 +652,10 @@
 +		out[i * 4 + 3] = (uint8_t)((w >> 24) & 0xffu);
 +	}
 +
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & OE_INT_TC) != 0) {
-+			rc = 0;
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			/* The bytes are already in out; still report the error. */
-+			rc = ETIMEDOUT;
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_TC, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		/* The bytes are already in out; still report the error. */
++		goto out;
 +	}
 +
 +	/*
@@ -729,7 +740,6 @@
 +oe_pio_read_multi(uint32_t lba, uint32_t nblocks, uint8_t *out)
 +{
 +	uint32_t st = 0;
-+	uint64_t deadline;
 +	uint32_t blk;
 +	int i;
 +	int rc = ETIMEDOUT;
@@ -748,43 +758,20 @@
 +	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(OE_CMD18_READ & 0xFFFFu));
 +
 +	/* First block: wait for command complete and buffer read ready. */
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & (OE_INT_CC | OE_INT_BRR)) ==
-+		    (OE_INT_CC | OE_INT_BRR)) {
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_CC | OE_INT_BRR, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		goto out;
 +	}
 +
 +	for (blk = 0; blk < nblocks; blk++) {
 +		uint8_t *dst;
 +
 +		if (blk != 0) {
-+			/* Wait for this block's buffer; BRR stays set until
-+			 * acknowledged below, so polling with delay() is safe. */
-+			deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+			for (;;) {
-+				st = oe_rd(oe.hc, R_INT);
-+				if ((st & OE_INT_ERR) != 0) {
-+					rc = EIO;
-+					goto out;
-+				}
-+				if ((st & OE_INT_BRR) != 0) {
-+					break;
-+				}
-+				if (oe_expired(deadline)) {
-+					goto out;
-+				}
-+				delay(1);
++			/* Wait for this block's buffer (BRR is sticky until the
++			 * acknowledge below). */
++			rc = oe_wait_int(OE_INT_BRR, OE_DATA_TIMEOUT_NS, &st);
++			if (rc != 0) {
++				goto out;
 +			}
 +		}
 +		dst = out + blk * OE_BLOCK_SIZE;
@@ -800,22 +787,9 @@
 +		oe_wr(oe.hc, R_INT, OE_INT_BRR);
 +	}
 +
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & OE_INT_TC) != 0) {
-+			rc = 0;
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			rc = ETIMEDOUT;
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_TC, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		goto out;
 +	}
 +
 +	/*
@@ -912,7 +886,6 @@
 +oe_pio_write(uint32_t cmdw, uint32_t arg, const uint8_t *in)
 +{
 +	uint32_t st = 0;
-+	uint64_t deadline;
 +	int rc = ETIMEDOUT;
 +	int i;
 +
@@ -928,22 +901,9 @@
 +	(void)oe_rd(oe.hc, R_CMD);
 +	oe_wr16(oe.hc, R_CMD + 2, (uint16_t)(cmdw & 0xFFFFu));
 +
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & (OE_INT_CC | OE_INT_BWR)) ==
-+		    (OE_INT_CC | OE_INT_BWR)) {
-+			rc = 0;
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_CC | OE_INT_BWR, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		goto out;
 +	}
 +
 +	for (i = 0; i < (int)(OE_BLOCK_SIZE / 4u); i++) {
@@ -955,22 +915,9 @@
 +		oe_wr(oe.hc, R_BUF, w);
 +	}
 +
-+	deadline = oe_deadline(OE_DATA_TIMEOUT_NS);
-+	for (;;) {
-+		st = oe_rd(oe.hc, R_INT);
-+		if ((st & OE_INT_ERR) != 0) {
-+			rc = EIO;
-+			goto out;
-+		}
-+		if ((st & OE_INT_TC) != 0) {
-+			rc = 0;
-+			break;
-+		}
-+		if (oe_expired(deadline)) {
-+			rc = ETIMEDOUT;
-+			goto out;
-+		}
-+		delay(1);
++	rc = oe_wait_int(OE_INT_TC, OE_DATA_TIMEOUT_NS, &st);
++	if (rc != 0) {
++		goto out;
 +	}
 +
 +out:
@@ -1410,6 +1357,40 @@
 +	return -1;
 +}
 +
++/*
++ * Optional 8-bit bus (emmcroot_8bit=1): CMD6 BUS_WIDTH=2, then HOST_CONTROL
++ * 8-bit select.  Verified with an LBA0 read; any failure rolls back to
++ * 4-bit, so it is never fatal.
++ */
++static int
++oe_card_8bit(void)
++{
++	uint8_t probe[OE_BLOCK_SIZE];
++	uint32_t hc;
++
++	if (!oe.bus8) {
++		return 0;
++	}
++	if (oe_switch_byte(OE_CMD6_BUS_8BIT) == 0) {
++		hc = oe_rd(oe.hc, R_HOSTPWR);
++		oe_wr(oe.hc, R_HOSTPWR, (hc & ~OE_HC_4BIT) | OE_HC_8BIT);
++		delay(2000);
++		if (oe_read_lba(0, probe) == 0 &&
++		    ((uint32_t)probe[510] |
++		    ((uint32_t)probe[511] << 8)) == 0xAA55u) {
++			printf("ONC EMMC: 8-bit bus on, hostctrl=0x%02x\n",
++			    (unsigned)(oe_rd(oe.hc, R_HOSTPWR) & 0xffu));
++			return 0;
++		}
++	}
++	printf("ONC EMMC: 8-bit bus failed, back to 4-bit\n");
++	(void)oe_switch_byte(OE_CMD6_BUS_4BIT);
++	hc = oe_rd(oe.hc, R_HOSTPWR);
++	oe_wr(oe.hc, R_HOSTPWR, (hc & ~OE_HC_8BIT) | OE_HC_4BIT);
++	delay(2000);
++	return -1;
++}
++
 +static int
 +oe_card_hs_init(void)
 +{
@@ -1470,6 +1451,7 @@
 +	printf("ONC EMMC: hs on: 25 MHz, 4-bit, clk=0x%08x hostctrl=0x%02x\n",
 +	    oe_rd(oe.hc, R_CLK), (unsigned)(oe_rd(oe.hc, R_HOSTPWR) & 0xffu));
 +	(void)oe_card_clk50();
++	(void)oe_card_8bit();
 +	return 0;
 +
 +rollback_all:
@@ -1924,6 +1906,12 @@
 +		    sizeof(nodatwait));
 +		PE_parse_boot_argn("emmcroot_cmd16", &nocmd16,
 +		    sizeof(nocmd16));
++		{
++			uint32_t bus8 = 0;
++
++			PE_parse_boot_argn("emmcroot_8bit", &bus8, sizeof(bus8));
++			oe.bus8 = (bus8 != 0);
++		}
 +		oe.no_cmd18 = (nocmd18 != 0);
 +		oe.auto_cmd12 = (autocmd12 != 0);
 +		/* Both default ON; emmcroot_datwait=0 / emmcroot_cmd16=0 turn
@@ -1997,9 +1985,9 @@
 +	    want, oe.bmajor, oe.first_lba,
 +	    (oe.nblocks * (uint64_t)OE_BLOCK_SIZE) >> 20,
 +	    oe.writable ? "read-write" : "read-only");
-+	printf("ONC EMMC: v9e cmd18=%u auto12=%d nocmd18=%d datwait=%d cmd16=%d rdhb=%u KiB\n",
++	printf("ONC EMMC: v10 cmd18=%u auto12=%d nocmd18=%d datwait=%d cmd16=%d bus8=%d rdhb=%u KiB\n",
 +	    (unsigned)oe.batch_blocks, (int)oe.auto_cmd12, (int)oe.no_cmd18,
-+	    (int)oe.dat_wait, (int)oe.send_cmd16,
++	    (int)oe.dat_wait, (int)oe.send_cmd16, (int)oe.bus8,
 +	    (unsigned)(OE_RD_HEARTBEAT_BYTES >> 10));
 +
 +	/*

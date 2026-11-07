@@ -1,0 +1,38 @@
+name: logdump
+
+# Build the freestanding arm64 logdump tool (prints logd diagnostics to the
+# console).  Kept separate from xnu.yml so it can be rebuilt in ~1 min without
+# a kernel build.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/logdump/**"
+      - ".github/workflows/logdump.yml"
+
+concurrency:
+  group: logdump-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-13
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          sudo xcode-select -s "$XC"
+          bash tools/logdump/build.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: logdump
+          path: |
+            out/logdump
+            out/logdump.sha256

@@ -1,0 +1,306 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,15 @@
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * Publish kernel-wired memory as a surface (a shadow framebuffer for panels
++ * whose own memory is not 32bpp: userland draws 32bpp BGRA here and the
++ * framebuffer converts it on present). Zeroed, mapped cached. Counted
++ * against the buffer-surface wired budget like any created surface.
++ */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -242,6 +242,54 @@
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
++/*
++ * Buffer-backed surface: the same publish path as create(), for memory the
++ * kernel allocates itself (the ONC 24bpp panel needs a 32bpp shadow buffer
++ * to present into). free() drops the wired accounting because memory is an
++ * IOBufferMemoryDescriptor.
++ */
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	IOBufferMemoryDescriptor *mem = NULL;
++
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow * height);
++	s->mapCache = kIOMapDefaultCache;
++	if (s->allocSize == 0 || s->allocSize > SWEET_SURFACE_MAX_ALLOC) {
++		s->release();
++		return NULL;
++	}
++	if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
++	    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	}
++	if (mem == NULL) {
++		/* free() only accounts wired memory for buffer descriptors. */
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		s->release();
++		return NULL;
++	}
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	if (!sweet_surface_publish(s)) {
+ 		s->release();
+ 		return NULL;
+ 	}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -30,7 +30,14 @@
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+- * default framebuffer surface. The kernel text console keeps drawing over
++ * default framebuffer surface. When the panel memory is not 32bpp that is
++ * impossible (32-bit pixels would not even fit the stride): the ONC panel
++ * is 24bpp RGB888, so the default surface is then a kernel 32bpp BGRA canvas
++ * buffer (the logical size reported to userland) and every copy into the
++ * panel converts BGRA -> R,G,B (byte order p[0]=R p[1]=G p[2]=B measured on
++ * the phone by the framebuffer console).
++ *
++ * The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+@@ -44,6 +51,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+@@ -81,6 +89,7 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_ROW_ALIGN              64      /* surface row alignment */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -102,11 +111,15 @@
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fDepth;           /* PE_Video.v_depth (informational) */
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uintptr_t     fPixels;          /* kernel address of the panel memory */
+ 	IOMemoryMap  *fMap;
+-	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	IOMemoryDescriptor *fPanelDesc; /* panel map when it is not published */
++	IOMemoryMap  *fPanelMap;
++	uint32_t      fPanelBpp;        /* bytes per panel pixel: 4 = BGRA, 3 = RGB888 */
++	SweetSurface *fSurface;         /* default surface: the panel or a 32bpp shadow */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -154,6 +167,9 @@
+ {
+ 	PE_Video video;
+ 
++	fPanelDesc = NULL;
++	fPanelMap = NULL;
++	fPanelBpp = 0;
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+@@ -162,8 +178,26 @@
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+-	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+-		IOLog("SWEET FB: no boot framebuffer\n");
++	fDepth = (uint32_t)video.v_depth;
++	if (fPhys == 0 || fWidth == 0 || fHeight == 0) {
++		IOLog("SWEET FB: no boot framebuffer (base 0x%llx %ux%u stride %u depth %u)\n",
++		    fPhys, fWidth, fHeight, fRowBytes, fDepth);
++		return false;
++	}
++	/*
++	 * 32bpp panels (BGRA, stride == width * 4) are published as they are.
++	 * The ONC panel is the ABL splash region at 24bpp: RGB888, stride ==
++	 * width * 3 exactly, byte order p[0]=R p[1]=G p[2]=B (measured on the
++	 * phone by the framebuffer console). Only that exact layout is accepted
++	 * as 24bpp; anything else stays rejected.
++	 */
++	if (fRowBytes >= (uint64_t)fWidth * 4) {
++		fPanelBpp = 4;
++	} else if (fDepth == 24 && fRowBytes == (uint64_t)fWidth * 3) {
++		fPanelBpp = 3;
++	} else {
++		IOLog("SWEET FB: unsupported boot framebuffer (base 0x%llx %ux%u stride %u depth %u)\n",
++		    fPhys, fWidth, fHeight, fRowBytes, fDepth);
+ 		return false;
+ 	}
+ 	int native = 0;
+@@ -178,18 +212,47 @@
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	if (fPanelBpp == 4) {
++		fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes,
++		    SWEET_FB_FORMAT_BGRA);
++		fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	} else {
++		/*
++		 * 24bpp panel: userland gets a real 32bpp BGRA canvas (a 2160
++		 * byte stride cannot describe 32-bit pixels) and present()
++		 * converts every copy into the panel. The panel itself is only
++		 * mapped. The canvas is the logical size userland is told
++		 * (GetDisplaySize); the panel shows its centre (fOffX/fOffY).
++		 */
++		uint32_t surfW = fWidth, surfH = fHeight;
++		if (fLogicalW > fWidth || fLogicalH > fHeight) {
++			surfW = fLogicalW;
++			surfH = fLogicalH;
++		}
++		uint32_t surfRow = (surfW * 4 + SWEET_FB_ROW_ALIGN - 1) &
++		    ~(SWEET_FB_ROW_ALIGN - 1);
++		fSurface = sweet_surface_create_buffer(surfW, surfH, surfRow,
++		    SWEET_FB_FORMAT_BGRA);
++		fPanelDesc = IOMemoryDescriptor::withPhysicalAddress(fPhys,
++		    (vm_size_t)round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
++		fPanelMap = fPanelDesc != NULL ? fPanelDesc->map(kIOMapWriteCombineCache) : NULL;
++		fPixels = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
++	    fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
++		OSSafeReleaseNULL(fPanelMap);
++		OSSafeReleaseNULL(fPanelDesc);
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
++		OSSafeReleaseNULL(fPanelMap);
++		OSSafeReleaseNULL(fPanelDesc);
+ 		return false;
+ 	}
+ 	uint32_t hz = 10;
+@@ -201,8 +264,9 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u depth %u panel %ubpp at 0x%llx, default surface %u, presented as %ux%u\n",
++	    fWidth, fHeight, fRowBytes, fDepth, fPanelBpp * 8, fPhys, fSurface->id,
++	    fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -233,9 +297,19 @@
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				uint8_t *row = (uint8_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				if (fb->fPanelBpp == 4) {
++					volatile uint32_t *row32 = (volatile uint32_t *)row;
++					for (uint32_t x = 0; x < fb->fWidth; x++) {
++						row32[x] = step < 6 ? (row32[x] >> 1) & 0x7f7f7f7f : 0;
++					}
++				} else {
++					for (uint32_t x = 0; x < fb->fWidth; x++) {
++						volatile uint8_t *p = row + (uint64_t)x * 3;
++						p[0] = step < 6 ? p[0] >> 1 : 0;
++						p[1] = step < 6 ? p[1] >> 1 : 0;
++						p[2] = step < 6 ? p[2] >> 1 : 0;
++					}
+ 				}
+ 			}
+ 		}
+@@ -324,6 +398,12 @@
+ 		}
+ 	}
+ 
++	/*
++	 * 24bpp panel: the default surface is a real 32bpp BGRA buffer, not the
++	 * panel, so it is copied/converted like any other layer below (the
++	 * old `s == fSurface` shortcut only holds when the surface *is* the
++	 * panel memory, i.e. the 32bpp case).
++	 */
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -343,7 +423,7 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		if (s == NULL || (s == fSurface && fPanelBpp == 4)) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -391,10 +471,27 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (fPanelBpp == 4) {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
++			} else {
++				/* BGRA surface -> RGB888 panel: 4 bytes in, 3 bytes out. */
++				for (int32_t y = 0; y < h; y++) {
++					const uint8_t *sp = (const uint8_t *)(src + s->offset +
++					    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++					uint8_t *dp = (uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
++					    (uint64_t)dx * 3);
++					for (int32_t x = 0; x < w; x++) {
++						dp[0] = sp[2];
++						dp[1] = sp[1];
++						dp[2] = sp[0];
++						sp += 4;
++						dp += 3;
++					}
++				}
+ 			}
+ 		}
+ 		s->release();

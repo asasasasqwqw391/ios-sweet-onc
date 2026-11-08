@@ -1,0 +1,76 @@
+Make the eMMC write path detect and retry a silently lost block.
+
+TC is treated as success today, but the card's CRC status for the last block
+can arrive after TC, and nothing waits for DAT0 to go idle.  A bad write then
+looks fine and the block is lost - matching the HFS "BlockMarkFreeInternal()
+trying to free unallocated blocks on volume iOSRoot <524257,1>" +
+hfs_mark_inconsistent flood, which in turn breaks containermanagerd's SQLite
+container database (ContainerManagerCommon +0x8e83c, brk #1).
+
+ 1. After TC: wait DAT0 idle, re-check the INT error bits (DCRC/AC12/DRTO);
+    a set bit fails the block and oe_write_lba() retries it.
+ 2. emmcroot_wrverify=1: read every written block back and compare, printing
+    "ONC EMMC: wrverify mismatch lba=0x..." on a silent loss (off by default).
+
+Base: bsd/dev/onc_emmc.c from CI main after 0118, saved as
+tmp/onc_emmc_after_0119.c.  Only bsd/dev/onc_emmc.c changes.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -242,6 +242,7 @@
+ 	bool nobranch;		/* emmcroot_nobranch=1: skip the GCC branch kick */
+ 	bool kick_always;	/* emmcroot_kickalways=1: old kick-per-command */
+ 	bool force_kick;	/* next command must kick the branch */
++	bool wr_verify;		/* emmcroot_wrverify=1: read back every write */
+ 	uint64_t last_cmd_end;	/* timestamp of the previous command end */
+ } oe;
+ 
+@@ -1067,6 +1068,38 @@
+ 	rc = oe_wait_int(OE_INT_TC, OE_DATA_TIMEOUT_NS, &st);
+ 	if (rc != 0) {
+ 		goto out;
++	}
++
++	/*
++	 * The card reports the block's CRC status after the data phase, and the
++	 * controller can raise TC before that status is available: a bad write
++	 * then looks successful and the block is lost silently.  On this phone
++	 * that surfaced as the HFS flood
++	 *   "hfs: BlockMarkFreeInternal() trying to free unallocated blocks
++	 *    on volume iOSRoot <524257,1>" + hfs_mark_inconsistent,
++	 * which in turn broke containermanagerd's SQLite container database.
++	 * So wait for DAT0 to go idle, look at the error bits once more, and
++	 * optionally read the block back and compare.
++	 */
++	(void)oe_wait_dat_idle(OE_DAT_IDLE_TIMEOUT_NS);
++	{
++		uint32_t est = oe_rd(oe.hc, R_INT);
++
++		if ((est & OE_INT_ERR) != 0) {
++			st = est;
++			rc = EIO;
++			goto out;
++		}
++	}
++	if (oe.wr_verify) {
++		uint8_t back[OE_BLOCK_SIZE];
++
++		if (oe_read_lba(arg, back) != 0 ||
++		    memcmp(back, in, OE_BLOCK_SIZE) != 0) {
++			printf("ONC EMMC: wrverify mismatch lba=0x%x\n", arg);
++			rc = EIO;
++			goto out;
++		}
+ 	}
+ 
+ out:
+@@ -2099,6 +2132,10 @@
+ 			PE_parse_boot_argn("emmcroot_kickalways", &nobr,
+ 			    sizeof(nobr));
+ 			oe.kick_always = (nobr != 0);
++			nobr = 0;
++			PE_parse_boot_argn("emmcroot_wrverify", &nobr,
++			    sizeof(nobr));
++			oe.wr_verify = (nobr != 0);
+ 		}
+ 	}
+ 	{

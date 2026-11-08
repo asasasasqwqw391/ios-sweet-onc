@@ -1,0 +1,65 @@
+Print the caller offset in hfs_mark_inconsistent() so the remaining HFS
+inconsistency call site can be found.
+
+The message fires from ~a dozen call sites (catalog, B-tree, VolumeAllocation,
+hfs_readwrite, ...).  After 0120 removed the BlockMarkFree "free unallocated
+blocks" class, "Runtime corruption detected" still repeats, but the console
+only has room for one line per event.  Print the caller's offset from the
+kernel Mach-O header - slide independent, so it symbolises with the unstripped
+kernel.development.sweet + llvm-nm.
+
+Base: bsd/sweet_hfs/core/hfs_vfsops.c from CI main, saved as
+tmp/hfs_vfsops_after_0120.c.  Only that file changes.
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -4436,29 +4436,41 @@
+ void hfs_mark_inconsistent(struct hfsmount *hfsmp,
+ 								  hfs_inconsistency_reason_t reason)
+ {
++	extern char _mh_execute_header[];
++	uint64_t caller_off;
++
+ 	hfs_lock_mount (hfsmp);
+ 	if ((hfsmp->vcbAtrb & kHFSVolumeInconsistentMask) == 0) {
+ 		hfsmp->vcbAtrb |= kHFSVolumeInconsistentMask;
+ 		MarkVCBDirty(hfsmp);
+ 	}
+ 	if ((hfsmp->hfs_flags & HFS_READ_ONLY)==0) {
++		/*
++		 * SWEET: this fires from a dozen call sites (catalog, B-tree,
++		 * volume allocation, ...) and the console shows one line per
++		 * event.  Print the caller's offset from the kernel Mach-O
++		 * header (slide independent) so the call site can be
++		 * symbolicated with the unstripped kernel + llvm-nm.
++		 */
++		caller_off = (uint64_t)(uintptr_t)__builtin_return_address(0) -
++		    (uint64_t)(uintptr_t)_mh_execute_header;
+ 		switch (reason) {
+ 		case HFS_INCONSISTENCY_DETECTED:
+-			printf("hfs_mark_inconsistent: Runtime corruption detected on %s, fsck will be forced on next mount.\n", 
+-				   hfsmp->vcbVN);
++			printf("hfs_mark_inconsistent: caller_off 0x%llx reason %d: Runtime corruption detected on %s, fsck will be forced on next mount.\n",
++			    caller_off, (int)reason, hfsmp->vcbVN);
+ 			break;
+ 		case HFS_ROLLBACK_FAILED:
+-			printf("hfs_mark_inconsistent: Failed to roll back; volume `%s' might be inconsistent; fsck will be forced on next mount.\n", 
+-				   hfsmp->vcbVN);
++			printf("hfs_mark_inconsistent: caller_off 0x%llx reason %d: Failed to roll back; volume `%s' might be inconsistent; fsck will be forced on next mount.\n",
++			    caller_off, (int)reason, hfsmp->vcbVN);
+ 			break;
+ 		case HFS_OP_INCOMPLETE:
+-			printf("hfs_mark_inconsistent: Failed to complete operation; volume `%s' might be inconsistent; fsck will be forced on next mount.\n", 
+-				   hfsmp->vcbVN);
++			printf("hfs_mark_inconsistent: caller_off 0x%llx reason %d: Failed to complete operation; volume `%s' might be inconsistent; fsck will be forced on next mount.\n",
++			    caller_off, (int)reason, hfsmp->vcbVN);
+ 			break;
+ 		case HFS_FSCK_FORCED:
+-			printf("hfs_mark_inconsistent: fsck requested for `%s'; fsck will be forced on next mount.\n",
+-				   hfsmp->vcbVN);
+-			break;	
++			printf("hfs_mark_inconsistent: caller_off 0x%llx reason %d: fsck requested for `%s'; fsck will be forced on next mount.\n",
++			    caller_off, (int)reason, hfsmp->vcbVN);
++			break;
+ 		}
+ 	}
+ 	hfs_unlock_mount (hfsmp);

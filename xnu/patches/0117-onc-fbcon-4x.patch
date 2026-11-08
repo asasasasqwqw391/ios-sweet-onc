@@ -1,0 +1,28 @@
+Draw the framebuffer console at 4x instead of 2x so the kernel's own console
+(including the SWEET sampler's pc/lr/bt hex and CRASH reports) can be read off
+a 1080p photo of the panel.
+
+The onclite has no usable UART; FBCON_SCALE 2 gives 70 columns on the 1125 px
+wide presented panel, and the camera cannot resolve the hexadecimal digits
+reliably, which blocks symbolication of user stacks.  At 4x the panel shows 35
+columns x 38 rows with 32x64 px glyphs.
+
+Base: pexpert/arm/pe_serial.c from CI main after 0109, saved as
+tmp/pe_serial_after_0116.c.  Only pexpert/arm/pe_serial.c changes.
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -715,7 +715,13 @@
+ 
+ extern unsigned char iso_font[256 * 16];
+ 
+-#define FBCON_SCALE     2
++/*
++ * onc: 4x instead of 2x.  The phone has no usable UART, so every kernel and
++ * userland console line is read off a 1080p camera photo; at 2x a 70-column
++ * line is at the edge of what the camera resolves.  At 4x the panel shows 35
++ * columns x 38 rows and the sampler/crash hex (pc/lr/bt) is readable.
++ */
++#define FBCON_SCALE     4
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 

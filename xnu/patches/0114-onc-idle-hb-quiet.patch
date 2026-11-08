@@ -1,0 +1,34 @@
+Silence the SWEET idle heartbeat once the GUI has taken over the panel.  Patch
+0106 prints "ONC IDLE hb=..." every 2 s while the CPU idles; that text is drawn
+over the iOS GUI through the framebuffer console, so the GUI can never be seen
+(or recorded) after boot.  The heartbeat now stops when sweet_console_muted is
+set (AppleCLCD set it on the first present with sweetfb_noconsole=1), and can
+also be disabled outright with the boot-arg onc_idle_hb=0.
+
+Base: osfmk/arm64/machine_routines.c from CI main after 0106 (reconstructed
+from the 0106 patch, as the local xnu-src tree does not carry it).
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -368,7 +368,21 @@
+ 			 * so the heartbeat cannot flood the console. */
+ 			onc_frq = 24000000;
+ 		}
+-		if (onc_last_hb == 0 || onc_now - onc_last_hb >= onc_frq * 2) {
++		/*
++		 * onc: the SWEET GUI mutes the kernel console once a frame is
++		 * presented; stop drawing this heartbeat then (it would cover the
++		 * GUI every 2 s) and honour onc_idle_hb=0 to turn it off entirely.
++		 */
++		extern int sweet_console_muted;
++		static int onc_hb_on = -1;
++
++		if (onc_hb_on < 0) {
++			onc_hb_on = 1;
++			(void)PE_parse_boot_argn("onc_idle_hb", &onc_hb_on,
++			    sizeof(onc_hb_on));
++		}
++		if (onc_hb_on && !sweet_console_muted &&
++		    (onc_last_hb == 0 || onc_now - onc_last_hb >= onc_frq * 2)) {
+ 			onc_last_hb = onc_now;
+ 			onc_hb_count++;
+ 			kprintf("ONC IDLE hb=%u irq=%llu vt=%llu last=%u cntv_ctl=%llx "

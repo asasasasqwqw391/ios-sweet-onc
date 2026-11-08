@@ -1,0 +1,49 @@
+Make the SWEET AppleKeyStore per-call trace switchable (sweetaks_log=0).
+
+"SWEET AKS: <proc> sel ..." is printed with IOLog, which repaints the
+framebuffer console - the only display on this phone - so the trace hides the
+iOS GUI and the SWEET sampler block during GUI captures.  The trace stays on
+by default (it is what mapped the selectors iOS 16 asks for).
+
+Base: iokit/Kernel/arm/SweetKeyStore.cpp from CI main after 0038, saved as
+tmp/SweetKeyStore_after_0118.cpp.  Only that file changes.
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -24,6 +24,24 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
++
++/*
++ * The per-call trace below repaints the framebuffer console - which is the
++ * only display on these phones - so during GUI captures it hides both the GUI
++ * and the SWEET sampler block.  sweetaks_log=0 turns it off (default: on).
++ */
++static int
++sweet_aks_log_enabled(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = 1;
++		(void)PE_parse_boot_argn("sweetaks_log", &on, sizeof(on));
++	}
++	return on;
++}
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+@@ -234,8 +252,10 @@
+ 
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	if (sweet_aks_log_enabled()) {
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */

@@ -1,0 +1,128 @@
+Fix the eMMC read speed wall properly.  0112 showed that skipping the GCC apps
+branch kick in oe_ensure_clock() turns ~15 KiB/s into ~3 MB/s, but a boot with
+the kick fully disabled can lose commands after a long idle gap and panic in
+IOFindBSDRoot ("ONC eMMC root emmcroot0 unavailable").  The branch is only
+hardware-gated when the core has been idle, and a kick after such an idle gap
+takes ~32 ms - that is what made every command slow.
+
+So: kick the branch only when the previous command ended more than 10 ms ago
+(real idle gap, or the first command after init), and force a kick on the
+retry path in oe_read_lba().  A steady command stream then runs at bus speed
+while idle gaps still re-enable the clock.
+
+  * emmcroot_nobranch=1   - skip the kick entirely (A/B, as in 0112)
+  * emmcroot_kickalways=1 - old kick-per-command behaviour (safety fallback)
+  * emmcroot_rdprof still prints "prof branch=<us>" while profiling
+
+Base: tmp/onc_emmc_after_0112.c (= CI main after 0112).
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -239,6 +239,9 @@
+ 	uint64_t rd_print_at;	/* next bytes_read milestone to print */
+ 	uint32_t rdprof_left;	/* emmcroot_rdprof=N: reads left to profile */
+ 	bool nobranch;		/* emmcroot_nobranch=1: skip the GCC branch kick */
++	bool kick_always;	/* emmcroot_kickalways=1: old kick-per-command */
++	bool force_kick;	/* next command must kick the branch */
++	uint64_t last_cmd_end;	/* timestamp of the previous command end */
+ } oe;
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+@@ -350,13 +353,38 @@
+  * command would then be silently dropped (measured on expU3: the HFS mount's
+  * first CMD17 timed out with INT_STATUS = 0).  Called before every command.
+  */
++/*
++ * The GCC apps branch is hardware-gated while the SDCC core is idle and the
++ * kick below requests it back on, but a kick after a real idle gap takes
++ * ~32 ms, which capped the read path at 15 KiB/s.  So kick only when the
++ * previous command is more than 10 ms old (a real idle gap, or the first
++ * command after init) or when a retry forces it: a steady stream of commands
++ * then runs at bus speed while idle gaps still re-enable the clock.
++ * emmcroot_nobranch=1 disables the kick completely (A/B), and
++ * emmcroot_kickalways=1 restores the old kick-per-command behaviour.
++ */
++#define OE_KICK_IDLE_NS	(10ull * 1000000ull)
++
+ static void
+ oe_ensure_clock(void)
+ {
+ 	uint32_t clk;
+ 	uint32_t want = OE_INT_CLK_EN | OE_INT_CLK_STABLE | OE_SD_CLK_EN;
+-
+-	if (!oe.nobranch) {
++	bool need_kick = true;
++
++	if (oe.nobranch && !oe.force_kick) {
++		need_kick = false;
++	} else if (!oe.kick_always && !oe.force_kick &&
++	    oe.last_cmd_end != 0) {
++		uint64_t now = mach_absolute_time();
++		uint64_t nsec = 0;
++
++		absolutetime_to_nanoseconds(now - oe.last_cmd_end, &nsec);
++		if (nsec < OE_KICK_IDLE_NS) {
++			need_kick = false;
++		}
++	}
++	if (need_kick) {
+ 		if (oe.rdprof_left != 0) {
+ 			uint64_t t0 = mach_absolute_time();
+ 			uint64_t nsec = 0;
+@@ -478,6 +506,7 @@
+ 	if (ist != NULL) {
+ 		*ist = st;
+ 	}
++	oe.last_cmd_end = mach_absolute_time();
+ 	return rc;
+ }
+ 
+@@ -712,6 +741,7 @@
+ out:
+ 	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
+ 	oe.last_int = st;
++	oe.last_cmd_end = mach_absolute_time();
+ 	return rc;
+ }
+ 
+@@ -766,10 +796,14 @@
+ 			    oe_rd(oe.hc, R_CLK) | OE_SW_RESET_CMD_DAT);
+ 			(void)oe_poll_clear(oe.hc, R_CLK, OE_SW_RESET_CMD_DAT,
+ 			    OE_CLK_TIMEOUT_NS);
++			oe.force_kick = true;
+ 			oe_ensure_clock();
++			oe.force_kick = false;
+ 			delay(2000);
+ 		}
++		oe.force_kick = (attempt != 0);
+ 		rc = oe_pio_read(cmdw, (uint32_t)lba, out);
++		oe.force_kick = false;
+ 		if (rc == 0) {
+ 			oe_rd_account(1);
+ 			return 0;
+@@ -877,6 +911,7 @@
+ out:
+ 	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
+ 	oe.last_int = st;
++	oe.last_cmd_end = mach_absolute_time();
+ 	return rc;
+ }
+ 
+@@ -1036,6 +1071,7 @@
+ out:
+ 	oe_wr(oe.hc, R_INT, 0xFFFFFFFFu);
+ 	oe.last_int = st;
++	oe.last_cmd_end = mach_absolute_time();
+ 	return rc;
+ }
+ 
+@@ -2057,6 +2093,10 @@
+ 			PE_parse_boot_argn("emmcroot_nobranch", &nobr,
+ 			    sizeof(nobr));
+ 			oe.nobranch = (nobr != 0);
++			nobr = 0;
++			PE_parse_boot_argn("emmcroot_kickalways", &nobr,
++			    sizeof(nobr));
++			oe.kick_always = (nobr != 0);
+ 		}
+ 	}
+ 	oe.rd_print_at = OE_RD_HEARTBEAT_BYTES;

@@ -1,0 +1,86 @@
+Harden the eMMC root probe against a busy card (panic seen on the first boot
+right after a 15.7 GB userdata flash).
+
+Patch 0113 kicks the GCC apps branch only when the previous command ended more
+than 10 ms ago; one command lost during the probe makes onc_emmc_init() return
+EIO and the kernel panics with
+  "IOFindBSDRoot: ONC eMMC root emmcroot0 unavailable" (IOKitBSDInit.cpp:756).
+Two changes:
+ 1. onc_emmc_init() forces the kick for the whole probe (tens of commands) and
+    restores the emmcroot_kickalways boot-arg value after a successful probe,
+    so the file system keeps the fast smart-kick path.
+ 2. onc_emmc_rootdev() retries onc_emmc_init() up to three times with a 200 ms
+    settle delay, so a card still flushing its write cache does not panic.
+
+Base: bsd/dev/onc_emmc.c from CI main after 0113, saved as
+tmp/onc_emmc_after_0114.c.  Only bsd/dev/onc_emmc.c changes.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -2039,6 +2039,7 @@
+ {
+ 	char want[40] = "userdata";
+ 	uint32_t orw = 0;
++	uint32_t kickalways_saved;
+ 	int error;
+ 
+ 	if (oe.attempted) {
+@@ -2121,6 +2122,16 @@
+ 	printf("ONC EMMC: mapped hc=0x%lx core=0x%lx gcc=0x%lx\n",
+ 	    (unsigned long)oe.hc, (unsigned long)oe.core, (unsigned long)oe.gcc);
+ 
++	/*
++	 * The probe runs a handful of commands over seconds (it prints between
++	 * them), and a single command lost to the GCC branch gate here means
++	 * "IOFindBSDRoot: ONC eMMC root emmcroot0 unavailable" -> panic, which
++	 * was observed on the first boot right after a 15.7 GB userdata flash.
++	 * Force the kick for the whole probe (a few dozen commands, ~32 ms each
++	 * at worst) and go back to the fast smart-kick path for the file system.
++	 */
++	kickalways_saved = oe.kick_always;
++	oe.kick_always = true;
+ 	lck_mtx_lock(&onc_emmc_lock);
+ 	oe_gcc_clock_init();
+ 	oe_core_init();
+@@ -2132,6 +2143,9 @@
+ 		error = oe_gpt_scan(want);
+ 	}
+ 	lck_mtx_unlock(&onc_emmc_lock);
++	if (error == 0) {
++		oe.kick_always = kickalways_saved;
++	}
+ 	if (error != 0) {
+ 		printf("ONC EMMC: init failed: %d\n", error);
+ 		goto fail;
+@@ -2212,8 +2226,30 @@
+ int
+ onc_emmc_rootdev(dev_t *dev)
+ {
+-	int error = onc_emmc_init();
+-
++	int error = 0;
++	int tries;
++
++	/*
++	 * One retry (up to three) is cheap insurance: a card that has just been
++	 * written for minutes can still be busy, and a failed probe panics the
++	 * kernel with "root unavailable" (measured on the first boot after the
++	 * iosroot22 userdata flash: onc_emmc_init() returned EIO).
++	 */
++	for (tries = 0; tries < 3; tries++) {
++		error = onc_emmc_init();
++		if (error == 0) {
++			break;
++		}
++		if (tries == 2) {
++			break;
++		}
++		printf("ONC EMMC: root probe failed: %d, retrying %d/3\n",
++		    error, tries + 2);
++		/* Let a card still flushing its write cache settle. */
++		delay(200);
++		oe.attempted = false;	/* allow onc_emmc_init() to run again */
++		oe.kick_always = true;
++	}
+ 	if (error != 0) {
+ 		return error;
+ 	}

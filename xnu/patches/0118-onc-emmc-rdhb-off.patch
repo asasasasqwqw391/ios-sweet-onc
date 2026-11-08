@@ -1,0 +1,65 @@
+Make the eMMC read heartbeat switchable: emmcroot_rdhb=<KiB>, 0 = off.
+
+Every "ONC EMMC: rd" line repaints the framebuffer console, which is the only
+display on this phone, so the heartbeat hides the iOS GUI and the SWEET
+sampler block behind kernel text during GUI bring-up.  Default behaviour is
+unchanged (one line per 8 MiB); boot with emmcroot_rdhb=0 for GUI captures.
+
+Base: bsd/dev/onc_emmc.c from CI main after 0116, saved as
+tmp/onc_emmc_after_0116.c.  Only bsd/dev/onc_emmc.c changes.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -237,6 +237,7 @@
+ 	uint32_t last_int;	/* last INT_STATUS seen by the read primitive */
+ 	uint64_t blocks_read;	/* diagnostics: 512-byte blocks read so far */
+ 	uint64_t rd_print_at;	/* next bytes_read milestone to print */
++	uint64_t rdhb_bytes;	/* emmcroot_rdhb=<KiB>, 0 = no heartbeat */
+ 	uint32_t rdprof_left;	/* emmcroot_rdprof=N: reads left to profile */
+ 	bool nobranch;		/* emmcroot_nobranch=1: skip the GCC branch kick */
+ 	bool kick_always;	/* emmcroot_kickalways=1: old kick-per-command */
+@@ -761,7 +762,7 @@
+ 
+ 	oe.blocks_read += nblocks;
+ 	bytes = oe.blocks_read * (uint64_t)OE_BLOCK_SIZE;
+-	if (bytes >= oe.rd_print_at) {
++	if (oe.rdhb_bytes != 0 && bytes >= oe.rd_print_at) {
+ 		uint64_t nsec = 0;
+ 
+ 		now = mach_absolute_time();
+@@ -770,9 +771,9 @@
+ 		}
+ 		oe_rd_last_ts = now;
+ 		printf("ONC EMMC: rd %llu KiB (+%llu KiB in %llu ms)\n",
+-		    bytes >> 10, OE_RD_HEARTBEAT_BYTES >> 10,
++		    bytes >> 10, oe.rdhb_bytes >> 10,
+ 		    (nsec + 500000ull) / 1000000ull);
+-		oe.rd_print_at = bytes + OE_RD_HEARTBEAT_BYTES;
++		oe.rd_print_at = bytes + oe.rdhb_bytes;
+ 	}
+ }
+ 
+@@ -2100,7 +2101,23 @@
+ 			oe.kick_always = (nobr != 0);
+ 		}
+ 	}
+-	oe.rd_print_at = OE_RD_HEARTBEAT_BYTES;
++	{
++		uint32_t rdhb = 0;
++
++		/*
++		 * emmcroot_rdhb=<KiB> sets the read-heartbeat interval and 0 turns
++		 * the "ONC EMMC: rd" line off entirely.  Each such line repaints
++		 * the framebuffer console, which hides the iOS GUI (and the
++		 * sampler block) behind kernel text; during GUI bring-up the
++		 * heartbeat is pure noise.
++		 */
++		if (PE_parse_boot_argn("emmcroot_rdhb", &rdhb, sizeof(rdhb))) {
++			oe.rdhb_bytes = (uint64_t)rdhb * 1024ull;
++		} else {
++			oe.rdhb_bytes = OE_RD_HEARTBEAT_BYTES;
++		}
++		oe.rd_print_at = oe.rdhb_bytes;
++	}
+ 	if (oe.writable) {
+ 		printf("ONC EMMC: emmcroot_orw=1, read-write mode\n");
+ 	}

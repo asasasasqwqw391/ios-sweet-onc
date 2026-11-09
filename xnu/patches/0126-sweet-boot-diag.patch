@@ -1,0 +1,283 @@
+Boot diagnostics for the usermanagerd/persona wall (all default-off).
+
+Four boot-args; no behaviour change unless one is set:
+
+  sweetexeclog=0          suppress the per-exec "exec NAME" console line (the
+                          exec flood hides launchd's boot-task lines)
+  sweetexecwatch=a,b,c    "EXECW NAME pid N" when a listed process is exec'd
+                          and "EXITW NAME pid N status X" when it exits
+                          (exit1() in bsd/kern/kern_exit.c)
+  sweetrenameswap=1       one "SWEET RENAMESWAP: proc flags err from X to Y"
+                          line per RENAME_SWAP attempt, printed at the
+                          renameat_internal() exit path where the final error
+                          is known; this also covers the swap-with-missing-
+                          target ENOENT that returns before vn_rename()
+  sweetfsprobe=1          at 120/240/480 s of uptime stat these paths from the
+                          kernel and print one line each:
+                          "FSPROBE <path> err=<e> size=<n> mode=<o> fileid=<i>"
+                          /private/var/keybags/{systembag,persona,usersession}.kb
+                          /private/var/mobile/Containers, /private/var/containers,
+                          /private/var/folders, /private/var/containers/Data/System
+
+Live evidence this addresses: usermanagerd's boot task completes (UMD_INIT /
+EARLYBOOT SETUP DONE) without a visible write error, but /private/var/keybags
+still contains only systembag.kb.  EXECW/EXITW shows whether usermanagerd
+really exits and with which status, sweetrenameswap shows whether Foundation's
+atomic swap rename (0052) is attempted and whether it succeeds, and
+sweetfsprobe shows the on-disk result (a later boot then reports persona.kb's
+size and mode).
+
+Base: bsd/kern/kern_exec.c, bsd/kern/kern_exit.c, bsd/vfs/vfs_syscalls.c and
+bsd/dev/sweet_sample.c from xnuios/xnu-src/xnu with 0001..0125 applied.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2166,6 +2166,60 @@
+ 			break;
+ 		}
+ 		t = end + 1;
++	}
++	return 0;
++}
++
++/*
++ * SWEET: boot-arg sweetexeclog=0 suppresses the per-exec "exec NAME" console
++ * line (default keeps it on), and sweetexecwatch=<name>[,<name>...] prints
++ * "EXECW name pid N" when a watched process is exec'd and (from exit1() in
++ * kern_exit.c) "EXITW name pid N status X" when it dies, so the life of a
++ * daemon like usermanagerd can be followed in a quiet capture.
++ */
++static int
++sweet_exec_log_enabled(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = 1;
++		(void)PE_parse_boot_argn("sweetexeclog", &on, sizeof(on));
++	}
++	return on;
++}
++
++/* Shared with kern_exit.c: true when name is in sweetexecwatch. */
++int
++sweet_exec_watched(const char *name)
++{
++	static char names[128];
++	static int parsed;
++	const char *base, *comma;
++	size_t blen;
++
++	if (!parsed) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("sweetexecwatch", names, sizeof(names));
++	}
++	if (names[0] == '\0') {
++		return 0;
++	}
++	base = strrchr(name, '/');
++	base = (base != NULL) ? base + 1 : name;
++	blen = strlen(base);
++	for (const char *t = names; *t != '\0';) {
++		size_t len;
++
++		comma = strchr(t, ',');
++		len = (comma != NULL) ? (size_t)(comma - t) : strlen(t);
++		if (len == blen && strncmp(t, base, len) == 0) {
++			return 1;
++		}
++		if (comma == NULL) {
++			break;
++		}
++		t = comma + 1;
+ 	}
+ 	return 0;
+ }
+@@ -7463,7 +7517,13 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			if (sweet_exec_log_enabled()) {
++				printf("exec %s\n", p->p_name);
++			}
++			/* sweetexecwatch: EXECW here, the matching EXITW in exit1(). */
++			if (sweet_exec_watched(p->p_name)) {
++				printf("EXECW %s pid %d\n", p->p_name, proc_getpid(p));
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1451,6 +1451,15 @@
+ int
+ exit1(proc_t p, int rv, int *retval)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* sweetexecwatch: the matching EXECW is printed by kern_exec.c. */
++	extern int sweet_exec_watched(const char *name);
++
++	if (sweet_exec_watched(p->p_name)) {
++		printf("EXITW %s pid %d status %d\n", p->p_name, proc_getpid(p), rv);
++	}
++#endif
++
+ 	return exit1_internal(p, rv, retval, FALSE, TRUE, 0);
+ }
+ 
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8924,6 +8924,26 @@
+  * Rename files.  Source and destination must either both be directories,
+  * or both not be directories.  If target is a directory, it must be empty.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: boot-arg sweetrenameswap=1 logs one line per RENAME_SWAP attempt
++ * (caller, both component names, flags and the final error), so Foundation's
++ * atomic writes of the keybag files (persona.kb/usersession.kb) can be
++ * followed on the console.  Off by default.
++ */
++static int
++sweet_renameswap_log_enabled(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = 0;
++		(void)PE_parse_boot_argn("sweetrenameswap", &on, sizeof(on));
++	}
++	return on;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /* ARGSUSED */
+ static int
+ renameat_internal(vfs_context_t ctx, int fromfd, user_addr_t from,
+@@ -9615,6 +9635,23 @@
+ 			}
+ 		}
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * sweetrenameswap: log here, where the final error is known; this also
++	 * covers the swap-with-missing-target ENOENT that returns before
++	 * vn_rename().
++	 */
++	if ((flags & VFS_RENAME_SWAP) != 0 && sweet_renameswap_log_enabled()) {
++		proc_t p = vfs_context_proc(ctx);
++
++		printf("SWEET RENAMESWAP: %s flags 0x%x err %d from %.*s to %.*s\n",
++		    (p != NULL) ? proc_best_name(p) : "kernel", (unsigned)flags, error,
++		    (int)fromnd->ni_cnd.cn_namelen, fromnd->ni_cnd.cn_nameptr,
++		    (int)tond->ni_cnd.cn_namelen, tond->ni_cnd.cn_nameptr);
++	}
++#endif
++
++
+ 	if (to_name != NULL) {
+ 		RELEASE_PATH(to_name);
+ 		to_name = NULL;
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -16,6 +16,7 @@
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
++#include <sys/vnode.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -60,6 +61,86 @@
+ 	return PROC_RETURNED;
+ }
+ 
++/*
++ * SWEET filesystem probe (sweetfsprobe=1): the host cannot read the data
++ * volume while iOS owns it, so a kernel thread stats the keybag files and
++ * container directories that the persona/container bring-up needs and prints
++ * "FSPROBE <path> err=<errno> size=<n> mode=<octal> fileid=<n>" for each, at
++ * 120 s, 240 s and 480 s of uptime.  Off by default.
++ */
++static const char *sweet_fsprobe_paths[] = {
++	"/private/var/keybags/systembag.kb",
++	"/private/var/keybags/persona.kb",
++	"/private/var/keybags/usersession.kb",
++	"/private/var/mobile/Containers",
++	"/private/var/containers",
++	"/private/var/folders",
++	"/private/var/containers/Data/System",
++};
++
++static void
++sweet_fsprobe_dump(void)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++
++	for (unsigned int i = 0; i < sizeof(sweet_fsprobe_paths) / sizeof(sweet_fsprobe_paths[0]); i++) {
++		const char *path = sweet_fsprobe_paths[i];
++		vnode_t vp = NULLVP;
++		struct vnode_attr va;
++		unsigned long long fileid = 0;
++		long long size = -1;
++		unsigned int mode = 0;
++		int err;
++
++		err = vnode_lookup(path, 0, &vp, ctx);
++		if (err == 0) {
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_mode);
++			VATTR_WANTED(&va, va_size);
++			VATTR_WANTED(&va, va_fileid);
++			err = vnode_getattr(vp, &va, ctx);
++			if (err == 0) {
++				size = (long long)va.va_size;
++				mode = (unsigned int)va.va_mode;
++				fileid = (unsigned long long)va.va_fileid;
++			}
++			vnode_put(vp);
++		}
++		printf("FSPROBE %s err=%d size=%lld mode=%o fileid=%llu\n",
++		    path, err, size, mode, fileid);
++	}
++	vfs_context_rele(ctx);
++}
++
++static void
++sweet_fsprobe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static const int at[] = { 120, 240, 480 };
++	static int chan;
++	int enabled = 0;
++	int waited = 0;
++
++	if (!PE_parse_boot_argn("sweetfsprobe", &enabled, sizeof(enabled)) || enabled == 0) {
++		return;
++	}
++	for (unsigned int i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
++		(void)tsleep(&chan, PZERO, "sweetfsp", (at[i] - waited) * hz);
++		waited = at[i];
++		printf("FSPROBE --- round %d s\n", waited);
++		sweet_fsprobe_dump();
++	}
++}
++
++void
++sweet_fsprobe_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_fsprobe_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -85,4 +166,5 @@
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	sweet_fsprobe_start();
+ }

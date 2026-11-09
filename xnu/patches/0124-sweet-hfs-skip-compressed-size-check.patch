@@ -1,0 +1,54 @@
+Do not mark the HFS volume inconsistent for decmpfs-compressed files.
+
+0121 symbolicated the "Runtime corruption detected" flood to
+hfs_getnewvnode+0x104: the sanity check howmany(cf_size, blockSize) >
+cf_blocks is true for every compressed file, because the catalog stores the
+uncompressed size while cf_blocks counts the compressed allocation.  Opening
+such a file marked the volume inconsistent (fsck.hfsplus still reports the
+image as OK).  Most of the iOS rootfs is compressed, so this fired constantly.
+
+Skip only that one test by default; hfs_strict_catalog=1 restores it.  The
+ca_blocks < cf_blocks test and the symlink length test stay always on.
+
+Base: bsd/sweet_hfs/core/hfs_cnode.c from CI main after 0123, saved as
+tmp/hfs_cnode_after_0123.c.  Only that file changes.
+--- a/bsd/sweet_hfs/core/hfs_cnode.c
++++ b/bsd/sweet_hfs/core/hfs_cnode.c
+@@ -51,6 +51,17 @@
+ #include "hfs_format.h"
+ #include "hfs_kdebug.h"
+ #include "hfs_cprotect.h"
++#include <pexpert/pexpert.h>
++
++/*
++ * SWEET: a decmpfs-compressed file records the *uncompressed* size in the
++ * catalog while cf_blocks counts the compressed allocation, so the
++ * "size needs more blocks than allocated" sanity check in hfs_getnewvnode()
++ * fires for every compressed file (most of the iOS rootfs), marks the volume
++ * inconsistent and makes the file unopenable.  Skip that one test by default;
++ * hfs_strict_catalog=1 restores the strict behaviour.
++ */
++static int hfs_strict_catalog = -1;
+ 
+ extern int prtactive;
+ 
+@@ -936,11 +947,18 @@
+ 	issystemfile = (descp->cd_flags & CD_ISMETA) && (vtype == VREG);
+ 	wantrsrc = flags & GNV_WANTRSRC;
+ 
++	if (hfs_strict_catalog < 0) {
++		hfs_strict_catalog = 0;
++		(void)PE_parse_boot_argn("hfs_strict_catalog",
++		    &hfs_strict_catalog, sizeof(hfs_strict_catalog));
++	}
++
+ 	/* Sanity checks: */
+ 	if (vtype == VBAD ||
+ 		(vtype != VDIR && forkp &&
+ 			(attrp->ca_blocks < forkp->cf_blocks ||
+-			 howmany((uint64_t)forkp->cf_size, hfsmp->blockSize) > forkp->cf_blocks ||
++			 (hfs_strict_catalog != 0 &&
++			  howmany((uint64_t)forkp->cf_size, hfsmp->blockSize) > forkp->cf_blocks) ||
+ 			 (vtype == VLNK && (uint64_t)forkp->cf_size > MAXPATHLEN)))) {
+ 		/* Mark the FS as corrupt and bail out */
+ 		{

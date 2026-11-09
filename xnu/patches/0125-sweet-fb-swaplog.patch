@@ -1,0 +1,51 @@
+Print the first swap records (sweetfb_swaplog=N) to find out why the panel
+stays black.
+
+present() copies a layer only when the swap record has its mask bit set and a
+non-zero surface id, so a black panel means either no layer/surface was bound
+or the bound surface is black.  sweetfb_swaplog=N prints mask + per-layer
+surface ids for the first N swaps, briefly lifting the console mute so the line
+is visible under sweetfb_noconsole=1.
+
+Base: iokit/Kernel/arm/SweetFramebuffer.cpp from CI main (0046/0109), saved as
+tmp/SweetFramebuffer_after_0124.cpp.  Only that file changes.
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -387,6 +387,37 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	/*
++	 * SWEET: sweetfb_swaplog=N prints the first N swap records' layer mask
++	 * and per-layer surface ids, temporarily lifting the console mute so
++	 * the line is visible even with sweetfb_noconsole=1.  This separates
++	 * "backboardd never bound a valid surface" (mask 0 / ids 0) from "the
++	 * bound surface is black" (ids non-zero but no visible pixels).
++	 */
++	{
++		static uint32_t swaplog_left = 0xffffffffu;
++
++		if (swaplog_left == 0xffffffffu) {
++			uint32_t v = 0;
++
++			swaplog_left = 0;
++			if (PE_parse_boot_argn("sweetfb_swaplog", &v, sizeof(v))) {
++				swaplog_left = v;
++			}
++		}
++		if (swaplog_left > 0) {
++			int saved = sweet_console_muted;
++
++			swaplog_left--;
++			sweet_console_muted = 0;
++			IOLog("SWEET FB: swaplog %u mask=0x%x id=0x%x,0x%x,0x%x,0x%x wh=%dx%d\n",
++			    get32(rec, 0x50), mask, get32(rec, 0x54), get32(rec, 0x58),
++			    get32(rec, 0x5c), get32(rec, 0x60),
++			    (int32_t)get32(rec + 0xc4, 8), (int32_t)get32(rec + 0xc4, 12));
++			sweet_console_muted = saved;
++		}
++	}
++
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;

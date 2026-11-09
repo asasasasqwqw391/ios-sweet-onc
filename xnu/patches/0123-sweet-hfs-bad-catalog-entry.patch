@@ -1,0 +1,41 @@
+Print the catalog numbers of the entries that trip hfs_getnewvnode()'s sanity
+check, so the inconsistent on-disk catalog record can be found and fixed.
+
+0121 symbolicated the "Runtime corruption detected" caller to
+hfs_getnewvnode+0x104 (slide 0xb000000): the catalog entry's fork size needs
+more allocation blocks than the fork records
+(howmany(cf_size, blockSize) > cf_blocks).  That is an image-side catalog
+inconsistency, not runtime write loss.  Log the first 8 offending entries:
+fileid, vtype, ca_blocks, cf_blocks, cf_size, blockSize.
+
+Base: bsd/sweet_hfs/core/hfs_cnode.c from CI main, saved as
+tmp/hfs_cnode_after_0121.c.  Only that file changes.
+--- a/bsd/sweet_hfs/core/hfs_cnode.c
++++ b/bsd/sweet_hfs/core/hfs_cnode.c
+@@ -943,6 +943,26 @@
+ 			 howmany((uint64_t)forkp->cf_size, hfsmp->blockSize) > forkp->cf_blocks ||
+ 			 (vtype == VLNK && (uint64_t)forkp->cf_size > MAXPATHLEN)))) {
+ 		/* Mark the FS as corrupt and bail out */
++		{
++			/*
++			 * SWEET: this sanity check is where the "Runtime corruption
++			 * detected" flood comes from (caller_off pointed at
++			 * hfs_getnewvnode+0x104).  Print the catalog numbers of the
++			 * offending entry so the file in the image can be found and
++			 * fixed; a handful of lines is enough.
++			 */
++			static int hfs_gnv_bad_logged;
++
++			if (hfs_gnv_bad_logged < 8) {
++				hfs_gnv_bad_logged++;
++				printf("hfs_gnv: bad catalog entry fileid=%u vtype=%d ca_blocks=%llu cf_blocks=%llu cf_size=%llu blockSize=%u\n",
++				    (unsigned)attrp->ca_fileid, (int)vtype,
++				    (unsigned long long)attrp->ca_blocks,
++				    (unsigned long long)(forkp != NULL ? forkp->cf_blocks : 0),
++				    (unsigned long long)(forkp != NULL ? forkp->cf_size : 0),
++				    (unsigned)hfsmp->blockSize);
++			}
++		}
+ 		hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
+ 		retval = EINVAL;
+ 		goto gnv_exit;

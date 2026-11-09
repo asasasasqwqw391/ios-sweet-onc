@@ -246,11 +246,11 @@ where kern_exec.c/kern_exit.c use them, so no hunk depends on the local-only
 +		if (err == 0) {
 +			VATTR_INIT(&va);
 +			VATTR_WANTED(&va, va_mode);
-+			VATTR_WANTED(&va, va_size);
++			VATTR_WANTED(&va, va_data_size);
 +			VATTR_WANTED(&va, va_fileid);
 +			err = vnode_getattr(vp, &va, ctx);
 +			if (err == 0) {
-+				size = (long long)va.va_size;
++				size = (long long)va.va_data_size;
 +				mode = (unsigned int)va.va_mode;
 +				fileid = (unsigned long long)va.va_fileid;
 +			}

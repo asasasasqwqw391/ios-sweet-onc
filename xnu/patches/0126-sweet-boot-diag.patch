@@ -5,8 +5,9 @@ Four boot-args; no behaviour change unless one is set:
   sweetexeclog=0          suppress the per-exec "exec NAME" console line (the
                           exec flood hides launchd's boot-task lines)
   sweetexecwatch=a,b,c    "EXECW NAME pid N" when a listed process is exec'd
-                          and "EXITW NAME pid N status X" when it exits
-                          (exit1() in bsd/kern/kern_exit.c)
+                          and "EXITW NAME pid N status X" when it dies
+                          (exit_with_reason() in bsd/kern/kern_exit.c, the
+                          funnel that also sees signal and jetsam deaths)
   sweetrenameswap=1       one "SWEET RENAMESWAP: proc flags err from X to Y"
                           line per RENAME_SWAP attempt, printed at the
                           renameat_internal() exit path where the final error
@@ -29,78 +30,30 @@ size and mode).
 
 Base: bsd/kern/kern_exec.c, bsd/kern/kern_exit.c, bsd/vfs/vfs_syscalls.c and
 bsd/dev/sweet_sample.c from xnuios/xnu-src/xnu with 0001..0125 applied.
+The exec-watch helpers live in bsd/dev/sweet_sample.c and are declared locally
+where kern_exec.c/kern_exit.c use them, so no hunk depends on the local-only
+0115-onc-blockexec patch (which CI main does not have).
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -2166,6 +2166,60 @@
- 			break;
- 		}
- 		t = end + 1;
-+	}
-+	return 0;
-+}
-+
-+/*
-+ * SWEET: boot-arg sweetexeclog=0 suppresses the per-exec "exec NAME" console
-+ * line (default keeps it on), and sweetexecwatch=<name>[,<name>...] prints
-+ * "EXECW name pid N" when a watched process is exec'd and (from exit1() in
-+ * kern_exit.c) "EXITW name pid N status X" when it dies, so the life of a
-+ * daemon like usermanagerd can be followed in a quiet capture.
-+ */
-+static int
-+sweet_exec_log_enabled(void)
-+{
-+	static int on = -1;
-+
-+	if (on < 0) {
-+		on = 1;
-+		(void)PE_parse_boot_argn("sweetexeclog", &on, sizeof(on));
-+	}
-+	return on;
-+}
-+
-+/* Shared with kern_exit.c: true when name is in sweetexecwatch. */
-+int
-+sweet_exec_watched(const char *name)
-+{
-+	static char names[128];
-+	static int parsed;
-+	const char *base, *comma;
-+	size_t blen;
-+
-+	if (!parsed) {
-+		parsed = 1;
-+		(void)PE_parse_boot_argn("sweetexecwatch", names, sizeof(names));
-+	}
-+	if (names[0] == '\0') {
-+		return 0;
-+	}
-+	base = strrchr(name, '/');
-+	base = (base != NULL) ? base + 1 : name;
-+	blen = strlen(base);
-+	for (const char *t = names; *t != '\0';) {
-+		size_t len;
-+
-+		comma = strchr(t, ',');
-+		len = (comma != NULL) ? (size_t)(comma - t) : strlen(t);
-+		if (len == blen && strncmp(t, base, len) == 0) {
-+			return 1;
-+		}
-+		if (comma == NULL) {
-+			break;
-+		}
-+		t = comma + 1;
- 	}
- 	return 0;
- }
-@@ -7463,7 +7517,13 @@
+@@ -7412,8 +7412,22 @@
+ 				goto done;
  			}
  #if defined(ARM64_BOARD_CONFIG_SWEET)
- 			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			/* SWEET runs every iOS binary this way: one short line per exec. */
 -			printf("exec %s\n", p->p_name);
++			/*
++			 * sweetexeclog=0 suppresses this line and sweetexecwatch adds
++			 * EXECW.  The helpers live in bsd/dev/sweet_sample.c; they are
++			 * declared here so this hunk depends only on the 0042 code and
++			 * not on the never-pushed 0115 sweet_blockexec patch.
++			 */
++			extern int sweet_exec_log_enabled(void);
++			extern int sweet_exec_watched(const char *name);
++
 +			if (sweet_exec_log_enabled()) {
 +				printf("exec %s\n", p->p_name);
 +			}
-+			/* sweetexecwatch: EXECW here, the matching EXITW in exit1(). */
++			/* sweetexecwatch: EXECW here, EXITW in exit_with_reason(). */
 +			if (sweet_exec_watched(p->p_name)) {
 +				printf("EXECW %s pid %d\n", p->p_name, proc_getpid(p));
 +			}
@@ -109,22 +62,27 @@ bsd/dev/sweet_sample.c from xnuios/xnu-src/xnu with 0001..0125 applied.
  			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1451,6 +1451,15 @@
- int
- exit1(proc_t p, int rv, int *retval)
- {
+@@ -1473,6 +1473,20 @@
+ 	struct uthread *ut;
+ 	int error = 0;
+ 	bool proc_exiting = false;
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	/* sweetexecwatch: the matching EXECW is printed by kern_exec.c. */
++	/*
++	 * sweetexecwatch: the matching EXECW is printed by kern_exec.c.  This is
++	 * the common funnel for every death: exit(2) via exit1(), signal deaths
++	 * (kern_sig.c) and jetsam kills all reach exit_with_reason(), while
++	 * exit1() alone would miss the crashes.  A rare double-exit race can
++	 * print this line twice for the same pid.
++	 */
 +	extern int sweet_exec_watched(const char *name);
 +
 +	if (sweet_exec_watched(p->p_name)) {
 +		printf("EXITW %s pid %d status %d\n", p->p_name, proc_getpid(p), rv);
 +	}
 +#endif
-+
- 	return exit1_internal(p, rv, retval, FALSE, TRUE, 0);
- }
  
+ #if DEVELOPMENT || DEBUG
+ 	/*
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
 @@ -8924,6 +8924,26 @@
@@ -188,7 +146,68 @@ bsd/dev/sweet_sample.c from xnuios/xnu-src/xnu with 0001..0125 applied.
  #include <kern/task.h>
  #include <kern/thread.h>
  #include <pexpert/pexpert.h>
-@@ -60,6 +61,86 @@
+@@ -44,6 +45,60 @@
+ 	return false;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET exec diagnostics, called from kern_exec.c (EXECW) and kern_exit.c
++ * (EXITW): sweetexeclog=0 suppresses the per-exec "exec NAME" console line
++ * (default keeps it on) and sweetexecwatch=<name>[,<name>...] follows the
++ * listed processes through exec/exit.  Each boot arg is parsed once.
++ */
++int
++sweet_exec_log_enabled(void)
++{
++	static int on = -1;
++
++	if (on < 0) {
++		on = 1;
++		(void)PE_parse_boot_argn("sweetexeclog", &on, sizeof(on));
++	}
++	return on;
++}
++
++int
++sweet_exec_watched(const char *name)
++{
++	static char names[128];
++	static int parsed;
++	const char *base, *comma;
++	size_t blen;
++
++	if (!parsed) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("sweetexecwatch", names, sizeof(names));
++	}
++	if (names[0] == '\0') {
++		return 0;
++	}
++	base = strrchr(name, '/');
++	base = (base != NULL) ? base + 1 : name;
++	blen = strlen(base);
++	for (const char *t = names; *t != '\0';) {
++		size_t len;
++
++		comma = strchr(t, ',');
++		len = (comma != NULL) ? (size_t)(comma - t) : strlen(t);
++		if (len == blen && strncmp(t, base, len) == 0) {
++			return 1;
++		}
++		if (comma == NULL) {
++			break;
++		}
++		t = comma + 1;
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
+ 
+ static int
+@@ -60,6 +115,86 @@
  	return PROC_RETURNED;
  }
  
@@ -275,9 +294,10 @@ bsd/dev/sweet_sample.c from xnuios/xnu-src/xnu with 0001..0125 applied.
  static void
  sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  {
-@@ -85,4 +166,5 @@
+@@ -85,4 +220,5 @@
  	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
  	}
+-}
 +	sweet_fsprobe_start();
- }
++}

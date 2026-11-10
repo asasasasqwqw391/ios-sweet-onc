@@ -1,0 +1,236 @@
+Print a root-volume file to the console at chosen boot times (sweetdumpfile).
+
+The userland probe runs as a launchd daemon and cannot open /dev/console, so
+its output is lost; the probe now writes /private/var/tmp/logdump.out and this
+kernel thread prints that file to the console instead.  Nothing changes unless
+both boot args are set:
+
+  sweetdumpfile=<absolute path>      e.g. /private/var/tmp/logdump.out
+  sweetdumptimes=<secs>[,<secs>...]  e.g. 240,360,600 (boot uptime seconds)
+
+At each configured uptime a kernel thread opens the file read-only
+(vnode_open), reads it in 8 KiB chunks (vn_rdwr in a kernel context, 512 KiB
+cap) and prints:
+
+  PDUMP <path> err=<e> size=<n> uptime=<s>   (err != 0: file missing/unopenable)
+  PDUMP| <line>                              (max 200 chars, max 400 lines)
+  PDUMP end <lines> lines
+
+so "no output" is distinguishable from "probe never wrote the file".  Runs in
+the same file as 0126's fsprobe and is started from the same place.
+
+Base: bsd/dev/sweet_sample.c from the CI tree after 0126; only that file
+changes.
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -17,9 +17,12 @@
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
+ #include <sys/vnode.h>
++#include <sys/fcntl.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
++#include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -195,6 +198,190 @@
+ 	}
+ }
+ 
++/*
++ * SWEET console file dump (sweetdumpfile=..., sweetdumptimes=...): the
++ * userland probe runs as a launchd daemon and cannot open /dev/console, so it
++ * writes a file instead and this thread prints that file to the console at
++ * chosen boot uptimes.  Off unless both boot args are set.
++ */
++#define SWEET_DUMP_LINE_MAX   200
++#define SWEET_DUMP_MAX_LINES  400
++#define SWEET_DUMP_READ_MAX   (512 * 1024)
++#define SWEET_DUMP_CHUNK      8192
++#define SWEET_DUMP_MAX_TIMES  8
++
++static char sweet_dump_path[128];
++static int sweet_dump_times[SWEET_DUMP_MAX_TIMES];
++static int sweet_dump_time_count = -1;
++
++static uint64_t
++sweet_dump_uptime_sec(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000000ULL;
++}
++
++/* Sleep in 1 s steps until the requested boot uptime has been reached. */
++static void
++sweet_dump_sleep_until(uint64_t secs)
++{
++	static int chan;
++
++	while (sweet_dump_uptime_sec() < secs) {
++		(void)tsleep(&chan, PZERO, "sweetdmp", hz);
++	}
++}
++
++static void
++sweet_dump_file(const char *path)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	char line[SWEET_DUMP_LINE_MAX + 8];
++	char *buf;
++	off_t off = 0;
++	int line_len = 0;
++	int lines = 0;
++	int total = 0;
++	int err;
++
++	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		printf("PDUMP %s err=%d size=-1 uptime=%llu\n", path, err,
++		    (unsigned long long)sweet_dump_uptime_sec());
++		vfs_context_rele(ctx);
++		return;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_size);
++	if (vnode_getattr(vp, &va, ctx) != 0) {
++		va.va_size = 0;
++	}
++	printf("PDUMP %s err=0 size=%llu uptime=%llu\n", path,
++	    (unsigned long long)va.va_size,
++	    (unsigned long long)sweet_dump_uptime_sec());
++
++	buf = kalloc_data(SWEET_DUMP_CHUNK, Z_WAITOK);
++	if (buf == NULL) {
++		printf("PDUMP %s alloc failed\n", path);
++		printf("PDUMP end %d lines\n", lines);
++		vnode_close(vp, 0, ctx);
++		vfs_context_rele(ctx);
++		return;
++	}
++	while (err == 0 && total < SWEET_DUMP_READ_MAX && lines < SWEET_DUMP_MAX_LINES) {
++		int resid = SWEET_DUMP_CHUNK;
++		int n;
++
++		err = vn_rdwr(UIO_READ, vp, buf, SWEET_DUMP_CHUNK, off, UIO_SYSSPACE,
++		    0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (err != 0) {
++			break;
++		}
++		n = SWEET_DUMP_CHUNK - resid;
++		if (n <= 0) {
++			break;  /* EOF */
++		}
++		off += n;
++		total += n;
++		for (int i = 0; i < n; i++) {
++			char c = buf[i];
++
++			if (c == '\n') {
++				line[line_len] = '\0';
++				printf("PDUMP| %s\n", line);
++				lines++;
++				line_len = 0;
++				if (lines >= SWEET_DUMP_MAX_LINES) {
++					break;
++				}
++				continue;
++			}
++			if (c == '\r' || c == '\0') {
++				continue;
++			}
++			if (line_len < SWEET_DUMP_LINE_MAX) {
++				line[line_len++] = (c >= ' ' && c < 0x7f) ? c : '.';
++			}
++		}
++	}
++	if (line_len > 0 && lines < SWEET_DUMP_MAX_LINES) {
++		line[line_len] = '\0';
++		printf("PDUMP| %s\n", line);
++		lines++;
++	}
++	if (err != 0) {
++		printf("PDUMP read err=%d after=%d\n", err, total);
++	}
++	printf("PDUMP end %d lines\n", lines);
++	kfree_data(buf, SWEET_DUMP_CHUNK);
++	vnode_close(vp, 0, ctx);
++	vfs_context_rele(ctx);
++}
++
++static void
++sweet_dump_parse_times(const char *list)
++{
++	const char *p = list;
++
++	sweet_dump_time_count = 0;
++	while (*p != '\0' && sweet_dump_time_count < SWEET_DUMP_MAX_TIMES) {
++		int v = 0;
++		int digits = 0;
++
++		while (*p >= '0' && *p <= '9') {
++			v = v * 10 + (int)(*p - '0');
++			p++;
++			digits++;
++		}
++		if (digits != 0) {
++			sweet_dump_times[sweet_dump_time_count++] = v;
++		}
++		if (*p == ',') {
++			p++;
++		} else if (*p != '\0') {
++			break;
++		}
++	}
++}
++
++static void
++sweet_dumpfile_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	char times[96];
++
++	if (!PE_parse_boot_argn("sweetdumpfile", sweet_dump_path, sizeof(sweet_dump_path)) ||
++	    sweet_dump_path[0] == '\0') {
++		return;
++	}
++	if (!PE_parse_boot_argn("sweetdumptimes", times, sizeof(times))) {
++		return;
++	}
++	sweet_dump_parse_times(times);
++	if (sweet_dump_time_count <= 0) {
++		return;
++	}
++	for (int i = 0; i < sweet_dump_time_count; i++) {
++		sweet_dump_sleep_until((uint64_t)sweet_dump_times[i]);
++		printf("PDUMP --- dump %d/%d at uptime %llu s\n", i + 1,
++		    sweet_dump_time_count, (unsigned long long)sweet_dump_uptime_sec());
++		sweet_dump_file(sweet_dump_path);
++	}
++}
++
++void
++sweet_dumpfile_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_dumpfile_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -221,4 +408,5 @@
+ 		thread_deallocate(thread);
+ 	}
+ 	sweet_fsprobe_start();
+-}
++	sweet_dumpfile_start();
++}

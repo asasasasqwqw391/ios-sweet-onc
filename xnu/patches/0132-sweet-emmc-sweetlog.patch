@@ -1,0 +1,243 @@
+Persistent console log on the eMMC root + scheduled self-reboot (TWRP loop).
+
+In the `fastboot boot` mode the panel stays dark, so the kernel console must go
+to flash.  Patch 0047 already keeps every console byte (kernel printf and
+/dev/console writes) in a 4 MiB ring and flushes it from the UFS driver; on
+this port the root is eMMC, so this patch adds the eMMC flusher.  The on-flash
+format is unchanged, so tools/sweet-log-pull.sh + tools/sweet-log.py decode it:
+
+  block 0:        "SWEETLOG" | u32 version 1 | u32 ring size |
+                  u64 total bytes | u64 flush seq
+  blocks 1..1024: the 4 MiB ring (console byte n at ring offset n % size)
+
+stored in the LAST 4 MiB + 4 KiB (1025 x 4 KiB blocks = 8200 x 512-byte LBAs)
+of the selected eMMC partition - far outside the 20 GiB HFS image, so the file
+system never touches it.  The flush thread reads the existing 0047 ring via
+sweet_log_position()/sweet_log_copy() and writes whole 4 KiB blocks with
+oe_write_lba() under onc_emmc_lock.
+
+Boot args (all optional):
+  sweetlog=0             disable the eMMC console log (default: enabled, like
+                         0047; only runs when emmcroot_orw=1 made the card
+                         writable)
+  emcmlogsecs=<secs>     flush interval (default 10, clamped 1..60)
+  sweetrebootat=<secs>   arm a self-reboot after <secs> seconds (default off);
+                         prints "SWEET REBOOT: armed for N s" then
+                         "SWEET REBOOT: firing now" and calls
+                         reboot_kernel(RB_AUTOBOOT, "sweetrebootat")
+
+A banner with the flash LBA is printed when the log thread starts:
+  SWEET LOG: console log to the last 4100 KiB of the partition (block 0x...)
+
+Only bsd/dev/onc_emmc.c changes.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -57,10 +57,13 @@
+ #include <sys/errno.h>
+ #include <sys/fcntl.h>
+ #include <sys/proc.h>
++#include <sys/reboot.h>
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ #include <machine/machine_routines.h>
+@@ -2065,6 +2068,181 @@
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * Persistent console log on the eMMC root ("sweetlog").
++ *
++ * Patch 0047 keeps every console character in a 4 MiB ring (fed from
++ * _cnputs) and flushes it to the LAST 4 MiB + 4 KiB of the root partition.
++ * The UFS half only runs when UFS is the root; this is the same implementation
++ * for the eMMC driver, using this driver's raw writer and the same on-flash
++ * format so tools/sweet-log-pull.sh keeps working:
++ *   block 0:        "SWEETLOG" | u32 version 1 | u32 ring size |
++ *                   u64 total bytes | u64 flush sequence
++ *   blocks 1..1024: 4 MiB ring (console byte n at ring offset n % size)
++ * The region is the last 1025 x 4 KiB blocks of the selected partition, far
++ * outside the HFS image.  Disabled with sweetlog=0.
++ */
++#define SWEET_EMMC_LOG_RING      (4u << 20)
++#define SWEET_EMMC_LOG_BLKSIZE   4096u
++#define SWEET_EMMC_LOG_BLOCKS    (1u + SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE)
++#define SWEET_EMMC_LOG_LBAS      ((uint64_t)SWEET_EMMC_LOG_BLOCKS * \
++	                          (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE))
++#define SWEET_EMMC_LOG_SECS      10u
++#define SWEET_EMMC_LOG_FLUSH_MAX (8u * SWEET_EMMC_LOG_BLKSIZE)
++
++extern uint64_t sweet_log_position(void);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern int hz;
++
++struct sweet_emmc_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static uint8_t sweet_emmc_log_data[SWEET_EMMC_LOG_FLUSH_MAX];
++static uint8_t sweet_emmc_log_hdr[SWEET_EMMC_LOG_BLKSIZE];
++
++/* Write one 4 KiB ring block as 8 x 512-byte eMMC blocks. */
++static int
++sweet_emmc_log_block_write(uint64_t base, uint32_t blk, const uint8_t *data)
++{
++	uint64_t lba = base + (uint64_t)blk * (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
++
++	for (uint32_t i = 0; i < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; i++) {
++		int error = oe_write_lba(lba + i, data + (uint64_t)i * OE_BLOCK_SIZE);
++
++		if (error != 0) {
++			return error;
++		}
++	}
++	return 0;
++}
++
++static void
++sweet_emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = oe.first_lba + oe.nblocks - SWEET_EMMC_LOG_LBAS;
++	uint64_t flushed = 0;
++	uint64_t seq = 0;
++	uint32_t secs = SWEET_EMMC_LOG_SECS;
++	uint32_t on = 1;
++	int chan;
++
++	if (PE_parse_boot_argn("sweetlog", &on, sizeof(on)) && on == 0) {
++		printf("SWEET LOG: disabled by sweetlog=0\n");
++		return;
++	}
++	PE_parse_boot_argn("emcmlogsecs", &secs, sizeof(secs));
++	if (secs == 0 || secs > 60) {
++		secs = SWEET_EMMC_LOG_SECS;
++	}
++	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
++	    (SWEET_EMMC_LOG_BLOCKS * SWEET_EMMC_LOG_BLKSIZE) >> 10, base);
++	for (;;) {
++		uint64_t total, start, rpos;
++		uint32_t nblocks, got, i;
++		int error = 0;
++
++		(void)tsleep(&chan, PZERO, "emcmlog", hz * (int)secs);
++		total = sweet_log_position();
++		if (total == flushed) {
++			continue;
++		}
++		/* Never fall more than the ring behind; start on a 4 KiB boundary. */
++		if (total > SWEET_EMMC_LOG_RING &&
++		    flushed < total - SWEET_EMMC_LOG_RING) {
++			start = total - SWEET_EMMC_LOG_RING;
++		} else {
++			start = flushed;
++		}
++		start = (start + SWEET_EMMC_LOG_BLKSIZE - 1) &
++		    ~((uint64_t)SWEET_EMMC_LOG_BLKSIZE - 1);
++		if (start >= total) {
++			continue;
++		}
++		nblocks = (uint32_t)((total - start) / SWEET_EMMC_LOG_BLKSIZE);
++		if (nblocks == 0) {
++			continue;	/* < 1 block of new data; wait */
++		}
++		if (nblocks > SWEET_EMMC_LOG_FLUSH_MAX / SWEET_EMMC_LOG_BLKSIZE) {
++			nblocks = SWEET_EMMC_LOG_FLUSH_MAX / SWEET_EMMC_LOG_BLKSIZE;
++		}
++		rpos = start;
++		got = sweet_log_copy(&rpos, (char *)sweet_emmc_log_data,
++		    nblocks * SWEET_EMMC_LOG_BLKSIZE);
++		if (got != nblocks * SWEET_EMMC_LOG_BLKSIZE) {
++			flushed = rpos;	/* reader fell behind: skip ahead */
++			continue;
++		}
++		lck_mtx_lock(&onc_emmc_lock);
++		for (i = 0; i < nblocks && error == 0; i++) {
++			uint32_t ring_blk = (uint32_t)(((start / SWEET_EMMC_LOG_BLKSIZE) + i) %
++			    (SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE));
++
++			error = sweet_emmc_log_block_write(base, 1 + ring_blk,
++			    sweet_emmc_log_data + (uint64_t)i * SWEET_EMMC_LOG_BLKSIZE);
++		}
++		if (error == 0) {
++			struct sweet_emmc_log_header h;
++
++			memset(&h, 0, sizeof(h));
++			memcpy(h.magic, "SWEETLOG", 8);
++			h.version = 1;
++			h.size = SWEET_EMMC_LOG_RING;
++			h.total = total;
++			h.seq = ++seq;
++			memset(sweet_emmc_log_hdr, 0, SWEET_EMMC_LOG_BLKSIZE);
++			memcpy(sweet_emmc_log_hdr, &h, sizeof(h));
++			error = sweet_emmc_log_block_write(base, 0, sweet_emmc_log_hdr);
++		}
++		lck_mtx_unlock(&onc_emmc_lock);
++		if (error != 0) {
++			printf("SWEET LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = start + (uint64_t)nblocks * SWEET_EMMC_LOG_BLKSIZE;
++	}
++}
++
++/*
++ * sweetrebootat=<seconds>: after that many seconds, reset into the boot
++ * partition (TWRP) so a host can pull the log unattended.
++ */
++static void
++sweet_reboot_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t secs = 0;
++	int chan;
++
++	if (!PE_parse_boot_argn("sweetrebootat", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	printf("SWEET REBOOT: armed for %u s\n", secs);
++	(void)tsleep(&chan, PZERO, "sweetrbt", hz * (int)secs);
++	printf("SWEET REBOOT: firing now\n");
++	reboot_kernel(RB_AUTOBOOT, "sweetrebootat");
++}
++
++/* Start the log flusher and the optional reboot timer (called after init). */
++static void
++sweet_emmc_extras_start(void)
++{
++	thread_t thread;
++
++	if (oe.writable) {
++		if (kernel_thread_start(sweet_emmc_log_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	} else {
++		printf("SWEET LOG: eMMC is read-only (emmcroot_orw=0), console log disabled\n");
++	}
++	if (kernel_thread_start(sweet_reboot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++
+ /* -------------------------------------------------------------------------
+  * Init and the root-device entry point
+  * ---------------------------------------------------------------------- */
+@@ -2265,6 +2443,12 @@
+ 			printf("ONC EMMC: sampler on for %s\n", smp);
+ 		}
+ 	}
++	/* Persistent console log (SWEETLOG) + optional scheduled reset. */
++	if (oe.nblocks > 2 * SWEET_EMMC_LOG_LBAS) {
++		sweet_emmc_extras_start();
++	} else {
++		printf("SWEET LOG: partition too small for the log tail, disabled\n");
++	}
+ 	return 0;
+ 
+ fail:

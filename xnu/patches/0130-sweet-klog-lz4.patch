@@ -30,7 +30,7 @@ Base: bsd/dev/sweet_sample.c after 0126, 0128 and 0129; only that file
 changes.
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -26,6 +26,17 @@
+@@ -27,6 +27,17 @@
  #include <pexpert/pexpert.h>
  #include <mach/mach_time.h>
  
@@ -48,7 +48,7 @@ changes.
  extern task_t proc_task(proc_t);
  extern int hz;
  extern void sweet_sample_start(void);
-@@ -593,8 +604,13 @@
+@@ -594,8 +605,13 @@
  			    strncmp(dep->d_name + namlen - 8, ".tracev3", 8) == 0) {
  				files++;
  				if (dump != 0 && files <= SWEET_LOG_MAX_FILES &&
@@ -64,7 +64,7 @@ changes.
  				}
  			}
  			p += reclen;
-@@ -673,6 +689,7 @@
+@@ -674,6 +690,7 @@
  	if (PE_parse_boot_argn("sweetlogmax", &max, sizeof(max)) && max > 0) {
  		sweet_log_max = max > SWEET_LOG_MAX_LINES_HARD ? SWEET_LOG_MAX_LINES_HARD : max;
  	}
@@ -72,7 +72,7 @@ changes.
  	sweet_log_parse_times(times);
  	if (sweet_log_time_count <= 0) {
  		return;
-@@ -692,6 +709,278 @@
+@@ -693,6 +710,278 @@
  		thread_deallocate(thread);
  	}
  }

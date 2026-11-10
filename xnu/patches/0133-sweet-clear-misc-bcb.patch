@@ -1,0 +1,121 @@
+Clear the Android BCB in `misc` at boot so the next reset leaves recovery.
+
+The chosen loop is: `boot` = TWRP (adb control plane), `recovery` = the iOS
+boot image.  ABL's `boot-recovery` BCB is only cleared by a successful Android
+boot, which iOS never does, so after a `fastboot flash recovery` +
+`fastboot reboot recovery` the device would keep booting recovery - the loop
+could not close.  This patch zeros the first 4096 bytes of the `misc`
+partition (the Android bootloader_message area: 2048-byte message + spare),
+very early in the eMMC root init, with the driver's raw writer:
+
+  - the `misc` partition is located by name with the existing GPT parser in
+    onc_emmc.c (new `misc` match recorded in `oe.misc_lba/misc_nblocks`);
+  - 8 x 512-byte zero blocks are written with oe_write_lba() under
+    onc_emmc_lock, right after the partition table is parsed;
+  - boot arg `sweetclearmisc=0` disables it (default ON; clearing an
+    already-clear BCB is harmless and the loop depends on it);
+  - banner: `SWEET MISC: cleared BCB at block 0x...` (or a skip reason).
+
+It runs only when the card is writable (emmcroot_orw=1) and `misc` exists and
+is large enough; no other partition is touched.  If `misc` is not found the
+banner says so and nothing is written.
+
+Note: this clears the BCB *during* the iOS boot, i.e. the current boot already
+happened; the NEXT reset boots TWRP - which is exactly the intended order.
+
+Only bsd/dev/onc_emmc.c changes; base is the post-0132 content.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -222,6 +222,8 @@
+ 	uint32_t ext_csd_rev;	/* EXT_CSD_REV */
+ 	uint64_t first_lba;	/* selected partition, first 512-byte LBA */
+ 	uint64_t nblocks;	/* selected partition, length in 512-byte blocks */
++	uint64_t misc_lba;	/* "misc" partition, first 512-byte LBA (0 = none) */
++	uint64_t misc_nblocks;	/* "misc" partition length in 512-byte blocks */
+ 	uint32_t secsize;	/* logical sector size exposed to the BSD layer */
+ 	bool cmd32;		/* CMD0 only worked through the 32-bit window */
+ 	bool writable;		/* emmcroot_orw=1: writes are implemented */
+@@ -1731,6 +1733,7 @@
+ 	uint32_t sig;
+ 	bool crc_ok = false;
+ 	bool found = false;
++	bool misc_found = false;
+ 	int rc;
+ 
+ 	rc = oe_read_lba(0, oe_sector);
+@@ -1821,6 +1824,13 @@
+ 			found = true;
+ 			oe.first_lba = first;
+ 			oe.nblocks = last - first + 1;
++		}
++		if (!misc_found && strcmp(name, "misc") == 0) {
++			misc_found = true;
++			oe.misc_lba = first;
++			oe.misc_nblocks = last - first + 1;
++			printf("ONC EMMC: gpt misc first=0x%llx blocks=0x%llx\n",
++			    oe.misc_lba, oe.misc_nblocks);
+ 		}
+ 	}
+ 	if (printed > OE_GPT_MAX_PRINT) {
+@@ -2243,6 +2253,51 @@
+ }
+ 
+ 
++/*
++ * Clear the Android bootloader BCB in `misc` (0x600d, "boot-recovery") very
++ * early in the eMMC init, so that the NEXT reset does not return to the
++ * recovery partition (our iOS image) but boots `boot` (TWRP).  Only the
++ * bootloader_message area at the start of `misc` is zeroed: 4096 bytes =
++ * 8 x 512-byte blocks.  Disabled with sweetclearmisc=0.
++ */
++#define SWEET_MISC_CLEAR_BYTES 4096u
++
++static void
++sweet_clear_misc_bcb(void)
++{
++	uint8_t zero[OE_BLOCK_SIZE];
++	uint32_t on = 1;
++	uint32_t i;
++	int error = 0;
++
++	if (PE_parse_boot_argn("sweetclearmisc", &on, sizeof(on)) && on == 0) {
++		printf("SWEET MISC: clearing disabled by sweetclearmisc=0\n");
++		return;
++	}
++	if (!oe.writable) {
++		printf("SWEET MISC: eMMC is read-only, BCB not cleared\n");
++		return;
++	}
++	if (oe.misc_lba == 0 ||
++	    oe.misc_nblocks < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE) {
++		printf("SWEET MISC: misc partition not found or too small, BCB not cleared\n");
++		return;
++	}
++	memset(zero, 0, sizeof(zero));
++	lck_mtx_lock(&onc_emmc_lock);
++	for (i = 0; i < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE && error == 0; i++) {
++		error = oe_write_lba(oe.misc_lba + i, zero);
++	}
++	lck_mtx_unlock(&onc_emmc_lock);
++	if (error != 0) {
++		printf("SWEET MISC: clear failed (%d) at block 0x%llx\n", error,
++		    oe.misc_lba);
++	} else {
++		printf("SWEET MISC: cleared BCB at block 0x%llx\n", oe.misc_lba);
++	}
++}
++
++
+ /* -------------------------------------------------------------------------
+  * Init and the root-device entry point
+  * ---------------------------------------------------------------------- */
+@@ -2383,6 +2438,9 @@
+ 		goto fail;
+ 	}
+ 
++	/* Clear the Android BCB now so the NEXT reset boots boot=TWRP. */
++	sweet_clear_misc_bcb();
++
+ 	oe.bmajor = bdevsw_add(-1, &onc_emmc_bdevsw);
+ 	if (oe.bmajor < 0) {
+ 		printf("ONC EMMC: bdevsw_add failed\n");

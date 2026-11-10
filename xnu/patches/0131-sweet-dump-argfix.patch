@@ -1,0 +1,80 @@
+Fix the numeric-prefix boot-arg bug that silently disabled the KLOG/PDUMP
+threads, and add start banners.
+
+PE_parse_boot_argn() parses any value starting with a digit as a NUMBER and
+binary-copies it into the destination buffer (pexpert/gen/bootargs.c:
+getval -> NUM -> argnumcpy).  sweetlogtimes=240,420,600 therefore landed as
+binary 240 in the char buffer, the comma parser found no digits, the time
+count was 0 and sweet_logdump_thread() returned without printing anything -
+which is why the live 0130 boot showed no KLOG output.  The same applied to
+sweetdumptimes in 0128's thread.  Path arguments start with '/' and were
+unaffected.
+
+This patch switches those two arguments to PE_parse_boot_arg_str() (which
+forces string parsing) and leaves PE_parse_boot_argn() for the numeric
+switches (sweetlogdump/sweetloglz4/sweetlogmax).  It also prints a few
+unconditional-at-start banners (only when the feature is enabled):
+
+  KLOG: thread start
+  KLOG: dir=<dir> times=<count> max=<max>
+  KLOG: readdir err                      (when the directory pass fails)
+  PDUMP: thread start
+  PDUMP: path=<path> times=<count>
+
+so the next boot immediately shows whether the thread started and how many
+uptimes were parsed.  Default-off behaviour is unchanged (no banner unless
+sweetlogdump=1 / sweetdumpfile=<path> is set).
+
+Base: bsd/dev/sweet_sample.c after 0126+0128+0129+0130; only that file
+changes.
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -371,10 +371,16 @@
+ 	    sweet_dump_path[0] == '\0') {
+ 		return;
+ 	}
+-	if (!PE_parse_boot_argn("sweetdumptimes", times, sizeof(times))) {
++	printf("PDUMP: thread start\n");
++	/*
++	 * PE_parse_boot_argn() would treat a numeric-looking value ("240,360")
++	 * as a number and binary-copy it; force string parsing instead.
++	 */
++	if (!PE_parse_boot_arg_str("sweetdumptimes", times, sizeof(times))) {
+ 		return;
+ 	}
+ 	sweet_dump_parse_times(times);
++	printf("PDUMP: path=%s times=%d\n", sweet_dump_path, sweet_dump_time_count);
+ 	if (sweet_dump_time_count <= 0) {
+ 		return;
+ 	}
+@@ -658,6 +664,7 @@
+ 	sweet_log_lines = 0;
+ 	files = sweet_log_readdir(ctx, 0);
+ 	if (files < 0) {
++		printf("KLOG: readdir err\n");
+ 		vfs_context_rele(ctx);
+ 		return;
+ 	}
+@@ -681,7 +688,12 @@
+ 	if (!PE_parse_boot_argn("sweetlogdump", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
+-	if (!PE_parse_boot_argn("sweetlogtimes", times, sizeof(times))) {
++	printf("KLOG: thread start\n");
++	/*
++	 * PE_parse_boot_argn() would treat a numeric-looking value ("240,420,600")
++	 * as a number and binary-copy it; force string parsing instead.
++	 */
++	if (!PE_parse_boot_arg_str("sweetlogtimes", times, sizeof(times))) {
+ 		strlcpy(times, "240,420", sizeof(times));
+ 	}
+ 	if (PE_parse_boot_argn("sweetlogdir", dir, sizeof(dir)) && dir[0] != '\0') {
+@@ -692,6 +704,8 @@
+ 	}
+ 	(void)PE_parse_boot_argn("sweetloglz4", &sweet_log_lz4, sizeof(sweet_log_lz4));
+ 	sweet_log_parse_times(times);
++	printf("KLOG: dir=%s times=%d max=%d\n", sweet_log_dir, sweet_log_time_count,
++	    sweet_log_max);
+ 	if (sweet_log_time_count <= 0) {
+ 		return;
+ 	}

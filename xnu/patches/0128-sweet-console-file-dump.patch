@@ -98,12 +98,12 @@ changes.
 +		return;
 +	}
 +	VATTR_INIT(&va);
-+	VATTR_WANTED(&va, va_size);
++	VATTR_WANTED(&va, va_data_size);
 +	if (vnode_getattr(vp, &va, ctx) != 0) {
-+		va.va_size = 0;
++		va.va_data_size = 0;
 +	}
 +	printf("PDUMP %s err=0 size=%llu uptime=%llu\n", path,
-+	    (unsigned long long)va.va_size,
++	    (unsigned long long)va.va_data_size,
 +	    (unsigned long long)sweet_dump_uptime_sec());
 +
 +	buf = kalloc_data(SWEET_DUMP_CHUNK, Z_WAITOK);

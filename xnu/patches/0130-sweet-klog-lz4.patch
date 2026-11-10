@@ -1,0 +1,353 @@
+Decode the LZ4 (bv41) tracev3 chunks in the kernel KLOG dump (sweetloglz4=1).
+
+0129 reads tracev3 files and scans them for printable strings, but the payload
+chunks are LZ4-compressed, so it mostly sees file headers.  With
+sweetloglz4=1 the KLOG path additionally walks each file for Apple's LZ4
+stream markers and decompresses the blocks in the kernel with a small bounded
+LZ4 block decoder, then runs the same printable-run + keyword filter on the
+decompressed bytes and prints `KLOGD| <string>`.
+
+Boot args (on top of the 0129 ones; default OFF = 0129 behaviour):
+  sweetlogdump=1        enable the KLOG dump (0129)
+  sweetloglz4=1         also decode bv41/bv4- tracev3 chunks (this patch)
+  sweetlogtimes=...     as 0129 (default 240,420)
+  sweetlogmax=...       as 0129 (cap on KLOG| lines)
+  sweetlogdir=...       as 0129 (default .../diagnostics/Persist)
+
+Tracev3 LZ4 framing (tmp/tracev3_format.asciidoc):
+  bv41  u32 uncompressed_size  u32 compressed_size  <LZ4 block>
+  bv4-  u32 uncompressed_size  <plaintext>
+  bv4$  end of stream
+Bounds: <=8 chunks/file, <=64 KiB decompressed output/chunk, <=512 KiB read
+per file, <=200 KLOGD| lines per dump, malformed chunk => skipped.  For the
+first 8 chunks a defensive line is printed so the framing can be checked
+without another kernel build:
+
+  KLOGZ chunk <n> magic=bv41 usize=<u> csize=<c> out=<o> err=<e>
+  KLOGZ end chunks=<n> decoded=<n> bad=<n> bytes=<n> lines=<n>
+
+Base: bsd/dev/sweet_sample.c after 0126, 0128 and 0129; only that file
+changes.
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -26,6 +26,17 @@
+ #include <pexpert/pexpert.h>
+ #include <mach/mach_time.h>
+ 
++/* SWEET 0130: bounded LZ4 (bv41) decode for the KLOG dump (sweetloglz4=1). */
++#define SWEET_LOGD_LINE_MAX   200
++#define SWEET_LZ4_MAX_CHUNKS  8
++#define SWEET_LZ4_MAX_OUT     (64 * 1024)
++#define SWEET_LZ4_FILE_MAX    (512 * 1024)
++
++static int sweet_log_lz4;
++static int sweet_logd_lines;
++
++static void sweet_log_file_lz4(const char *name);
++
+ extern task_t proc_task(proc_t);
+ extern int hz;
+ extern void sweet_sample_start(void);
+@@ -593,8 +604,13 @@
+ 			    strncmp(dep->d_name + namlen - 8, ".tracev3", 8) == 0) {
+ 				files++;
+ 				if (dump != 0 && files <= SWEET_LOG_MAX_FILES &&
+-				    sweet_log_lines < sweet_log_max) {
+-					sweet_log_file(dep->d_name);
++				    (sweet_log_lz4 ? sweet_logd_lines < SWEET_LOGD_LINE_MAX
++				                   : sweet_log_lines < sweet_log_max)) {
++					if (sweet_log_lz4) {
++						sweet_log_file_lz4(dep->d_name);
++					} else {
++						sweet_log_file(dep->d_name);
++					}
+ 				}
+ 			}
+ 			p += reclen;
+@@ -673,6 +689,7 @@
+ 	if (PE_parse_boot_argn("sweetlogmax", &max, sizeof(max)) && max > 0) {
+ 		sweet_log_max = max > SWEET_LOG_MAX_LINES_HARD ? SWEET_LOG_MAX_LINES_HARD : max;
+ 	}
++	(void)PE_parse_boot_argn("sweetloglz4", &sweet_log_lz4, sizeof(sweet_log_lz4));
+ 	sweet_log_parse_times(times);
+ 	if (sweet_log_time_count <= 0) {
+ 		return;
+@@ -692,6 +709,278 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++static uint32_t
++sweet_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/*
++ * Decode one LZ4 block (raw block format: token, literals, 2-byte match
++ * offset, match copy with possible overlap).  Everything is bounds-checked;
++ * returns 0 on success (with *dstlen set), -1 on malformed/overflow input.
++ */
++static int
++sweet_lz4_decode(const uint8_t *src, uint32_t srclen, uint8_t *dst,
++    uint32_t dstcap, uint32_t *dstlen)
++{
++	uint32_t si = 0;
++	uint32_t di = 0;
++
++	while (si < srclen) {
++		uint8_t token = src[si++];
++		uint32_t lit = token >> 4;
++		uint32_t match = token & 0x0f;
++		uint32_t off;
++		uint8_t b;
++
++		if (lit == 0x0f) {
++			do {
++				if (si >= srclen) {
++					return -1;
++				}
++				b = src[si++];
++				lit += b;
++				if (lit > dstcap) {
++					return -1;
++				}
++			} while (b == 0xff);
++		}
++		if (lit != 0) {
++			if (lit > srclen - si || lit > dstcap - di) {
++				return -1;
++			}
++			memcpy(dst + di, src + si, lit);
++			si += lit;
++			di += lit;
++		}
++		if (si >= srclen) {
++			break;  /* last sequence: literals only */
++		}
++		if (srclen - si < 2) {
++			return -1;
++		}
++		off = (uint32_t)src[si] | ((uint32_t)src[si + 1] << 8);
++		si += 2;
++		if (off == 0 || off > di) {
++			return -1;
++		}
++		if (match == 0x0f) {
++			do {
++				if (si >= srclen) {
++					return -1;
++				}
++				b = src[si++];
++				match += b;
++				if (match > dstcap) {
++					return -1;
++				}
++			} while (b == 0xff);
++		}
++		match += 4;
++		if (match > dstcap - di) {
++			return -1;
++		}
++		for (uint32_t i = 0; i < match; i++) {
++			dst[di] = dst[di - off];
++			di++;
++		}
++	}
++	*dstlen = di;
++	return 0;
++}
++
++/* Flush a printable run from decompressed data as a KLOGD| line. */
++static void
++sweet_logd_flush(char *run, int *runlen)
++{
++	if (*runlen >= SWEET_LOG_STR_MIN && sweet_logd_lines < SWEET_LOGD_LINE_MAX) {
++		char out[SWEET_LOG_LINE_MAX + 1];
++		int n;
++
++		run[*runlen] = '\0';
++		if (sweet_log_kw_match(run)) {
++			n = *runlen < SWEET_LOG_LINE_MAX ? *runlen : SWEET_LOG_LINE_MAX;
++			memcpy(out, run, (size_t)n);
++			out[n] = '\0';
++			printf("KLOGD| %s\n", out);
++			sweet_logd_lines++;
++		}
++	}
++	*runlen = 0;
++}
++
++/* Printable-run + keyword scan over decompressed/plaintext bytes. */
++static void
++sweet_log_scan_bytes(const char *data, int len)
++{
++	char run[SWEET_LOG_STR_MAX + 1];
++	int runlen = 0;
++
++	for (int i = 0; i < len; i++) {
++		char c = data[i];
++
++		if (c >= ' ' && c < 0x7f) {
++			if (runlen < SWEET_LOG_STR_MAX) {
++				run[runlen++] = c;
++			}
++		} else {
++			sweet_logd_flush(run, &runlen);
++		}
++	}
++	sweet_logd_flush(run, &runlen);
++}
++
++/*
++ * 0129-with-LZ4 variant of sweet_log_file(): read the whole tracev3 file into
++ * one bounded buffer, then walk it for bv41/bv4-/bv4$ markers.  bv41 blocks
++ * are LZ4-decoded into a 64 KiB buffer; bv4- blocks are plaintext.  Both are
++ * scanned for keyword-matched strings and printed as KLOGD| lines.
++ */
++static void
++sweet_log_file_lz4(const char *name)
++{
++	char path[192];
++	char *buf;
++	uint8_t *out;
++	uint64_t size = 0;
++	int total = 0;
++	int err = 0;
++	int chunks = 0;
++	int decoded = 0;
++	int bad = 0;
++	vfs_context_t ctx;
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++
++	snprintf(path, sizeof(path), "%s/%s", sweet_log_dir, name);
++	ctx = vfs_context_create(NULL);
++	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		printf("KLOG file %s err=%d\n", name, err);
++		vfs_context_rele(ctx);
++		return;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) != 0) {
++		va.va_data_size = 0;
++	}
++	size = va.va_data_size;
++	printf("KLOG file %s size=%llu\n", name, (unsigned long long)size);
++	buf = kalloc_data(SWEET_LZ4_FILE_MAX, Z_WAITOK);
++	out = kalloc_data(SWEET_LZ4_MAX_OUT, Z_WAITOK);
++	if (buf == NULL || out == NULL) {
++		printf("KLOG file %s alloc failed\n", name);
++		if (buf != NULL) {
++			kfree_data(buf, SWEET_LZ4_FILE_MAX);
++		}
++		if (out != NULL) {
++			kfree_data(out, SWEET_LZ4_MAX_OUT);
++		}
++		vnode_close(vp, 0, ctx);
++		vfs_context_rele(ctx);
++		return;
++	}
++	while (err == 0 && total < SWEET_LZ4_FILE_MAX) {
++		int want = SWEET_LZ4_FILE_MAX - total;
++		int resid = 0;
++
++		err = vn_rdwr(UIO_READ, vp, buf + total, want, (off_t)total,
++		    UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		if (err != 0) {
++			break;
++		}
++		if (want - resid <= 0) {
++			break;  /* EOF */
++		}
++		total += want - resid;
++	}
++	vnode_close(vp, 0, ctx);
++	vfs_context_rele(ctx);
++	uint32_t pos = 0;
++	while (total > 0 && chunks < SWEET_LZ4_MAX_CHUNKS) {
++		uint32_t i;
++		uint32_t usize;
++		uint32_t csize;
++		uint32_t avail;
++		uint32_t outlen = 0;
++		int derr;
++
++		for (i = pos; i + 4 <= (uint32_t)total; i++) {
++			if (buf[i] == 'b' && buf[i + 1] == 'v' && buf[i + 2] == '4' &&
++			    (buf[i + 3] == '1' || buf[i + 3] == '-' || buf[i + 3] == '$')) {
++				break;
++			}
++		}
++		if (i + 4 > (uint32_t)total) {
++			break;  /* no more markers */
++		}
++		pos = i;
++		if (buf[pos + 3] == '$') {
++			if (chunks < 8) {
++				printf("KLOGZ chunk %d magic=bv4$ end\n", chunks);
++			}
++			break;
++		}
++		if ((uint32_t)total < pos + 8) {
++			break;
++		}
++		usize = sweet_le32((const uint8_t *)buf + pos + 4);
++		if (buf[pos + 3] == '-') {
++			avail = (uint32_t)total - (pos + 8);
++			if (usize > avail) {
++				usize = avail;  /* tolerate a truncated tail */
++			}
++			if (chunks < 8) {
++				printf("KLOGZ chunk %d magic=bv4- usize=%u csize=0 out=%u err=0\n",
++				    chunks, usize, usize);
++			}
++			sweet_log_scan_bytes(buf + pos + 8, (int)usize);
++			pos += 8 + usize;
++			chunks++;
++		} else {
++			if ((uint32_t)total < pos + 12) {
++				break;
++			}
++			csize = sweet_le32((const uint8_t *)buf + pos + 8);
++			avail = (uint32_t)total - (pos + 12);
++			if (csize > avail) {
++				csize = avail;  /* decoder will reject if incomplete */
++			}
++			if (usize == 0 || usize > SWEET_LZ4_MAX_OUT) {
++				derr = -2;  /* implausible/oversized output */
++			} else {
++				derr = sweet_lz4_decode((const uint8_t *)buf + pos + 12,
++				    csize, out, usize, &outlen);
++			}
++			if (derr == 0) {
++				decoded++;
++				if (chunks < 8) {
++					printf("KLOGZ chunk %d magic=bv41 usize=%u csize=%u out=%u err=0\n",
++					    chunks, usize, csize, outlen);
++				}
++				sweet_log_scan_bytes((const char *)out, (int)outlen);
++			} else {
++				bad++;
++				if (chunks < 8) {
++					printf("KLOGZ chunk %d magic=bv41 usize=%u csize=%u out=0 err=%d\n",
++					    chunks, usize, csize, derr);
++				}
++			}
++			pos += 12 + csize;
++			chunks++;
++		}
++	}
++	printf("KLOGZ end chunks=%d decoded=%d bad=%d bytes=%d lines=%d\n",
++	    chunks, decoded, bad, total, sweet_logd_lines);
++	kfree_data(out, SWEET_LZ4_MAX_OUT);
++	kfree_data(buf, SWEET_LZ4_FILE_MAX);
++}
++
+ 
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)

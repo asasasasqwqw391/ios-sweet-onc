@@ -32,16 +32,17 @@ thin, a follow-up can add a bounded LZ4 block decoder.
 Base: bsd/dev/sweet_sample.c after 0126 and 0128; only that file changes.
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -18,6 +18,8 @@
+@@ -18,6 +18,9 @@
  #include <sys/proc_internal.h>
  #include <sys/vnode.h>
  #include <sys/fcntl.h>
 +#include <sys/dirent.h>
 +#include <sys/uio.h>
++#include <sys/uio_internal.h>
  #include <kern/task.h>
  #include <kern/thread.h>
  #include <kern/kalloc.h>
-@@ -382,6 +384,315 @@
+@@ -382,6 +385,315 @@
  	}
  }
  
@@ -357,7 +358,7 @@ Base: bsd/dev/sweet_sample.c after 0126 and 0128; only that file changes.
  static void
  sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  {
-@@ -409,4 +720,5 @@
+@@ -409,4 +721,5 @@
  	}
  	sweet_fsprobe_start();
  	sweet_dumpfile_start();

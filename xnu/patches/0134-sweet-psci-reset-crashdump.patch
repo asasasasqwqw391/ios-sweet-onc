@@ -1,0 +1,455 @@
+PSCI SYSTEM_RESET failsafe for the scheduled reboot + crash-report dumper.
+
+FEATURE A - reliable reset (fixes the hang after "launchd quiesce complete"):
+  reboot_kernel() -> halt_all_cpus(TRUE) -> PEHaltRestart(kPERestartCPU)
+  and PE_halt_restart is NULL on this platform, so the device never resets.
+  The SMC conduit is known good (patch 0065's PSCI CPU_ON), so add:
+    - sweet_psci_system_reset(): x0 = 0x84000009 (PSCI SYSTEM_RESET), "smc #0"
+      with the same clobbers as sweet_psci_cpu_on() (0065 SweetCPU.cpp);
+    - `sweetrebootat=<secs>` now prints "SWEET REBOOT: firing now", starts a
+      45 s failsafe kernel thread that calls sweet_psci_system_reset(), and
+      still calls reboot_kernel(RB_AUTOBOOT, "sweetrebootat") as before;
+    - new `sweetpscireset=<secs>` (default off): sleep N s and call
+      sweet_psci_system_reset() directly - the fast hardware validation path.
+  Banners: "SWEET RESET: armed for N s" / "SWEET RESET: PSCI SYSTEM_RESET".
+
+FEATURE B - crash-report dumper (SpringBoard SIGABRT needs its .ips report):
+  `sweetdumptree=<dir>[,<dir>...]` (default off) after
+  `sweetdumptreetime` s (default 120) lists each directory with VNOP_READDIR
+  (kernel 32-bit-ino struct dirent) and prints one line per entry:
+    TREE <dir> entry=<name> type=<d_type> size=<size>
+    TREE <dir> err=<errno>                     (directory missing)
+  then dumps the text of regular files whose name ends in
+  `sweetdumptreeext` (default "ips"):
+    CRASHFILE <path> size=<n>
+    CF| <line>                                 (<=200 chars/line, non-printables '.')
+    CRASHFILE end <path>
+  The total CF output is bounded by `sweetdumptreemax` (default 524288 bytes);
+  at most 4 directories and 200 entries per directory are processed.
+
+Both features are boot-arg gated and started from the same place as the other
+SWEET threads (onc_emmc extras / sweet_sample_start); without the boot args
+nothing changes.  Files: bsd/dev/sweet_sample.c (feature B) and
+bsd/dev/onc_emmc.c (feature A + starting the dumper).
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -997,6 +997,274 @@
+ }
+ 
+ 
++/*
++ * SWEET crash-report tree dumper (sweetdumptree=<dir>[,<dir>...]).
++ *
++ * The GUI wall is a SpringBoard SIGABRT, and the .ips report on the iOS
++ * volume has the exception backtrace.  After the root volume is mounted
++ * (sweetdumptreetime, default 120 s) list each directory with VNOP_READDIR
++ * (kernel struct dirent = 32-bit-ino layout under KERNEL) and dump the text of
++ * matching regular files to the console; SWEETLOG (0132) then carries it to
++ * the TWRP pull.  Off unless sweetdumptree is set.
++ */
++#define SWEET_TREE_MAX_DIRS    4
++#define SWEET_TREE_DIR_LEN     128
++#define SWEET_TREE_DIRBUF      8192
++#define SWEET_TREE_CHUNK       4096
++#define SWEET_TREE_MAX_ENTRIES 200
++#define SWEET_TREE_LINE_MAX    200
++#define SWEET_TREE_SECS        120u
++#define SWEET_TREE_MAX_BYTES   (512u * 1024u)
++
++static char sweet_tree_dirs[SWEET_TREE_MAX_DIRS][SWEET_TREE_DIR_LEN];
++static int sweet_tree_dir_count = -1;
++static char sweet_tree_ext[16] = "ips";
++static uint32_t sweet_tree_max = SWEET_TREE_MAX_BYTES;
++static uint32_t sweet_tree_time = SWEET_TREE_SECS;
++static uint32_t sweet_tree_printed;
++static uint8_t sweet_tree_dirbuf[SWEET_TREE_DIRBUF];
++static uint8_t sweet_tree_filebuf[SWEET_TREE_CHUNK];
++static char sweet_tree_line[SWEET_TREE_LINE_MAX + 1];
++
++/* True for "name.ips" (the extension is matched with its dot). */
++static int
++sweet_tree_name_matches(const char *name)
++{
++	size_t nl = strlen(name);
++	size_t el = strlen(sweet_tree_ext);
++
++	if (el == 0 || nl <= el || name[nl - el - 1] != '.') {
++		return 0;
++	}
++	return strcmp(name + nl - el, sweet_tree_ext) == 0;
++}
++
++static void
++sweet_tree_dump_file(const char *path, uint64_t size)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t vp = NULLVP;
++	int err;
++	int line_len = 0;
++	uint32_t total = 0;
++
++	printf("CRASHFILE %s size=%llu\n", path, (unsigned long long)size);
++	err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		printf("CRASHFILE %s err=%d\n", path, err);
++		vfs_context_rele(ctx);
++		return;
++	}
++	while (sweet_tree_printed < sweet_tree_max && total < sweet_tree_max) {
++		int resid = 0;
++		int n;
++
++		err = vn_rdwr(UIO_READ, vp, sweet_tree_filebuf, SWEET_TREE_CHUNK,
++		    (off_t)total, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		if (err != 0) {
++			break;
++		}
++		n = SWEET_TREE_CHUNK - resid;
++		if (n <= 0) {
++			break;	/* EOF */
++		}
++		total += n;
++		for (int i = 0; i < n; i++) {
++			char c = sweet_tree_filebuf[i];
++
++			if (c == '\n') {
++				sweet_tree_line[line_len] = '\0';
++				printf("CF| %s\n", sweet_tree_line);
++				sweet_tree_printed += (uint32_t)line_len + 1;
++				line_len = 0;
++				if (sweet_tree_printed >= sweet_tree_max) {
++					break;
++				}
++				continue;
++			}
++			if (c == '\r' || c == '\0') {
++				continue;
++			}
++			if (line_len < SWEET_TREE_LINE_MAX) {
++				sweet_tree_line[line_len++] =
++				    (c >= ' ' && c < 0x7f) ? c : '.';
++			}
++		}
++	}
++	if (line_len > 0 && sweet_tree_printed < sweet_tree_max) {
++		sweet_tree_line[line_len] = '\0';
++		printf("CF| %s\n", sweet_tree_line);
++		sweet_tree_printed += (uint32_t)line_len + 1;
++	}
++	if (err != 0) {
++		printf("CF read err=%d after=%u\n", err, total);
++	}
++	printf("CRASHFILE end %s\n", path);
++	vnode_close(vp, 0, ctx);
++	vfs_context_rele(ctx);
++}
++
++static void
++sweet_tree_dump_dir(const char *dir)
++{
++	vfs_context_t ctx = vfs_context_create(NULL);
++	vnode_t dvp = NULLVP;
++	off_t dir_off = 0;
++	int eofflag = 0;
++	int err;
++	int entries = 0;
++
++	err = vnode_lookup(dir, 0, &dvp, ctx);
++	if (err != 0) {
++		printf("TREE %s err=%d\n", dir, err);
++		vfs_context_rele(ctx);
++		return;
++	}
++	while (!eofflag && entries < SWEET_TREE_MAX_ENTRIES &&
++	    sweet_tree_printed < sweet_tree_max) {
++		uio_t auio;
++		uint32_t bytes;
++		char *p;
++		char *end;
++		int numdirent = 0;
++
++		auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++		if (auio == NULL) {
++			break;
++		}
++		uio_addiov(auio, (user_addr_t)(uintptr_t)sweet_tree_dirbuf,
++		    SWEET_TREE_DIRBUF);
++		auio->uio_offset = dir_off;
++		err = VNOP_READDIR(dvp, auio, 0, &eofflag, &numdirent, ctx);
++		bytes = SWEET_TREE_DIRBUF - (uint32_t)uio_resid(auio);
++		dir_off = auio->uio_offset;
++		uio_free(auio);
++		if (err != 0 || bytes == 0) {
++			break;
++		}
++		p = (char *)sweet_tree_dirbuf;
++		end = p + bytes;
++		while (p + offsetof(struct dirent, d_name) <= end &&
++		    entries < SWEET_TREE_MAX_ENTRIES &&
++		    sweet_tree_printed < sweet_tree_max) {
++			struct dirent *dep = (struct dirent *)p;
++			uint16_t reclen = dep->d_reclen;
++			uint16_t namlen = dep->d_namlen;
++			char *name = dep->d_name;
++			char path[512];
++			struct vnode_attr va;
++			uint64_t fsize = 0;
++			vnode_t fvp = NULLVP;
++			int lerr;
++
++			if (reclen < offsetof(struct dirent, d_name) + 1 ||
++			    p + reclen > end) {
++				break;
++			}
++			if (dep->d_ino != 0 && namlen != 0 &&
++			    !(namlen == 1 && name[0] == '.') &&
++			    !(namlen == 2 && name[0] == '.' && name[1] == '.')) {
++				snprintf(path, sizeof(path), "%s/%s", dir, name);
++				lerr = vnode_lookup(path, 0, &fvp, ctx);
++				if (lerr != 0) {
++					printf("TREE %s entry=%s err=%d\n", dir,
++					    name, lerr);
++				} else {
++					VATTR_INIT(&va);
++					VATTR_WANTED(&va, va_data_size);
++					if (vnode_getattr(fvp, &va, ctx) == 0) {
++						fsize = va.va_data_size;
++					}
++					printf("TREE %s entry=%s type=%u size=%llu\n",
++					    dir, name, (unsigned int)dep->d_type,
++					    (unsigned long long)fsize);
++					entries++;
++					if (sweet_tree_name_matches(name) &&
++					    vnode_isreg(fvp)) {
++						sweet_tree_dump_file(path, fsize);
++					}
++					vnode_put(fvp);
++				}
++			}
++			p += reclen;
++		}
++	}
++	vnode_put(dvp);
++	vfs_context_rele(ctx);
++}
++
++static void
++sweet_tree_parse_dirs(const char *list)
++{
++	const char *p = list;
++
++	sweet_tree_dir_count = 0;
++	while (*p != '\0' && sweet_tree_dir_count < SWEET_TREE_MAX_DIRS) {
++		const char *end = strchr(p, ',');
++		size_t n = (end != NULL) ? (size_t)(end - p) : strlen(p);
++
++		if (n > 0 && n < SWEET_TREE_DIR_LEN) {
++			memcpy(sweet_tree_dirs[sweet_tree_dir_count], p, n);
++			sweet_tree_dirs[sweet_tree_dir_count][n] = '\0';
++			sweet_tree_dir_count++;
++		}
++		if (end == NULL) {
++			break;
++		}
++		p = end + 1;
++	}
++}
++
++static void
++sweet_dumptree_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	char dirs[256];
++	char ext[16];
++	uint32_t max = 0;
++	uint32_t at = 0;
++
++	if (!PE_parse_boot_arg_str("sweetdumptree", dirs, sizeof(dirs))) {
++		return;
++	}
++	printf("TREE: thread start\n");
++	if (PE_parse_boot_arg_str("sweetdumptreeext", ext, sizeof(ext)) &&
++	    ext[0] != '\0') {
++		strlcpy(sweet_tree_ext, ext, sizeof(sweet_tree_ext));
++	}
++	if (PE_parse_boot_argn("sweetdumptreemax", &max, sizeof(max)) && max != 0) {
++		sweet_tree_max = (max < 4096u) ? 4096u : max;
++	}
++	if (PE_parse_boot_argn("sweetdumptreetime", &at, sizeof(at)) && at != 0) {
++		sweet_tree_time = at;
++	}
++	sweet_tree_parse_dirs(dirs);
++	if (sweet_tree_dir_count <= 0) {
++		printf("TREE: no directories parsed\n");
++		return;
++	}
++	printf("TREE: %d dirs, ext=%s, wait=%u s\n", sweet_tree_dir_count,
++	    sweet_tree_ext, sweet_tree_time);
++	sweet_dump_sleep_until((uint64_t)sweet_tree_time);
++	printf("TREE: dumping at uptime %llu s\n",
++	    (unsigned long long)sweet_dump_uptime_sec());
++	for (int i = 0; i < sweet_tree_dir_count && sweet_tree_printed < sweet_tree_max; i++) {
++		sweet_tree_dump_dir(sweet_tree_dirs[i]);
++	}
++	printf("TREE: end printed=%u bytes\n", sweet_tree_printed);
++}
++
++void
++sweet_dumptree_start(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(sweet_dumptree_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -1025,4 +1293,5 @@
+ 	sweet_fsprobe_start();
+ 	sweet_dumpfile_start();
+ 	sweet_logdump_start();
+-}
++	sweet_dumptree_start();
++}
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -251,6 +251,11 @@
+ 	uint64_t last_cmd_end;	/* timestamp of the previous command end */
+ } oe;
+ 
++/* 0134: PSCI SYSTEM_RESET failsafe + direct test (see below). */
++static void sweet_psci_system_reset(void);
++static void sweet_psci_failsafe_thread(void *arg, wait_result_t wr);
++static void sweet_pscireset_thread(void *arg, wait_result_t wr);
++
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+ 
+@@ -2231,6 +2236,20 @@
+ 	printf("SWEET REBOOT: armed for %u s\n", secs);
+ 	(void)tsleep(&chan, PZERO, "sweetrbt", hz * (int)secs);
+ 	printf("SWEET REBOOT: firing now\n");
++	/*
++	 * 0134 failsafe: the clean shutdown can hang (PE_halt_restart is NULL on
++	 * this platform), so start a thread that forces PSCI SYSTEM_RESET 45 s
++	 * from now, then run the normal path anyway.
++	 */
++	{
++		thread_t fs;
++
++		if (kernel_thread_start(sweet_psci_failsafe_thread, NULL, &fs) == KERN_SUCCESS) {
++			thread_deallocate(fs);
++		} else {
++			printf("SWEET RESET: failsafe thread not started\n");
++		}
++	}
+ 	reboot_kernel(RB_AUTOBOOT, "sweetrebootat");
+ }
+ 
+@@ -2248,6 +2267,10 @@
+ 		printf("SWEET LOG: eMMC is read-only (emmcroot_orw=0), console log disabled\n");
+ 	}
+ 	if (kernel_thread_start(sweet_reboot_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	/* 0134: sweetpscireset=<secs> direct PSCI reset test. */
++	if (kernel_thread_start(sweet_pscireset_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+@@ -2295,6 +2318,60 @@
+ 	} else {
+ 		printf("SWEET MISC: cleared BCB at block 0x%llx\n", oe.misc_lba);
+ 	}
++}
++
++
++/*
++ * PSCI SYSTEM_RESET for the scheduled reboot (0132 sweetrebootat).
++ *
++ * reboot_kernel() -> halt_all_cpus(TRUE) -> PEHaltRestart(kPERestartCPU)
++ * ends in PE_halt_restart, which is NULL on this platform: the device prints
++ * "launchd quiesce complete" and then never resets.  The SMC conduit is known
++ * good (patch 0065 uses it for PSCI CPU_ON), so the failsafe and the
++ * sweetpscireset test path call PSCI SYSTEM_RESET directly.  SMCCC 1.0:
++ * x1-x17 may be clobbered; x0 is the (signed) PSCI result if it ever returns.
++ */
++static void
++sweet_psci_system_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++
++	printf("SWEET RESET: PSCI SYSTEM_RESET\n");
++	__asm__ volatile("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	/* PSCI SYSTEM_RESET does not return; park here if it did. */
++	printf("SWEET RESET: PSCI returned 0x%llx, parked\n",
++	    (unsigned long long)x0);
++	for (;;) {
++		delay(1000000);
++	}
++}
++
++/* 45 s after "firing now": force a reset even if the clean path hangs. */
++static void
++sweet_psci_failsafe_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++
++	(void)tsleep(&chan, PZERO, "sweetpsi", hz * 45);
++	printf("SWEET RESET: failsafe firing (45 s, clean shutdown hung)\n");
++	sweet_psci_system_reset();
++}
++
++/* sweetpscireset=<secs>: direct PSCI reset test, no XNU shutdown. */
++static void
++sweet_pscireset_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	uint32_t secs = 0;
++
++	if (!PE_parse_boot_argn("sweetpscireset", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	printf("SWEET RESET: armed for %u s (PSCI SYSTEM_RESET)\n", secs);
++	(void)tsleep(&chan, PZERO, "sweetpsr", hz * (int)secs);
++	sweet_psci_system_reset();
+ }
+ 
+ 
+@@ -2493,12 +2570,27 @@
+ 	 */
+ 	{
+ 		char smp[40];
+-
+-		if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp))) {
++		char tree[256];
++		int want_sampler;
++		int want_tree;
++
++		want_sampler = PE_parse_boot_argn("sweetsample", smp, sizeof(smp));
++		want_tree = PE_parse_boot_arg_str("sweetdumptree", tree, sizeof(tree));
++		if (want_sampler || want_tree) {
+ 			extern void sweet_sample_start(void);
+ 
++			/*
++			 * 0134: the crash-report dumper (sweetdumptree) lives in
++			 * sweet_sample.c next to the other SWEET diagnostic threads.
++			 */
+ 			sweet_sample_start();
+-			printf("ONC EMMC: sampler on for %s\n", smp);
++			if (want_sampler) {
++				printf("ONC EMMC: sampler on for %s\n", smp);
++			}
++			if (want_tree) {
++				printf("ONC EMMC: crash-report dumper on for %s\n",
++				    tree);
++			}
+ 		}
+ 	}
+ 	/* Persistent console log (SWEETLOG) + optional scheduled reset. */

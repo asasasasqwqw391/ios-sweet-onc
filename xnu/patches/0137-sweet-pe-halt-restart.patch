@@ -1,0 +1,135 @@
+Install the PE_halt_restart hook and arm the WDT before the clean shutdown.
+
+The unattended reboot still hangs/panics: reboot_kernel() ->
+halt_all_cpus(TRUE) -> PEHaltRestart(kPERestartCPU) waits for the fake
+PMU/root-domain shutdown handshake, times out after 30 s and panics
+("Halt/Restart Timed Out 010 /PlatformExpert.cpp:884 handshake structure not
+initialized").  The platform reset hook `PE_halt_restart` (global function
+pointer in iokit/Kernel/IOPlatformExpert.cpp, called by
+IOPlatformExpert::haltRestart) is NULL on this port, so neither the normal
+path nor the panic path can reset.  The KPSS watchdog bite (0135) is already
+hardware-validated.
+
+0137 (bsd/dev/onc_emmc.c only):
+  A) `PE_halt_restart` is set to `sweet_pe_halt_restart()` early in
+     onc_emmc_init(): it prints "SWEET HALT: type=%u -> WDT reset" and runs
+     the existing reset fallback (PSCI attempt -> KPSS WDT bite 0x2000 ~250 ms)
+     and never returns.  The WDT page is mapped at hook-install time, so the
+     hook also works from panic context.  Assignment banner:
+     "SWEET HALT: PE_halt_restart hooked (WDT reset)".
+  B) sweetrebootat: after "SWEET REBOOT: firing now" the WDT is armed FIRST
+     for a short timeout (boot arg `sweetrebootticks`, default 0x40000 = 8 s
+     at 32768 Hz): "SWEET WDT: armed bite in <ticks> ticks (pre-shutdown)";
+     then the 45 s failsafe thread starts and reboot_kernel(RB_AUTOBOOT) is
+     called.  A hang/30 s panic therefore still ends in a reset <= 8 s.
+  C) sweetpscireset and the PSCI->WDT fallback semantics are unchanged; all
+     boot args stay default-OFF.
+
+Expected new console lines in a sweetrebootat cycle:
+  SWEET HALT: PE_halt_restart hooked (WDT reset)          (boot, once)
+  ...
+  SWEET REBOOT: firing now
+  SWEET WDT: armed bite in 262144 ticks (pre-shutdown)
+  SWEET WDT: armed bite in 262144 ticks
+  SWEET WDT: bite (STS=0x...)
+  (if the clean path reaches the platform hook instead:)
+  SWEET HALT: type=2 -> WDT reset
+  SWEET RESET: PSCI SYSTEM_RESET
+  SWEET RESET: PSCI returned 0xffffffffffffffff, falling back to watchdog
+  SWEET WDT: armed bite in 8192 ticks
+  SWEET WDT: bite (STS=0x...)
+
+Only bsd/dev/onc_emmc.c changes; base is the post-0135 content.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -257,6 +257,8 @@
+ static void sweet_pscireset_thread(void *arg, wait_result_t wr);
+ /* 0135: watchdog fallback after PSCI (see below). */
+ static void sweet_reset_fallback(void);
++/* 0137: pre-shutdown WDT arm + PE_halt_restart hook (see below). */
++static void sweet_wdt_arm_pre_shutdown(void);
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2239,9 +2241,15 @@
+ 	(void)tsleep(&chan, PZERO, "sweetrbt", hz * (int)secs);
+ 	printf("SWEET REBOOT: firing now\n");
+ 	/*
+-	 * 0134 failsafe: the clean shutdown can hang (PE_halt_restart is NULL on
+-	 * this platform), so start a thread that forces PSCI SYSTEM_RESET 45 s
+-	 * from now, then run the normal path anyway.
++	 * 0137: arm the WDT BEFORE reboot_kernel().  The clean path waits for
++	 * the fake PMU/root-domain shutdown handshake, times out after 30 s and
++	 * panics; a short bite resets the SoC regardless of that path.
++	 */
++	sweet_wdt_arm_pre_shutdown();
++	/*
++	 * 0134 failsafe: start a thread that forces PSCI SYSTEM_RESET 45 s from
++	 * now, then run the normal path anyway (covers a reboot syscall that
++	 * never even starts).
+ 	 */
+ 	{
+ 		thread_t fs;
+@@ -2456,6 +2464,45 @@
+ {
+ 	sweet_psci_system_reset();
+ 	sweet_wdt_bite_reset(SWEET_WDT_BITE_TICKS);
++}
++
++
++/*
++ * 0137: platform halt/restart hook.  PE_halt_restart is the global function
++ * pointer IOPlatformExpert::haltRestart() calls; on this port nothing assigns
++ * it, so a clean reboot waits for the fake shutdown handshake, times out
++ * after 30 s and panics ("Halt/Restart Timed Out").  Our hook turns both the
++ * clean path and the panic path into a watchdog reset.
++ */
++extern int (*PE_halt_restart)(unsigned int type);
++
++/* Pre-shutdown bite: 8 s at 32768 Hz, overridable with sweetrebootticks. */
++#define SWEET_WDT_REBOOT_TICKS 0x40000u
++
++static int
++sweet_pe_halt_restart(unsigned int type)
++{
++	printf("SWEET HALT: type=%u -> WDT reset\n", type);
++	sweet_reset_fallback();
++	for (;;) {
++		delay(1000000);
++	}
++	return 0;	/* not reached */
++}
++
++/* Arm a short WDT bite before reboot_kernel(), so a hung clean shutdown (the
++ * 30 s Halt/Restart handshake timeout) still ends in a reset. */
++static void
++sweet_wdt_arm_pre_shutdown(void)
++{
++	uint32_t ticks = SWEET_WDT_REBOOT_TICKS;
++
++	if (!PE_parse_boot_argn("sweetrebootticks", &ticks, sizeof(ticks)) ||
++	    ticks == 0) {
++		ticks = SWEET_WDT_REBOOT_TICKS;
++	}
++	printf("SWEET WDT: armed bite in %u ticks (pre-shutdown)\n", ticks);
++	sweet_wdt_arm(ticks);
+ }
+ 
+ 
+@@ -2599,6 +2646,16 @@
+ 		goto fail;
+ 	}
+ 
++	/*
++	 * 0137: install the platform reset hook before any reboot/panic path is
++	 * reachable.  PE_halt_restart is NULL on this port; IOPlatformExpert::
++	 * haltRestart() calls it from both the clean shutdown and the panic path.
++	 * Map the WDT page now, so the hook also works from panic context.
++	 */
++	(void)sweet_wdt_get();
++	PE_halt_restart = sweet_pe_halt_restart;
++	printf("SWEET HALT: PE_halt_restart hooked (WDT reset)\n");
++
+ 	/* Clear the Android BCB now so the NEXT reset boots boot=TWRP. */
+ 	sweet_clear_misc_bcb();
+ 

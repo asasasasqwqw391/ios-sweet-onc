@@ -1,0 +1,98 @@
+Revert 0138: restore the original ATM commpage behaviour (fixes logd).
+
+0138 masked ATM_TRACE_DISABLE out of the commpage view of atm_diagnostic_config
+while keeping it internally.  Measured consequence with 0139 in the same
+kernel: userspace sees atm_diagnostic_config == 0, libsystem_trace/os_trace
+re-enables tracing while the kernel firehose is disabled, and logd
+SIGTRAP crash-loops ("CRASH logd sig 5 code 0x600000001"); the GUIX10K cycle
+never reached "SWEET FB: display on".
+
+The SpringBoard PaperBoardUI nil-block crash that 0138 worked around is fixed
+on the userspace side (dyld shared cache NOP of BaseBoard's `cbz x0` at unslid
+0x18dd5b934, in tmp/iosroot28.simg), so 0138 is not needed.
+
+0140 is the exact inverse of 0138 on current main (0139 touched only
+bsd/dev/sweet_sample.c):
+  - osfmk/atm/atm.c: atm_get_diagnostic_config() returns the raw
+    atm_diagnostic_config again; the 0138 sweet_oslog_off boot arg / banner and
+    atm_get_kernel_diagnostic_config() are removed;
+  - osfmk/atm/atm_internal.h: the extra accessor declaration is removed;
+  - libkern/os/log.c: oslog_init() restores
+    `oslog_disabled = atm_get_diagnostic_config() & ATM_TRACE_DISABLE;`.
+
+After this the kernel is mathematically back to the pre-0138 ATM code (byte
+identical to the original CI files), so userspace sees the boot-arg
+`atm_diagnostic_config=256` bit again, tracing stays disabled everywhere and
+logd is healthy; 0139's KLOG fixes are untouched.
+--- a/osfmk/atm/atm.c
++++ b/osfmk/atm/atm.c
+@@ -59,27 +59,6 @@
+ 		}
+ 	}
+ 
+-	/*
+-	 * SWEET 0138: the kernel keeps ATM_TRACE_DISABLE (firehose skip) but must
+-	 * not export it through the commpage: libsystem_trace's
+-	 * os_state_add_handler() returns 0 when userspace sees that bit, which
+-	 * makes BaseBoard return a nil block and PaperBoardUI crash SpringBoard.
+-	 * sweet_oslog_off=1 sets the internal bit without the generic
+-	 * atm_diagnostic_config boot arg.  atm_get_diagnostic_config() masks the
+-	 * bit for userspace; os/log.c reads the raw accessor for the kernel.
+-	 */
+-	{
+-		uint32_t oslog_off = 0;
+-
+-		if (PE_parse_boot_argn("sweet_oslog_off", &oslog_off, sizeof(oslog_off)) &&
+-		    oslog_off != 0) {
+-			atm_diagnostic_config |= ATM_TRACE_DISABLE;
+-		}
+-	}
+-	if (atm_diagnostic_config & ATM_TRACE_DISABLE) {
+-		kprintf("SWEET ATM: kernel oslog disabled, userspace bit masked\n");
+-	}
+-
+ 	kprintf("ATM subsystem is initialized\n");
+ }
+ 
+@@ -122,19 +101,5 @@
+ uint32_t
+ atm_get_diagnostic_config(void)
+ {
+-	/*
+-	 * SWEET 0138: this is the userspace/commpage view.  Never expose
+-	 * ATM_TRACE_DISABLE (the kernel-internal firehose skip) - userspace
+-	 * libsystem_trace treats that bit as "tracing disabled" and e.g.
+-	 * os_state_add_handler() then returns 0, which breaks BaseBoard /
+-	 * PaperBoardUI (SpringBoard SIGABRT).  All other bits pass through.
+-	 */
+-	return atm_diagnostic_config & ~((uint32_t)ATM_TRACE_DISABLE);
+-}
+-
+-/* Kernel-internal view (includes ATM_TRACE_DISABLE); used by os/log.c. */
+-uint32_t
+-atm_get_kernel_diagnostic_config(void)
+-{
+ 	return atm_diagnostic_config;
+ }
+--- a/osfmk/atm/atm_internal.h
++++ b/osfmk/atm/atm_internal.h
+@@ -44,8 +44,5 @@
+ 
+ kern_return_t atm_set_diagnostic_config(uint32_t);
+ uint32_t atm_get_diagnostic_config(void);
+-/* SWEET 0138: raw kernel view (keeps ATM_TRACE_DISABLE); userspace/commpage
+- * callers must keep using atm_get_diagnostic_config() (masked). */
+-uint32_t atm_get_kernel_diagnostic_config(void);
+ 
+ #endif /* _ATM_ATM_INTERNAL_H_ */
+--- a/libkern/os/log.c
++++ b/libkern/os/log.c
+@@ -108,7 +108,7 @@
+ 	 * prevents userspace from unintentionally doing so => we stash initial
+ 	 * value in a dedicated variable for a later reference, just in case.
+ 	 */
+-	oslog_disabled = atm_get_kernel_diagnostic_config() & ATM_TRACE_DISABLE;
++	oslog_disabled = atm_get_diagnostic_config() & ATM_TRACE_DISABLE;
+ }
+ STARTUP(OSLOG, STARTUP_RANK_FIRST, oslog_init);
+ 

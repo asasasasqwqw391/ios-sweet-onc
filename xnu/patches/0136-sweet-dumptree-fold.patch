@@ -1,0 +1,177 @@
+Fold long lines in the crash-report dumper + sweetdumptreename filter.
+
+The 0134 dumper works (it listed /private/var/mobile/Library/Logs/CrashReporter
+and dumped SpringBoard .ips files), but it printed every source line as `CF| `
+plus at most 200 characters and DROPPED the rest.  The .ips report is JSON
+with very long single lines (`lastExceptionBacktrace` ~2.8 KB, `threads`
+longer), so the exception backtrace was cut after two frames.
+
+0136 (bsd/dev/sweet_sample.c only):
+  - fold every source line into chunks of <=180 characters, nothing dropped:
+        CF| <chunk>       first chunk of a source line
+        CF+| <chunk>      continuation of the previous source line
+    Reassemble by concatenating the payloads in order (CF| starts a new line,
+    CF+| continues the current one).
+  - `sweetdumptreename=<substr>` (default empty = all): only dump the content
+    of files whose name contains the substring, e.g. SpringBoard; the TREE
+    listing still shows every entry.
+  - default `sweetdumptreemax` raised to 1 MiB (1048576), still overridable
+    with the same boot arg.
+  - 4 KiB bounded reads / read-only vnode operations unchanged.
+
+Next dump-cycle boot args:
+  sweetdumptree=/private/var/mobile/Library/Logs/CrashReporter
+  sweetdumptreename=SpringBoard
+  sweetdumptreetime=90
+  sweetdumptreemax=1048576
+  sweetrebootat=600
+Expected console (-> SWEETLOG -> TWRP pull):
+  TREE: thread start
+  TREE: 1 dirs, ext=ips, name=SpringBoard, wait=90 s, max=1048576
+  TREE /private/var/mobile/Library/Logs/CrashReporter entry=SpringBoard-....ips type=1 size=50612
+  CRASHFILE /private/.../SpringBoard-....ips size=50612
+  CF| {"app_name":"SpringBoard",...
+  CF+| ...long JSON continues here...
+  CRASHFILE end /private/.../SpringBoard-....ips
+  TREE: end printed=...
+  (then SWEET REBOOT / WDT reset)
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -1012,13 +1012,14 @@
+ #define SWEET_TREE_DIRBUF      8192
+ #define SWEET_TREE_CHUNK       4096
+ #define SWEET_TREE_MAX_ENTRIES 200
+-#define SWEET_TREE_LINE_MAX    200
++#define SWEET_TREE_LINE_MAX    180
+ #define SWEET_TREE_SECS        120u
+-#define SWEET_TREE_MAX_BYTES   (512u * 1024u)
++#define SWEET_TREE_MAX_BYTES   (1024u * 1024u)
+ 
+ static char sweet_tree_dirs[SWEET_TREE_MAX_DIRS][SWEET_TREE_DIR_LEN];
+ static int sweet_tree_dir_count = -1;
+ static char sweet_tree_ext[16] = "ips";
++static char sweet_tree_name[64];
+ static uint32_t sweet_tree_max = SWEET_TREE_MAX_BYTES;
+ static uint32_t sweet_tree_time = SWEET_TREE_SECS;
+ static uint32_t sweet_tree_printed;
+@@ -1039,6 +1040,26 @@
+ 	return strcmp(name + nl - el, sweet_tree_ext) == 0;
+ }
+ 
++/* True when sweetdumptreename is unset or is a substring of name. */
++static int
++sweet_tree_name_filter(const char *name)
++{
++	size_t nl;
++	size_t fl;
++
++	if (sweet_tree_name[0] == '\0') {
++		return 1;
++	}
++	nl = strlen(name);
++	fl = strlen(sweet_tree_name);
++	for (size_t i = 0; i + fl <= nl; i++) {
++		if (memcmp(name + i, sweet_tree_name, fl) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static void
+ sweet_tree_dump_file(const char *path, uint64_t size)
+ {
+@@ -1046,6 +1067,7 @@
+ 	vnode_t vp = NULLVP;
+ 	int err;
+ 	int line_len = 0;
++	int continued = 0;
+ 	uint32_t total = 0;
+ 
+ 	printf("CRASHFILE %s size=%llu\n", path, (unsigned long long)size);
+@@ -1075,9 +1097,11 @@
+ 
+ 			if (c == '\n') {
+ 				sweet_tree_line[line_len] = '\0';
+-				printf("CF| %s\n", sweet_tree_line);
++				printf(continued ? "CF+| %s\n" : "CF| %s\n",
++				    sweet_tree_line);
+ 				sweet_tree_printed += (uint32_t)line_len + 1;
+ 				line_len = 0;
++				continued = 0;
+ 				if (sweet_tree_printed >= sweet_tree_max) {
+ 					break;
+ 				}
+@@ -1086,15 +1110,28 @@
+ 			if (c == '\r' || c == '\0') {
+ 				continue;
+ 			}
+-			if (line_len < SWEET_TREE_LINE_MAX) {
+-				sweet_tree_line[line_len++] =
+-				    (c >= ' ' && c < 0x7f) ? c : '.';
++			sweet_tree_line[line_len++] = (c >= ' ' && c < 0x7f) ? c : '.';
++			if (line_len >= SWEET_TREE_LINE_MAX) {
++				/*
++				 * Long source line: fold into another chunk instead
++				 * of dropping the remainder (the .ips backtrace
++				 * lines are several KiB).
++				 */
++				sweet_tree_line[line_len] = '\0';
++				printf(continued ? "CF+| %s\n" : "CF| %s\n",
++				    sweet_tree_line);
++				sweet_tree_printed += (uint32_t)line_len + 1;
++				line_len = 0;
++				continued = 1;
++				if (sweet_tree_printed >= sweet_tree_max) {
++					break;
++				}
+ 			}
+ 		}
+ 	}
+ 	if (line_len > 0 && sweet_tree_printed < sweet_tree_max) {
+ 		sweet_tree_line[line_len] = '\0';
+-		printf("CF| %s\n", sweet_tree_line);
++		printf(continued ? "CF+| %s\n" : "CF| %s\n", sweet_tree_line);
+ 		sweet_tree_printed += (uint32_t)line_len + 1;
+ 	}
+ 	if (err != 0) {
+@@ -1181,6 +1218,7 @@
+ 					    (unsigned long long)fsize);
+ 					entries++;
+ 					if (sweet_tree_name_matches(name) &&
++					    sweet_tree_name_filter(name) &&
+ 					    vnode_isreg(fvp)) {
+ 						sweet_tree_dump_file(path, fsize);
+ 					}
+@@ -1221,6 +1259,7 @@
+ {
+ 	char dirs[256];
+ 	char ext[16];
++	char name[64];
+ 	uint32_t max = 0;
+ 	uint32_t at = 0;
+ 
+@@ -1232,6 +1271,10 @@
+ 	    ext[0] != '\0') {
+ 		strlcpy(sweet_tree_ext, ext, sizeof(sweet_tree_ext));
+ 	}
++	if (PE_parse_boot_arg_str("sweetdumptreename", name, sizeof(name)) &&
++	    name[0] != '\0') {
++		strlcpy(sweet_tree_name, name, sizeof(sweet_tree_name));
++	}
+ 	if (PE_parse_boot_argn("sweetdumptreemax", &max, sizeof(max)) && max != 0) {
+ 		sweet_tree_max = (max < 4096u) ? 4096u : max;
+ 	}
+@@ -1243,8 +1286,10 @@
+ 		printf("TREE: no directories parsed\n");
+ 		return;
+ 	}
+-	printf("TREE: %d dirs, ext=%s, wait=%u s\n", sweet_tree_dir_count,
+-	    sweet_tree_ext, sweet_tree_time);
++	printf("TREE: %d dirs, ext=%s, name=%s, wait=%u s, max=%u\n",
++	    sweet_tree_dir_count, sweet_tree_ext,
++	    sweet_tree_name[0] != '\0' ? sweet_tree_name : "*",
++	    sweet_tree_time, sweet_tree_max);
+ 	sweet_dump_sleep_until((uint64_t)sweet_tree_time);
+ 	printf("TREE: dumping at uptime %llu s\n",
+ 	    (unsigned long long)sweet_dump_uptime_sec());

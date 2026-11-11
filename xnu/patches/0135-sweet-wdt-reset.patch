@@ -1,0 +1,159 @@
+KPSS watchdog bite as the real reset primitive (PSCI SYSTEM_RESET unsupported).
+
+The 0134 validation boot proved the TZ does not implement PSCI SYSTEM_RESET:
+the kernel printed "SWEET RESET: PSCI SYSTEM_RESET" and the SMC returned
+0xffffffffffffffff (NOT_SUPPORTED); the device kept running.  The SoC's KPSS
+watchdog at physical 0x0b017000 does reset it: the old shim armed it with
+`EN=0; dsb; RST=1; BARK=BITE=<60 s ticks>; EN=1; dsb` and the measured bite
+landed 58.5 +/- 0.75 s later (xnuios/shim-onc/WDT-ANALYSIS.md).  The current
+shim leaves EN=0, so nothing is armed unless the kernel does it.
+
+This patch (bsd/dev/onc_emmc.c only, default off via the existing boot args):
+
+  - sweet_wdt_arm(ticks): map 0x0b017000 once and run the shim's arm sequence
+    (RST=+0x4, EN=+0x8, STS=+0xC, BARK=+0x10, BITE=+0x14, timebase 32768 Hz);
+    prints "SWEET WDT: armed bite in N ticks" / "SWEET WDT: bite" and the STS
+    readback;
+  - sweet_wdt_bite_reset(ticks): arm, wait up to 5 s for the bite, then
+    "SWEET WDT: no bite, retrying", re-arm once, park in a delay loop;
+  - sweet_reset_fallback(): PSCI first (harmless, returns -1 here), then
+    ALWAYS sweet_wdt_bite_reset(0x2000 ~ 250 ms);
+  - the sweetrebootat 45 s failsafe thread and the sweetpscireset=<secs>
+    direct test both use sweet_reset_fallback(); boot args unchanged;
+  - 0134's sweet_psci_system_reset() no longer parks after the SMC returns,
+    so the watchdog fallback always runs.
+
+Boot args stay the same:
+  sweetpscireset=<secs>   -> PSCI attempt + WDT bite after N s
+  sweetrebootat=<secs>    -> normal reboot; 45 s failsafe = PSCI attempt + WDT bite
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -255,6 +255,8 @@
+ static void sweet_psci_system_reset(void);
+ static void sweet_psci_failsafe_thread(void *arg, wait_result_t wr);
+ static void sweet_pscireset_thread(void *arg, wait_result_t wr);
++/* 0135: watchdog fallback after PSCI (see below). */
++static void sweet_reset_fallback(void);
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2340,12 +2342,12 @@
+ 	__asm__ volatile("smc #0" : "+r"(x0) : :
+ 	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+ 	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+-	/* PSCI SYSTEM_RESET does not return; park here if it did. */
+-	printf("SWEET RESET: PSCI returned 0x%llx, parked\n",
++	/*
++	 * This TZ answers PSCI_NOT_SUPPORTED (-1); do NOT park here, the caller
++	 * falls back to the KPSS watchdog bite (0135).
++	 */
++	printf("SWEET RESET: PSCI returned 0x%llx, falling back to watchdog\n",
+ 	    (unsigned long long)x0);
+-	for (;;) {
+-		delay(1000000);
+-	}
+ }
+ 
+ /* 45 s after "firing now": force a reset even if the clean path hangs. */
+@@ -2356,7 +2358,7 @@
+ 
+ 	(void)tsleep(&chan, PZERO, "sweetpsi", hz * 45);
+ 	printf("SWEET RESET: failsafe firing (45 s, clean shutdown hung)\n");
+-	sweet_psci_system_reset();
++	sweet_reset_fallback();
+ }
+ 
+ /* sweetpscireset=<secs>: direct PSCI reset test, no XNU shutdown. */
+@@ -2369,9 +2371,91 @@
+ 	if (!PE_parse_boot_argn("sweetpscireset", &secs, sizeof(secs)) || secs == 0) {
+ 		return;
+ 	}
+-	printf("SWEET RESET: armed for %u s (PSCI SYSTEM_RESET)\n", secs);
++	printf("SWEET RESET: armed for %u s (PSCI SYSTEM_RESET then WDT bite)\n",
++	    secs);
+ 	(void)tsleep(&chan, PZERO, "sweetpsr", hz * (int)secs);
++	sweet_reset_fallback();
++}
++
++
++/*
++ * 0135: KPSS watchdog reset (PSCI SYSTEM_RESET returns NOT_SUPPORTED on this
++ * TZ).  The watchdog at physical 0x0b017000 resets the SoC when it bites:
++ * RST=+0x4, EN=+0x8, STS=+0xC, BARK=+0x10, BITE=+0x14, timebase 32768 Hz.
++ * The old shim armed it with EN=0; dsb; RST=1; BARK=BITE=ticks; EN=1; dsb and
++ * the measured bite happened at the programmed timeout (WDT-ANALYSIS.md).
++ */
++#define SWEET_WDT_PHYS        0x0b017000u
++#define SWEET_WDT_SIZE        0x1000u
++#define SWEET_WDT_RST         0x04u
++#define SWEET_WDT_EN          0x08u
++#define SWEET_WDT_STS         0x0cu
++#define SWEET_WDT_BARK        0x10u
++#define SWEET_WDT_BITE        0x14u
++
++/* ~250 ms at 32768 Hz; near-immediate but leaves time for the log flush. */
++#define SWEET_WDT_BITE_TICKS  0x2000u
++
++static vm_offset_t sweet_wdt_base;
++
++static vm_offset_t
++sweet_wdt_get(void)
++{
++	if (sweet_wdt_base == 0) {
++		sweet_wdt_base = ml_io_map(SWEET_WDT_PHYS, SWEET_WDT_SIZE);
++		if (sweet_wdt_base == 0) {
++			printf("SWEET WDT: ml_io_map(0x%x) failed\n",
++			    SWEET_WDT_PHYS);
++		}
++	}
++	return sweet_wdt_base;
++}
++
++static void
++sweet_wdt_arm(uint32_t ticks)
++{
++	vm_offset_t wdt = sweet_wdt_get();
++
++	printf("SWEET WDT: armed bite in %u ticks\n", ticks);
++	if (wdt == 0) {
++		return;
++	}
++	oe_wr(wdt, SWEET_WDT_EN, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	oe_wr(wdt, SWEET_WDT_RST, 1);
++	oe_wr(wdt, SWEET_WDT_BARK, ticks);
++	oe_wr(wdt, SWEET_WDT_BITE, ticks);
++	oe_wr(wdt, SWEET_WDT_EN, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET WDT: bite (STS=0x%x)\n", oe_rd(wdt, SWEET_WDT_STS));
++}
++
++static void
++sweet_wdt_bite_reset(uint32_t ticks)
++{
++	int i;
++
++	sweet_wdt_arm(ticks);
++	/* The bite should land within ~ticks/32768 s; wait up to 5 s. */
++	for (i = 0; i < 5; i++) {
++		delay(1000000);
++	}
++	printf("SWEET WDT: no bite, retrying\n");
++	sweet_wdt_arm(ticks);
++	for (;;) {
++		delay(1000000);
++	}
++}
++
++/*
++ * 0135: try PSCI first (harmless; this TZ returns NOT_SUPPORTED) and always
++ * fall through to the KPSS watchdog bite, which is the reliable reset.
++ */
++static void
++sweet_reset_fallback(void)
++{
+ 	sweet_psci_system_reset();
++	sweet_wdt_bite_reset(SWEET_WDT_BITE_TICKS);
+ }
+ 
+ 

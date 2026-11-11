@@ -33,15 +33,7 @@ Boot args for the next image (unchanged plus the new knobs):
   sweetlogmax=300 sweetkloglines=200 sweetklogfiles=2 sweetklogbytes=262144
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -28,7 +28,6 @@
- #include <mach/mach_time.h>
- 
- /* SWEET 0130: bounded LZ4 (bv41) decode for the KLOG dump (sweetloglz4=1). */
--#define SWEET_LOGD_LINE_MAX   200
- #define SWEET_LZ4_MAX_CHUNKS  8
- #define SWEET_LZ4_MAX_OUT     (64 * 1024)
- #define SWEET_LZ4_FILE_MAX    (512 * 1024)
-@@ -431,8 +430,10 @@
+@@ -431,8 +431,10 @@
  static char sweet_log_dir[128] = SWEET_LOG_DIR_DEFAULT;
  static int sweet_log_times[SWEET_LOG_MAX_TIMES];
  static int sweet_log_time_count = -1;
@@ -53,7 +45,7 @@ Boot args for the next image (unchanged plus the new knobs):
  
  static char
  sweet_log_lc(char c)
-@@ -515,7 +516,8 @@
+@@ -515,7 +517,8 @@
  		vfs_context_rele(ctx);
  		return;
  	}
@@ -63,7 +55,7 @@ Boot args for the next image (unchanged plus the new knobs):
  		int resid = SWEET_LOG_CHUNK;
  		int n;
  
-@@ -554,21 +556,35 @@
+@@ -554,21 +557,35 @@
   * Enumerate sweet_log_dir once.  dump == 0 only counts *.tracev3 files (and
   * prints the dir error); dump == 1 prints the files and their strings.
   */
@@ -104,7 +96,7 @@ Boot args for the next image (unchanged plus the new knobs):
  		return -1;
  	}
  	buf = kalloc_data(SWEET_LOG_DIR_BUF, Z_WAITOK);
-@@ -576,7 +592,7 @@
+@@ -576,7 +593,7 @@
  		vnode_put(dvp);
  		return -1;
  	}
@@ -113,7 +105,7 @@ Boot args for the next image (unchanged plus the new knobs):
  		uio_t auio;
  		uint32_t bytes;
  		char *p;
-@@ -598,7 +614,8 @@
+@@ -598,7 +615,8 @@
  		}
  		p = buf;
  		end = buf + bytes;
@@ -123,7 +115,7 @@ Boot args for the next image (unchanged plus the new knobs):
  			struct dirent *dep = (struct dirent *)p;
  			uint16_t reclen = dep->d_reclen;
  			uint16_t namlen = dep->d_namlen;
-@@ -608,24 +625,49 @@
+@@ -608,24 +626,49 @@
  			}
  			if (dep->d_ino != 0 && namlen >= 8 &&
  			    namlen <= (uint16_t)(reclen - offsetof(struct dirent, d_name) - 1) &&
@@ -183,7 +175,7 @@ Boot args for the next image (unchanged plus the new knobs):
  }
  
  static void
-@@ -659,21 +701,46 @@
+@@ -659,21 +702,46 @@
  {
  	vfs_context_t ctx;
  	int files;
@@ -237,7 +229,7 @@ Boot args for the next image (unchanged plus the new knobs):
  	vfs_context_rele(ctx);
  }
  
-@@ -702,10 +769,29 @@
+@@ -702,10 +770,29 @@
  	if (PE_parse_boot_argn("sweetlogmax", &max, sizeof(max)) && max > 0) {
  		sweet_log_max = max > SWEET_LOG_MAX_LINES_HARD ? SWEET_LOG_MAX_LINES_HARD : max;
  	}
@@ -269,7 +261,7 @@ Boot args for the next image (unchanged plus the new knobs):
  	if (sweet_log_time_count <= 0) {
  		return;
  	}
-@@ -861,6 +947,7 @@
+@@ -861,6 +948,7 @@
  	char *buf;
  	uint8_t *out;
  	uint64_t size = 0;
@@ -277,7 +269,7 @@ Boot args for the next image (unchanged plus the new knobs):
  	int total = 0;
  	int err = 0;
  	int chunks = 0;
-@@ -899,8 +986,10 @@
+@@ -899,8 +987,10 @@
  		vfs_context_rele(ctx);
  		return;
  	}
@@ -290,16 +282,6 @@ Boot args for the next image (unchanged plus the new knobs):
  		int resid = 0;
  
  		err = vn_rdwr(UIO_READ, vp, buf + total, want, (off_t)total,
-@@ -917,7 +1006,8 @@
- 	vnode_close(vp, 0, ctx);
- 	vfs_context_rele(ctx);
- 	uint32_t pos = 0;
--	while (total > 0 && chunks < SWEET_LZ4_MAX_CHUNKS) {
-+	while (total > 0 && chunks < SWEET_LZ4_MAX_CHUNKS &&
-+	    sweet_logd_lines < sweet_log_max) {
- 		uint32_t i;
- 		uint32_t usize;
- 		uint32_t csize;
 @@ -990,8 +1080,8 @@
  			chunks++;
  		}

@@ -1,0 +1,452 @@
+Secondary-CPU progress marks + panic diagnostics (where does CPU1 die?).
+
+0135/0137 fixed the reset; 0141 enabled the SMP validation.  Booting 0141 with
+`cpus=4` PSCI CPU_ON for cpu1 returned rc=0, but CPU1 never cleared
+SIGPdisabled and the boot panicked:
+
+  SWEET CPU: cpu=1 startup timeout (reset/MMU/GIC/SGI)
+
+Nothing survived (SWEETLOG flusher and the PE_halt_restart hook start later),
+so there is no way to tell whether CPU1 reached sweet_secondary_entry,
+LowResetVectorBase or initCPU.
+
+0142 records the secondary path's progress in fixed globals and prints it in
+the timeout panic:
+
+  sweet_secondary_marks[8]  per logical CPU (index = PSCI context / MPIDR):
+      1    first instruction of sweet_secondary_entry
+      0x12 firmware entered the secondary at EL2
+      2    EL1 path, just before `b LowResetVectorBase`
+      3    reset_vector reached (VBAR installed)
+      4    start_cpu reached, just before `b common_start`
+      5    SweetCPU::initCPU first line
+      6    after signalCPU() (self-IPI queued)
+      7    after initialized = 1
+  sweet_smp_stage           last start.s stage any secondary reached:
+      0xE0 entry, 0xE2 EL2, 0xE3 EL1, 0xE4 reset_vector, 0xE5 CpuData found,
+      0xE6 CpuData/handler not found, 0xE7 before blr handler, 0xE8 start_cpu,
+      0xF0 initCPU entered (C side)
+      0xEA common_start, 0xEB bootstrap page tables built, 0xEC before SCTLR
+      (MMU enable), 0xED MMU on, 0xEE arm_init_tramp returning to arm_init_cpu,
+      0xEF unexpected EL
+  sweet_smp_vector_hit      early EL1-SP1 exception stub hit (0xF1..0xF4)
+
+The assembly writes work with the MMU off: the kernel image is linked V=P, so
+PA(symbol) = PC_pa + (symbol_VA - entry_VA), computed with adr/adrp+add (no
+absolute constants).  Every write is followed by `dsb sy`.
+
+The panic and the "NOT alive after 5s" IOLog now print for the failing CPU:
+  cpu=%u start phys=0x%x mark=0x%llx stage=0x%llx vec=0x%llx init=%u sig=%u
+plus the elapsed ticks, so one photo tells where CPU1 stopped.
+
+Also verified in the plan: the secondary SCTLR value 0x30d00800 is exactly the
+ARMv8.0 SCTLR_EL1 RES1 set (bits 11,20,22,23,28,29 - Linux SCTLR_EL1_RES1)
+with M/C/I off, and the secondary page-table rebuild uses the same
+ARM_TT_Lx_SHIFT/PGBYTES macros as the (working) boot path, no 16K assumption.
+
+Base = post-0141 CI main (xnu-buildtree artifact of run 43216360057).
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -35,6 +35,38 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++
++/*
++ * 0142: secondary-CPU progress marks (C linkage so start.s can write them).
++ *
++ * The entry stub and start.s run with the MMU off, so start.s computes the
++ * physical address of these symbols from its own PC (the image is linked V=P).
++ * Index = logical CPU id (the PSCI context id / MPIDR-derived in reset_vector).
++ */
++extern "C" {
++volatile uint64_t sweet_secondary_marks[8];
++volatile uint64_t sweet_smp_stage;
++volatile uint64_t sweet_smp_vector_hit;
++}
++
++static inline void
++sweet_smp_mark(uint32_t cpu, uint64_t mark)
++{
++	if (cpu < 8) {
++		__atomic_store_n(&sweet_secondary_marks[cpu], mark,
++		    __ATOMIC_RELEASE);
++	}
++}
++
++static inline uint64_t
++sweet_smp_get(uint32_t cpu)
++{
++	if (cpu < 8) {
++		return __atomic_load_n(&sweet_secondary_marks[cpu],
++		    __ATOMIC_ACQUIRE);
++	}
++	return 0;
++}
+ 
+ #if HAS_GIC_V2
+ extern "C" void pe_gic_send_ipi(void);
+@@ -189,6 +221,10 @@
+ 	IOLog("ONC: startAll entered (registered=%u/%u irq=%llu vt=%llu)\n",
+ 	    __atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE),
+ 	    topology->num_cpus, onc_irq_count, onc_vtimer_count);
++	/* 0142: one-line banner before the per-CPU start loop (panic photos). */
++	IOLog("SWEET CPU: startAll entered (registered=%u/%u boot_mpidr=0x%x)\n",
++	    __atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE),
++	    topology->num_cpus, topology->boot_cpu->phys_id);
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -225,6 +261,7 @@
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
++		const uint64_t onc_start_time = mach_absolute_time();
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		uint32_t onc_waits = 0;
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+@@ -241,9 +278,40 @@
+ 			}
+ 			onc_waits++;
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				/*
++				 * 0142: where did the secondary stop?  mark/stage are
++				 * written by start.s (MMU-off safe), 5/6/7 by initCPU.
++				 */
++				uint64_t mark = __atomic_load_n(
++				    &sweet_secondary_marks[i], __ATOMIC_ACQUIRE);
++				uint64_t stage = __atomic_load_n(
++				    &sweet_smp_stage, __ATOMIC_ACQUIRE);
++				uint64_t vec = __atomic_load_n(
++				    &sweet_smp_vector_hit, __ATOMIC_ACQUIRE);
++				uint64_t delta = mach_absolute_time() - onc_start_time;
++
++				IOLog("SWEET CPU: cpu=%u start phys=0x%x NOT alive after 5s "
++				    "mark=0x%llx stage=0x%llx vec=0x%llx init=%u sig=%u "
++				    "delta=%llu\n",
++				    i, topology->cpus[i].phys_id,
++				    (unsigned long long)mark,
++				    (unsigned long long)stage,
++				    (unsigned long long)vec,
++				    (unsigned)__atomic_load_n(&cpu->initialized,
++				    __ATOMIC_ACQUIRE),
++				    (unsigned)sweet_cpu_signal_is_enabled(i),
++				    (unsigned long long)delta);
++				panic("SWEET CPU: cpu=%u startup timeout mark=0x%llx "
++				    "stage=0x%llx vec=0x%llx init=%u sig=%u phys=0x%x "
++				    "delta=%llu", i,
++				    (unsigned long long)mark,
++				    (unsigned long long)stage,
++				    (unsigned long long)vec,
++				    (unsigned)__atomic_load_n(&cpu->initialized,
++				    __ATOMIC_ACQUIRE),
++				    (unsigned)sweet_cpu_signal_is_enabled(i),
++				    topology->cpus[i].phys_id,
++				    (unsigned long long)delta);
+ 			}
+ 			onc_spin_us(1000);
+ 		}
+@@ -275,6 +343,9 @@
+ void
+ SweetCPU::initCPU(bool boot)
+ {
++	/* 0142: mark 5 - the secondary reached the C initCPU path. */
++	sweet_smp_mark(getCPUNumber(), 5);
++	__atomic_store_n(&sweet_smp_stage, 0xF0, __ATOMIC_RELEASE);
+ 	if (!boot) {
+ 		panic("SWEET CPU: cpu=%u resume is not implemented", getCPUNumber());
+ 	}
+@@ -286,11 +357,18 @@
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
++	/* 0142: mark 6 - self-IPI queued. */
++	sweet_smp_mark(getCPUNumber(), 6);
+ 	setCPUState(kIOCPUStateRunning);
+-	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
++	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u "
++	    "mark=0x%llx stage=0x%llx\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+-	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled(),
++	    (unsigned long long)sweet_smp_get(getCPUNumber()),
++	    (unsigned long long)__atomic_load_n(&sweet_smp_stage, __ATOMIC_ACQUIRE));
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
++	/* 0142: mark 7 - initCPU done (startAll can see both conditions now). */
++	sweet_smp_mark(getCPUNumber(), 7);
+ }
+ 
+ void
+@@ -347,6 +425,11 @@
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	/* 0142: clear the progress marks before this CPU_ON so a stale value from
++	 * a previous attempt cannot be mistaken for progress. */
++	sweet_smp_mark(getCPUNumber(), 0);
++	__atomic_store_n(&sweet_smp_stage, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_smp_vector_hit, 0, __ATOMIC_RELEASE);
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -36,6 +36,44 @@
+ #include <arm64/tunables/tunables.s>
+ #include <arm64/exception_asm.h>
+ 
++/*
++ * 0142: secondary-CPU progress marks, usable with the MMU OFF.
++ *
++ * The progress variables live in kernel BSS, addressable only through the KVA
++ * once the MMU is on.  The early entry path runs with the MMU off, so derive
++ * the physical address from the PC: the image is linked V=P, hence
++ *     PA(sym) = PC_pa + (sym_VA - entry_VA)
++ * (no absolute constants, works for every link address).
++ * Clobbers x10, x11, x12; \index is read before x10-x12 are touched.
++ */
++.macro SWEET_MARK mark, index
++	adr	x10, .
++	adrp	x11, EXT(sweet_secondary_marks)@page
++	add	x11, x11, EXT(sweet_secondary_marks)@pageoff
++	adrp	x12, EXT(sweet_secondary_entry)@page
++	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
++	sub	x11, x11, x12
++	add	x10, x10, x11
++	MOV64	x11, \mark
++	str	x11, [x10, \index, lsl #3]
++	dsb	sy
++.endm
++
++/* Last stage reached by any secondary (single slot, MMU-off safe). */
++.macro SWEET_STAGE stage
++	adr	x10, .
++	adrp	x11, EXT(sweet_smp_stage)@page
++	add	x11, x11, EXT(sweet_smp_stage)@pageoff
++	adrp	x12, EXT(sweet_secondary_entry)@page
++	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
++	sub	x11, x11, x12
++	add	x10, x10, x11
++	MOV64	x11, \stage
++	str	x11, [x10]
++	dsb	sy
++.endm
++
++
+ #if __ARM_KERNEL_PROTECT__
+ #include <arm/pmap.h>
+ #endif /* __ARM_KERNEL_PROTECT__ */
+@@ -113,14 +151,34 @@
+ 	b		EXT(reset_vector)
+ 
+ 	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	/*
++	 * 0142: an early fault on a secondary used to spin silently here.  Record
++	 * which vector was taken in sweet_smp_vector_hit (MMU-off safe write)
++	 * before spinning, so the timeout panic shows it.
++	 */
+ 	.align	9
+-	b		.
+-	.align	7
+-	b		.
+-	.align	7
+-	b		.
+-	.align	7
+-	b		.
++	MOV64	x9, 0xF1
++	b	Lsweet_vec_hit
++	.align	7
++	MOV64	x9, 0xF2
++	b	Lsweet_vec_hit
++	.align	7
++	MOV64	x9, 0xF3
++	b	Lsweet_vec_hit
++	.align	7
++	MOV64	x9, 0xF4
++	b	Lsweet_vec_hit
++#else
++	.align	9
++	b		.
++	.align	7
++	b		.
++	.align	7
++	b		.
++	.align	7
++	b		.
++#endif
+ 
+ 	.align	7
+ 	.globl EXT(reset_vector)
+@@ -143,6 +201,21 @@
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	/*
++	 * 0142: mark 3 - reset_vector reached on a secondary (x0 was clobbered by
++	 * the VBAR setup above).  Index the per-CPU array from MPIDR using the
++	 * Qualcomm layout: idx = (Aff1 & 0xff) * 4 + (Aff0 & 3).
++	 */
++	and	x13, x15, #0xff
++	ubfx	x12, x15, #8, #8
++	add	x13, x13, x12, lsl #2
++	cmp	x13, #8
++	b.hs	9f
++	SWEET_MARK 3, x13
++9:
++	SWEET_STAGE 0xE4
++#endif
+ #if HAS_CLUSTER || defined(SWEET)
+ 	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
+ #else
+@@ -162,6 +235,7 @@
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++	SWEET_STAGE 0xE5
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -191,8 +265,10 @@
+ 	msr		TPIDR_EL1, x13
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
++	SWEET_STAGE 0xE7
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++	SWEET_STAGE 0xE6
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -280,6 +356,7 @@
+ 
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ #if defined(SWEET)
++
+ /* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
+  * Keep this separate from __start (which requires x0=boot_args PA).
+  * Firmware may return at EL1 or EL2; check before accessing EL1 state.
+@@ -288,12 +365,24 @@
+ 	.align 2
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
++	/* 0142: mark 1 - entry reached.  x0 = PSCI context (logical cpu id). */
++	cmp	x0, #8
++	b.hs	1f
++	SWEET_MARK 1, x0
++1:
++	SWEET_STAGE 0xE0
+ 	msr		DAIFSet, #0xf
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+ 	cmp		x1, #0x8
+ 	b.ne	Lsweet_secondary_bad_el
++	/* 0142: 0x12 - firmware entered the secondary at EL2. */
++	cmp	x0, #8
++	b.hs	1f
++	SWEET_MARK 0x12, x0
++1:
++	SWEET_STAGE 0xE2
+ 	adrp	x1, EXT(LowExceptionVectorBase)@page
+ 	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
+ 	msr		VBAR_EL2, x1
+@@ -330,12 +419,39 @@
+ 	msr		SPSR_EL2, x1
+ 	eret
+ Lsweet_secondary_bad_el:
++	SWEET_STAGE 0xEF
+ 	b		.
+ Lsweet_secondary_el1:
++	/* 0142: mark 2 - EL1 path, about to enter LowResetVectorBase. */
++	cmp	x0, #8
++	b.hs	1f
++	SWEET_MARK 2, x0
++1:
++	SWEET_STAGE 0xE3
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
++
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++/*
++ * 0142: common lander for the four early-vector stubs above.  x9 holds the
++ * vector code; write it to sweet_smp_vector_hit using the PC-derived physical
++ * address (the MMU may still be off), then spin.
++ */
++Lsweet_vec_hit:
++	adr	x10, .
++	adrp	x11, EXT(sweet_smp_vector_hit)@page
++	add	x11, x11, EXT(sweet_smp_vector_hit)@pageoff
++	adrp	x12, EXT(sweet_secondary_entry)@page
++	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
++	sub	x11, x11, x12
++	add	x10, x10, x11
++	str	x9, [x10]
++	dsb	sy
++9:	b	9b
++#endif
++
+ 
+ 	.align 2
+ 	.globl EXT(resume_idle_cpu)
+@@ -403,6 +519,18 @@
+ 	add		lr, lr, x22
+ 	sub		lr, lr, x23
+ 
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	/* 0142: mark 4 - start_cpu done (stacks/TPIDR set), before common_start. */
++	mrs	x15, MPIDR_EL1
++	and	x13, x15, #0xff
++	ubfx	x12, x15, #8, #8
++	add	x13, x13, x12, lsl #2
++	cmp	x13, #8
++	b.hs	9f
++	SWEET_MARK 4, x13
++9:
++	SWEET_STAGE 0xE8
++#endif
+ 	b		common_start
+ 
+ /*
+@@ -785,6 +913,7 @@
+  *	TPIDRRO_EL0 - CPU number
+  */
+ common_start:
++	SWEET_STAGE 0xEA
+ 
+ #if HAS_NEX_PG
+ 	mov x19, lr
+@@ -818,6 +947,7 @@
+ 	mov		x19, lr
+ 	bl		EXT(set_mmu_ttb)
+ 	mov		lr, x19
++	SWEET_STAGE 0xEB
+ 
+ #if defined(SWEET)
+ 	MOV64	x9, 0xBFEE0000
+@@ -934,9 +1064,11 @@
+ 	str	x8, [x9]
+ 	dsb	sy
+ #endif
++	SWEET_STAGE 0xEC
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++	SWEET_STAGE 0xED
+ 
+ #if defined(SWEET)
+ 	MOV64	x9, 0xBFEE0000
+@@ -1064,6 +1196,7 @@
+ 	bl		EXT(phystokv)
+ 
+ 	mov		lr, x19
++	SWEET_STAGE 0xEE
+ 
+ 	/* Return to arm_init() */
+ 	ret

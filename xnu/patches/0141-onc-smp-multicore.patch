@@ -1,0 +1,206 @@
+Enable onclite SDM632 multicore (Qualcomm MPIDR topology + GICv2 cross-IPI).
+
+The SWEET SMP path (PSCI CPU_ON via SMC, sweet_secondary_entry, the
+initCPU self-SGI handshake and the GICv2 driver) is already in the tree, but
+every image boots with cpus=1 because SweetCPU::start() validates the Apple
+topology rule (MPIDR Aff0 must be 0) while onclite's ADT has four Kryo 250 Gold
+cores with phys_id 0..3 (Aff0 = core in cluster):
+
+  SWEET CPU: invalid topology cpu=1 mpidr=0x1 count=4
+
+0141:
+  A) SweetCPU.cpp: ONC-aware validation under `SWEET && ONC_SWEET_4K`
+     (phys_id <= 0x103, Aff0 <= 3; num_cpus <= SWEET_SMP_MAX_CPUS, which is
+     already 8 from 0078); the Apple check is unchanged for other builds.
+  B) SweetCPU.cpp: signalCPU() targets the requested PE on GICv2
+     (GICD_SGIR CPUTargetList, pe_gic_send_ipi_cpu()) and keeps the 0b10
+     self-only path for the initCPU handshake; first cross-IPI is logged.
+  C) SweetCPU.cpp: per-CPU start diagnostics (phys/cluster) plus the existing
+     requested/selected/limit, CPU_ON target/entry/context, PSCI rc, entered
+     initCPU, came alive SGI1 OK and final N/N CPUs lines.
+  D) pe_fiq.c: new pe_gic_send_ipi_cpu() with sweetgiccpuoff boot arg
+     (default 0) for the GIC-400 CPU-interface number; SWEET.h:
+     GICD_SGIR_TARGET_LIST().
+  E) machine_routines.c: ONC-aware die-cluster-id / cluster-core-id fallbacks
+     (Aff1 = cluster, Aff0 = core).
+  F) start.s: skip ICC_SRE_EL2 accesses under HAS_GIC_V2 (no GICv3 system
+     registers on a GIC-400; PSCI CPU_ON entry level is SoC dependent).
+
+Boot args: cpus=4, optional sweetgiccpuoff=<n>.  Base = post-0140 CI main.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -38,6 +38,7 @@
+ 
+ #if HAS_GIC_V2
+ extern "C" void pe_gic_send_ipi(void);
++extern "C" void pe_gic_send_ipi_cpu(uint32_t cpu);
+ #endif
+ 
+ class SweetCPU;
+@@ -113,12 +114,26 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	/*
++	 * onc: Qualcomm MPIDR layout - Aff0 = core in cluster, Aff1 = cluster.
++	 * The onclite ADT has phys_id 0x0..0x3 for the four Kryo 250 Gold cores
++	 * (0x100..0x103 for the Silver cluster once it is added), so the Apple
++	 * "Aff0 must be 0" rule does not apply here.
++	 */
++	if (cpu->phys_id > 0x103 || (cpu->phys_id & 0xff) > 3 ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++		panic("SWEET CPU: invalid onc topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
++#endif
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+@@ -194,6 +209,9 @@
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		IOLog("SWEET CPU: cpu=%u start phys=0x%x cluster=%u\n",
++		    cpu->getCPUNumber(), topology->cpus[i].phys_id,
++		    topology->cpus[i].cluster_id);
+ 		ONC_STAGE(0xB1);
+ 		IOLog("ONC: cpu%u processor_start (init=%u sig_en=%u irq=%llu vt=%llu)\n",
+ 		    i, (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+@@ -294,10 +312,24 @@
+ 	    (((mpidr >> 8) & 0xff) << 16) |
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+ #if HAS_GIC_V2
+-	/* GIC-400: no ICC_SGI1R_EL1.  Broadcast "all but self" so this does not
+-	 * depend on the SoC's CPU-interface numbering. */
++	/*
++	 * GIC-400: no ICC_SGI1R_EL1.  signalCPU() is also used for cross-CPU
++	 * wakeups once cpus>1, so deliver to the requested PE when it is not us;
++	 * our own initCPU handshake keeps the safe 0b10 self-only path.
++	 */
+ 	(void) sgi;
+-	pe_gic_send_ipi();
++	if (logical == (unsigned int)cpu_number()) {
++		pe_gic_send_ipi();
++	} else {
++		static boolean_t cross_logged = FALSE;
++
++		if (!cross_logged) {
++			cross_logged = TRUE;
++			IOLog("SWEET CPU: cross-IPI SGI%u from cpu=%u to cpu=%u\n",
++			    SWEET_IPI_SGI, cpu_number(), logical);
++		}
++		pe_gic_send_ipi_cpu(logical);
++	}
+ #else
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -10,6 +10,7 @@
+ #include <machine/atomic.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
++#include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET) && !HAS_GIC_V3
+@@ -307,6 +308,38 @@
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	gicd_write32(GICD_SGIR, GICD_SGIR_SELF_ONLY |
+ 	    GICD_SGIR_SGI(SWEET_IPI_SGI));
++	__builtin_arm_isb(ISB_SY);
++}
++
++/*
++ * onc: deliver the IPI SGI to one specific PE (TargetListFilter 0b00,
++ * CPUTargetList).  signalCPU() uses this for cross-CPU wakeups once cpus>1;
++ * the initCPU handshake keeps the safe 0b10 self-only path above.
++ *
++ * The GIC-400 CPU-interface number is not derivable from MPIDR here, so it is
++ * assumed to be the logical CPU number; an optional boot arg
++ * `sweetgiccpuoff=<n>` is added to it (default 0) so a wrong assumption can be
++ * fixed without rebuilding.
++ */
++void
++pe_gic_send_ipi_cpu(uint32_t cpu)
++{
++	static int gic_cpu_off = -1;
++	uint32_t iface;
++
++	if (gic_cpu_off < 0) {
++		uint32_t off = 0;
++
++		gic_cpu_off = PE_parse_boot_argn("sweetgiccpuoff", &off,
++		    sizeof(off)) ? (int)off : 0;
++	}
++	iface = cpu + (uint32_t)gic_cpu_off;
++	if (iface >= 8) {
++		return;
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	gicd_write32(GICD_SGIR, GICD_SGIR_SGI(SWEET_IPI_SGI) |
++	    GICD_SGIR_TARGET_LIST(1U << iface));
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -78,6 +78,7 @@
+ #define GICD_SGIR_SGI(intid)      ((uint32_t)((intid) & 0xf))
+ #define GICD_SGIR_ALL_BUT_SELF    (1U << 24)   /* TargetListFilter = 0b01 */
+ #define GICD_SGIR_SELF_ONLY       (2U << 24)   /* TargetListFilter = 0b10 */
++#define GICD_SGIR_TARGET_LIST(b)  ((uint32_t)((b) & 0xffu) << 16) /* 0b00 */
+ 
+ #define GIC_INTID_SPURIOUS_MIN    1020
+ 
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1139,7 +1139,17 @@
+ 		}
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++		/*
++		 * onc: Qualcomm MPIDR - Aff1 = cluster, Aff0 = core in cluster.
++		 * The ADT carries both properties explicitly; these are the
++		 * fallbacks for an ADT that omits them.
++		 */
++		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id",
++		    (int)((cpu->phys_id >> 8) & 0xff));
++		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id",
++		    (int)(cpu->phys_id & 0xff));
++#elif defined(SWEET)
+ 		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+ 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,19 @@
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++#if HAS_GIC_V2
++	/*
++	 * onc: a GIC-400 has no GICv3 ICC_*_EL2 system registers, so touching
++	 * them here would UNDEF if PSCI enters the secondary at EL2 (the boot
++	 * CPU runs at EL1 per the shim).  The GICv2 driver uses GICD/GICC MMIO.
++	 */
++#else
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1

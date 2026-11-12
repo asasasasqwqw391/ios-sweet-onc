@@ -1,0 +1,183 @@
+Install PE_halt_restart + a safety WDT before IOKit (covers SMP bring-up).
+
+0137 installs the platform reset hook only in onc_emmc_init(), which runs after
+SweetCPU::startAll().  Every panic before that (e.g. the current
+"SWEET CPU: cpu=1 startup timeout") leaves the phone spinning on the panic
+screen, so each SMP iteration needs a manual long-press.
+
+0143 (2 files, no functional change to the 0137 later path):
+
+  osfmk/arm/arm_init.c
+    - call sweet_early_reset_install() right after PE_init_cpu() on the boot
+      CPU (VM is up after arm_vm_init, console is up after PE_init_printf,
+      ml_io_map works, and it is still before IOKit / SweetCPU::startAll).
+      Guarded by `#if defined(SWEET) && defined(ONC_SWEET_4K)`.
+
+  bsd/dev/onc_emmc.c
+    - `sweet_early_reset_install()` (global): `sweetearlyreset=0` disables;
+      otherwise map the KPSS WDT page, install
+      PE_halt_restart = sweet_pe_halt_restart (0137 hook: PSCI attempt then
+      WDT bite, never returns) and arm a safety watchdog for 120 s
+      (`sweetearlywdts=<secs>` override, clamped to 600).
+      Banner: "SWEET RESET: early hook install, safety WDT N s".
+    - `sweet_wdt_disarm()`: EN=0; dsb; RST=1; dsb (+ STS readback).
+    - onc_emmc_init(): the 0137 assignment becomes idempotent
+      ("PE_halt_restart already hooked early") and the safety WDT is disarmed
+      here, because from now on the hook covers panics and a live boot must
+      not bite.  With `sweetearlyreset=0` the original 0137 install path is
+      still taken, exactly as before.
+    - Nothing else changes; sweetrebootat's pre-shutdown WDT arm is untouched.
+
+Why this point: arm_init() runs after arm_vm_init() (vm map alive) and after
+PE_init_printf() (kprintf works), so ml_io_map(0x0b017000) and the hook's
+printf/MMIO reset are safe there; it is before machine_startup() and therefore
+before IOKit matching and SweetCPU::startAll().  A panic/hang between
+PE_init_cpu() and onc_emmc_init() now resets via the hook (panic) or the
+120 s safety WDT (hang).
+
+Expected new console lines:
+  SWEET RESET: early hook install, safety WDT 120 s
+  SWEET WDT: armed bite in 3932160 ticks
+  SWEET WDT: bite (STS=0x...)
+  ...normal boot...
+  SWEET HALT: PE_halt_restart already hooked early
+  SWEET WDT: safety WDT disarmed (STS=0x...)
+and on an early panic:
+  SWEET HALT: type=%u -> WDT reset
+  SWEET RESET: PSCI SYSTEM_RESET
+  SWEET RESET: PSCI returned 0xffffffffffffffff, falling back to watchdog
+  SWEET WDT: armed bite in 8192 ticks
+  SWEET WDT: bite (STS=0x...)
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -259,6 +259,8 @@
+ static void sweet_reset_fallback(void);
+ /* 0137: pre-shutdown WDT arm + PE_halt_restart hook (see below). */
+ static void sweet_wdt_arm_pre_shutdown(void);
++/* 0143: early hook install + safety WDT (called from arm_init()). */
++void sweet_early_reset_install(void);
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2505,6 +2507,70 @@
+ 	sweet_wdt_arm(ticks);
+ }
+ 
++#if defined(ONC_SWEET_4K)
++/*
++ * 0143: early reset safety net.
++ *
++ * SweetCPU::startAll() (SMP bring-up) runs before onc_emmc_init(), so the
++ * 0137 hook used to be installed too late: a panic in the SMP path left the
++ * phone spinning on the panic screen.  arm_init() calls this right after
++ * PE_init_cpu(), i.e. after arm_vm_init() (ml_io_map works) and after
++ * PE_init_printf() (printf works), but before machine_startup()/IOKit.
++ *
++ * The hook turns panics into a reset; a hard hang is caught by the safety
++ * watchdog.  A successful boot reaches onc_emmc_init(), which disarms the
++ * safety WDT (from there on the hook covers later panics).
++ */
++#define SWEET_EARLY_WDT_SECS 120u
++
++void
++sweet_early_reset_install(void)
++{
++	uint32_t on = 1;
++	uint32_t secs = 0;
++	uint32_t ticks;
++
++	if (PE_parse_boot_argn("sweetearlyreset", &on, sizeof(on)) && on == 0) {
++		printf("SWEET RESET: early hook disabled (sweetearlyreset=0)\n");
++		return;
++	}
++	if (PE_parse_boot_argn("sweetearlywdts", &secs, sizeof(secs)) &&
++	    secs != 0) {
++		if (secs > 600) {
++			secs = 600;
++		}
++	} else {
++		secs = SWEET_EARLY_WDT_SECS;
++	}
++	ticks = secs * 32768u;
++	printf("SWEET RESET: early hook install, safety WDT %u s\n", secs);
++	if (sweet_wdt_get() == 0) {
++		printf("SWEET RESET: WDT not mappable yet, hook only\n");
++	}
++	PE_halt_restart = sweet_pe_halt_restart;
++	if (sweet_wdt_get() != 0) {
++		sweet_wdt_arm(ticks);
++	}
++}
++
++/* Disarm the safety WDT once a live boot passed the early init/SMP phase. */
++static void
++sweet_wdt_disarm(void)
++{
++	vm_offset_t wdt = sweet_wdt_get();
++
++	if (wdt == 0) {
++		return;
++	}
++	oe_wr(wdt, SWEET_WDT_EN, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	oe_wr(wdt, SWEET_WDT_RST, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET WDT: safety WDT disarmed (STS=0x%x)\n",
++	    oe_rd(wdt, SWEET_WDT_STS));
++}
++#endif /* ONC_SWEET_4K */
++
+ 
+ /* -------------------------------------------------------------------------
+  * Init and the root-device entry point
+@@ -2647,14 +2713,23 @@
+ 	}
+ 
+ 	/*
+-	 * 0137: install the platform reset hook before any reboot/panic path is
+-	 * reachable.  PE_halt_restart is NULL on this port; IOPlatformExpert::
+-	 * haltRestart() calls it from both the clean shutdown and the panic path.
+-	 * Map the WDT page now, so the hook also works from panic context.
++	 * 0137/0143: the platform reset hook is normally installed much earlier
++	 * (arm_init() -> sweet_early_reset_install()), which also armed the
++	 * safety WDT.  Keep the assignment idempotent for the case it was
++	 * disabled (sweetearlyreset=0) and disarm the safety WDT now that the
++	 * early phase is over: from here on the hook covers panics and a live
++	 * boot must not bite.
+ 	 */
+-	(void)sweet_wdt_get();
+-	PE_halt_restart = sweet_pe_halt_restart;
+-	printf("SWEET HALT: PE_halt_restart hooked (WDT reset)\n");
++	if (PE_halt_restart != sweet_pe_halt_restart) {
++		(void)sweet_wdt_get();
++		PE_halt_restart = sweet_pe_halt_restart;
++		printf("SWEET HALT: PE_halt_restart hooked (WDT reset)\n");
++	} else {
++		printf("SWEET HALT: PE_halt_restart already hooked early\n");
++	}
++#if defined(ONC_SWEET_4K)
++	sweet_wdt_disarm();
++#endif
+ 
+ 	/* Clear the Android BCB now so the NEXT reset boots boot=TWRP. */
+ 	sweet_clear_misc_bcb();
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -648,6 +648,17 @@
+ #endif /* KPERF */
+ 
+ 	PE_init_cpu();
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++	{
++		/*
++		 * 0143: install the reset hook and the safety WDT before IOKit /
++		 * SweetCPU SMP bring-up; VM and console are up at this point.
++		 */
++		extern void sweet_early_reset_install(void);
++
++		sweet_early_reset_install();
++	}
++#endif
+ 	fiq_context_init(TRUE);
+ 
+ 

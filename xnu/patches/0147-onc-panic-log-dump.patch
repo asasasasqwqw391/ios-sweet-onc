@@ -1,0 +1,476 @@
+Raw-eMMC panic log dump from the halt hook + self-contained SMP timeout line.
+
+(1) SMP bring-up panics happen before onc_emmc_init() starts the 0132 SWEETLOG
+    flusher, so the panic text only flashes on the panel.  0147 makes the 0144
+    PE_halt_restart hook write the 0129 console ring to eMMC itself, before the
+    reset, using 0146's lock-free early raw-SDHCI path (ml_io_map + PIO, no
+    IOKit/threads/locks).
+
+    Layout is exactly the one 0132 uses at the end of userdata:
+      block 0 (4 KiB): "SWEETLOG", u32 version=1, u32 ring size=4 MiB,
+                       u64 total console bytes, u64 seq
+      blocks 1..1024 (4 KiB each): the console ring, byte n at n % size
+    so `xnuios/sweet-onc/tools/sweet-log.py` decodes it unchanged.
+    To stay bounded on the 400 kHz legacy link the dump writes the header plus
+    the NEWEST `sweetpanicdumpkb` KiB of the ring (default 32, max 4096) - the
+    panic lines are at the tail, so they are always included.  The old header
+    is read first so `seq` keeps incrementing.  `sweetpanicdump=0` disables.
+    Any failure prints a reason and returns (the reset continues).
+
+(2) `SweetCPU::startCPU()` stores the PSCI CPU_ON parameters in globals and the
+    5 s SMP timeout IOLog/panic prints them, so one line is self-contained:
+      cpu=1 target=0x1 entry=0x... rc=0 mark=... stage=... init=... sig=...
+
+Files: bsd/dev/onc_emmc.c, iokit/Kernel/arm/SweetCPU.cpp.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -261,6 +261,8 @@
+ static void sweet_wdt_arm_pre_shutdown(void);
+ /* 0143: early hook install + safety WDT (called from arm_init()). */
+ void sweet_early_reset_install(void);
++/* 0147: panic-time console-ring dump via the early raw-eMMC path. */
++void sweet_panic_log_dump(void);
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2485,6 +2487,15 @@
+ sweet_pe_halt_restart(unsigned int type)
+ {
+ 	printf("SWEET HALT: type=%u -> WDT reset\n", type);
++#if defined(ONC_SWEET_4K)
++	/*
++	 * 0147: persist the console ring (which already contains the panic text)
++	 * to the userdata log tail before resetting, so the TWRP loop can read
++	 * the full panic even when it happened before the SWEETLOG flusher
++	 * started.  Bounded and failure-tolerant.
++	 */
++	sweet_panic_log_dump();
++#endif
+ 	sweet_reset_fallback();
+ 	for (;;) {
+ 		delay(1000000);
+@@ -2615,65 +2626,47 @@
+ }
+ 
+ /*
+- * 0146: very early Android-BCB clear.
++ * 0146/0147: very early raw-eMMC path (no IOKit, no threads, no locks).
+  *
+- * Called from arm_init() right after sweet_early_reset_install(), i.e. after
+- * arm_vm_init() (ml_io_map works) and PE_init_printf() (printf works), but
+- * before machine_startup()/IOKit and before SweetCPU::startAll().  A panic in
+- * the CPU bring-up therefore already has the Android BCB cleared and resets
+- * into boot=TWRP.
+- *
+- * Self-contained early path: no IOKit, no threads, no bdevsw, no locks.  It
+- * reuses only the lock-free low-level helpers defined above in this file
++ * The kernel's normal eMMC driver only comes up in onc_emmc_init(), i.e. after
++ * IOKit/BSD and after SweetCPU::startAll().  Two things need the card before
++ * that: clearing the Android BCB (0146, so an SMP panic resets into TWRP) and
++ * dumping the console ring on panic (0147, so the panic text survives).  Both
++ * use the lock-free low-level helpers below with ml_io_map + busy-loop delays
+  * (oe_gcc_clock_init/oe_core_init/oe_sdhci_takeover/oe_issue16/oe_issue/
+- * oe_pio_read/oe_read_lba/oe_write_lba/oe_gpt_scan), with ml_io_map for the
+- * register windows and busy-loop delays.  The card is left in the same
+- * 400 kHz legacy / 1-bit mode that 0133 and the shim probe use for writes;
+- * no CMD6/HS switch is attempted, so no PLL is needed.
+- *
+- * Failure is never fatal: it prints a reason and returns; the normal
+- * onc_emmc_init() path (and its 0133 BCB clear) still runs later.
+- */
+-void
+-sweet_early_misc_clear(void)
+-{
+-	uint8_t zero[OE_BLOCK_SIZE];
++ * oe_pio_read/oe_read_lba/oe_write_lba/oe_gpt_scan).  400 kHz legacy / 1-bit,
++ * no CMD6/HS, no PLL.
++ */
++static int
++sweet_early_card_init(void)
++{
+ 	uint32_t resp[4] = { 0, 0, 0, 0 };
+ 	uint32_t ist = 0;
+ 	uint32_t ocr = 0;
+-	uint32_t on = 1;
+-	uint32_t orw = 0;
+ 	uint32_t i;
+-	int rc;
+-	bool ok = false;
+-
+-	if (PE_parse_boot_argn("sweetearlymisc", &on, sizeof(on)) && on == 0) {
+-		printf("SWEET EARLYMISC: disabled (sweetearlymisc=0)\n");
+-		return;
+-	}
+-	if (!PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw)) || orw == 0) {
+-		printf("SWEET EARLYMISC: emmcroot_orw=0 (read-only), BCB not cleared\n");
+-		return;
+-	}
+-	if (oe.hc != 0) {
+-		printf("SWEET EARLYMISC: eMMC already mapped, skipped\n");
+-		return;
+-	}
+-
++	int rc = 0;
++
++	if (oe.hc != 0 && oe.rca != 0) {
++		return 0;	/* already initialised (0146 or onc_emmc_init()) */
++	}
++	if (oe.hc == 0) {
++		oe.hc = ml_io_map(OE_SDCC_HC_PHYS, OE_SDCC_HC_SIZE);
++		oe.core = ml_io_map(OE_SDCC_CORE_PHYS, OE_SDCC_CORE_SIZE);
++		oe.gcc = ml_io_map(OE_GCC_PHYS, OE_GCC_SIZE);
++		if (oe.hc == 0 || oe.core == 0 || oe.gcc == 0) {
++			printf("SWEET EARLYMISC: ml_io_map failed "
++			    "(hc=0x%lx core=0x%lx gcc=0x%lx)\n",
++			    (unsigned long)oe.hc, (unsigned long)oe.core,
++			    (unsigned long)oe.gcc);
++			return ENOMEM;
++		}
++		printf("SWEET EARLYMISC: early eMMC init (hc=0x%lx core=0x%lx "
++		    "gcc=0x%lx)\n", (unsigned long)oe.hc,
++		    (unsigned long)oe.core, (unsigned long)oe.gcc);
++	}
+ 	oe.writable = true;
+ 	oe.secsize = OE_BLOCK_SIZE;
+ 	oe.kick_always = true;	/* probe-style kick for the few commands below */
+-	oe.hc = ml_io_map(OE_SDCC_HC_PHYS, OE_SDCC_HC_SIZE);
+-	oe.core = ml_io_map(OE_SDCC_CORE_PHYS, OE_SDCC_CORE_SIZE);
+-	oe.gcc = ml_io_map(OE_GCC_PHYS, OE_GCC_SIZE);
+-	if (oe.hc == 0 || oe.core == 0 || oe.gcc == 0) {
+-		printf("SWEET EARLYMISC: ml_io_map failed (hc=0x%lx core=0x%lx gcc=0x%lx)\n",
+-		    (unsigned long)oe.hc, (unsigned long)oe.core,
+-		    (unsigned long)oe.gcc);
+-		goto out;
+-	}
+-	printf("SWEET EARLYMISC: early eMMC init (hc=0x%lx core=0x%lx gcc=0x%lx)\n",
+-	    (unsigned long)oe.hc, (unsigned long)oe.core, (unsigned long)oe.gcc);
+ 
+ 	oe_gcc_clock_init();
+ 	oe_core_init();
+@@ -2700,8 +2693,9 @@
+ 		delay(25000);
+ 	}
+ 	if ((ocr & 0x80000000u) == 0) {
+-		printf("SWEET EARLYMISC: CMD1 never signalled power-up (ocr=0x%08x)\n",
+-		    ocr);
++		printf("SWEET EARLYMISC: CMD1 never signalled power-up "
++		    "(ocr=0x%08x)\n", ocr);
++		rc = ETIMEDOUT;
+ 		goto out;
+ 	}
+ 	rc = oe_issue(OE_CMD_IDX(2) | OE_RSP_136 | OE_CC_CRC, 0, resp, &ist);
+@@ -2739,7 +2733,9 @@
+ 	}
+ 	oe.sec_count = oe_le32(&oe_sector[212]);
+ 	if (oe.sec_count < 2) {
+-		printf("SWEET EARLYMISC: invalid SEC_COUNT 0x%08x\n", oe.sec_count);
++		printf("SWEET EARLYMISC: invalid SEC_COUNT 0x%08x\n",
++		    oe.sec_count);
++		rc = ENXIO;
+ 		goto out;
+ 	}
+ 	printf("SWEET EARLYMISC: card ready rca=%u sectors=0x%08x "
+@@ -2747,17 +2743,47 @@
+ 	    "  (EXT_CSD; raw 400 kHz legacy mode)\n",
+ 	    oe.rca, oe.sec_count, oe_sector[33], oe_sector[185],
+ 	    oe_sector[183]);
+-
+-	/* GPT scan: the shared reader also records the "misc" partition. */
++	rc = 0;
++
++out:
++	oe.kick_always = false;
++	return rc;
++}
++
++void
++sweet_early_misc_clear(void)
++{
++	uint8_t zero[OE_BLOCK_SIZE];
++	uint32_t on = 1;
++	uint32_t orw = 0;
++	uint32_t i;
++	int rc;
++
++	if (PE_parse_boot_argn("sweetearlymisc", &on, sizeof(on)) && on == 0) {
++		printf("SWEET EARLYMISC: disabled (sweetearlymisc=0)\n");
++		return;
++	}
++	if (!PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw)) || orw == 0) {
++		printf("SWEET EARLYMISC: emmcroot_orw=0 (read-only), "
++		    "BCB not cleared\n");
++		return;
++	}
++	rc = sweet_early_card_init();
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: eMMC init failed rc=%d\n", rc);
++		return;
++	}
++	/* GPT scan: the shared reader also records the "misc" and "userdata"
++	 * partitions. */
+ 	rc = oe_gpt_scan("userdata");
+ 	if (rc != 0) {
+ 		printf("SWEET EARLYMISC: GPT scan failed rc=%d\n", rc);
+-		goto out;
++		return;
+ 	}
+ 	if (oe.misc_lba == 0 ||
+ 	    oe.misc_nblocks < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE) {
+ 		printf("SWEET EARLYMISC: misc partition not found or too small\n");
+-		goto out;
++		return;
+ 	}
+ 
+ 	/* Only action: 4096 zero bytes (8 x 512) at the start of misc. */
+@@ -2765,19 +2791,161 @@
+ 	for (i = 0; i < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE; i++) {
+ 		rc = oe_write_lba(oe.misc_lba + i, zero);
+ 		if (rc != 0) {
+-			printf("SWEET EARLYMISC: BCB write failed at block 0x%llx rc=%d\n",
+-			    oe.misc_lba + i, rc);
+-			goto out;
++			printf("SWEET EARLYMISC: BCB write failed at block "
++			    "0x%llx rc=%d\n", oe.misc_lba + i, rc);
++			return;
+ 		}
+ 	}
+ 	printf("SWEET EARLYMISC: cleared BCB at block 0x%llx\n", oe.misc_lba);
+-	ok = true;
+-
+-out:
+-	oe.kick_always = false;
+-	if (!ok) {
+-		printf("SWEET EARLYMISC: early BCB clear failed, continuing boot\n");
+-	}
++}
++
++/*
++ * 0147: write the console ring to the userdata log tail, in exactly the layout
++ * the 0132 flusher uses (tools/sweet-log.py decodes it unchanged).  Called
++ * from the 0144 halt hook before the reset.  Bounded and best-effort: the
++ * header plus the newest `sweetpanicdumpkb` KiB (default 32) of the 4 MiB ring
++ * are written, so the panic lines at the tail are always included; at the
++ * 400 kHz legacy link this is roughly 0.8 s.  Never panics/hangs; any failure
++ * prints a reason and returns so the reset still happens.
++ */
++void
++sweet_panic_log_dump(void)
++{
++	static uint8_t hdr[SWEET_EMMC_LOG_BLKSIZE];
++	static uint8_t blk[SWEET_EMMC_LOG_BLKSIZE];
++	static uint8_t oldhdr[OE_BLOCK_SIZE];
++	struct sweet_emmc_log_header h;
++	uint64_t base;
++	uint64_t total;
++	uint64_t start_abs;
++	uint64_t seq = 1;
++	uint32_t on = 1;
++	uint32_t kb = 32;
++	uint32_t nblocks;
++	uint32_t i;
++	uint32_t j;
++	int rc;
++
++	if (PE_parse_boot_argn("sweetpanicdump", &on, sizeof(on)) && on == 0) {
++		printf("SWEET PANICDUMP: disabled (sweetpanicdump=0)\n");
++		return;
++	}
++	rc = sweet_early_card_init();
++	if (rc != 0) {
++		printf("SWEET PANICDUMP: eMMC init failed rc=%d\n", rc);
++		return;
++	}
++	/* Always (re)scan so oe.first_lba/nblocks point at userdata, whatever
++	 * partition the normal root selection used.  A few single-block reads. */
++	rc = oe_gpt_scan("userdata");
++	if (rc != 0) {
++		printf("SWEET PANICDUMP: GPT scan failed rc=%d\n", rc);
++		return;
++	}
++	if (oe.nblocks <= 2 * SWEET_EMMC_LOG_LBAS) {
++		printf("SWEET PANICDUMP: userdata too small for the log tail\n");
++		return;
++	}
++	base = oe.first_lba + oe.nblocks - SWEET_EMMC_LOG_LBAS;
++	total = sweet_log_position();
++	if (total == 0) {
++		printf("SWEET PANICDUMP: console ring is empty\n");
++		return;
++	}
++
++	if (PE_parse_boot_argn("sweetpanicdumpkb", &kb, sizeof(kb)) &&
++	    kb >= 4) {
++		if (kb > SWEET_EMMC_LOG_RING / 1024) {
++			kb = SWEET_EMMC_LOG_RING / 1024;
++		}
++	} else {
++		kb = 32;
++	}
++	nblocks = kb / (SWEET_EMMC_LOG_BLKSIZE / 1024);
++	if (nblocks == 0) {
++		nblocks = 1;
++	}
++	if (nblocks > SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE) {
++		nblocks = SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE;
++	}
++	start_abs = (total > (uint64_t)nblocks * SWEET_EMMC_LOG_BLKSIZE) ?
++	    total - (uint64_t)nblocks * SWEET_EMMC_LOG_BLKSIZE : 0;
++	start_abs &= ~((uint64_t)SWEET_EMMC_LOG_BLKSIZE - 1);
++	{
++		uint64_t nb = (total - start_abs + SWEET_EMMC_LOG_BLKSIZE - 1) /
++		    SWEET_EMMC_LOG_BLKSIZE;
++
++		if (nb > nblocks) {
++			nb = nblocks;
++		}
++		nblocks = (uint32_t)nb;
++	}
++	if (nblocks == 0) {
++		printf("SWEET PANICDUMP: nothing to write\n");
++		return;
++	}
++
++	/* Read the previous header (if any) so seq keeps incrementing. */
++	memset(oldhdr, 0, sizeof(oldhdr));
++	if (oe_read_lba(base, oldhdr) == 0 &&
++	    memcmp(oldhdr, "SWEETLOG", 8) == 0) {
++		struct sweet_emmc_log_header old;
++
++		memcpy(&old, oldhdr, sizeof(old));
++		seq = old.seq + 1;
++		if (seq == 0) {
++			seq = 1;
++		}
++	}
++
++	memset(hdr, 0, sizeof(hdr));
++	memset(&h, 0, sizeof(h));
++	memcpy(h.magic, "SWEETLOG", 8);
++	h.version = 1;
++	h.size = SWEET_EMMC_LOG_RING;
++	h.total = total;
++	h.seq = seq;
++	memcpy(hdr, &h, sizeof(h));
++	for (i = 0; i < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; i++) {
++		rc = oe_write_lba(base + i, hdr + (uint64_t)i * OE_BLOCK_SIZE);
++		if (rc != 0) {
++			printf("SWEET PANICDUMP: header write failed rc=%d\n", rc);
++			return;
++		}
++	}
++
++	for (i = 0; i < nblocks; i++) {
++		uint64_t abs = start_abs + (uint64_t)i * SWEET_EMMC_LOG_BLKSIZE;
++		uint64_t pos = abs;
++		uint32_t got;
++		uint32_t ring_blk;
++		uint64_t out_lba;
++
++		memset(blk, 0, sizeof(blk));
++		got = sweet_log_copy(&pos, (char *)blk,
++		    SWEET_EMMC_LOG_BLKSIZE);
++		if (got == 0) {
++			continue;
++		}
++		ring_blk = (uint32_t)((abs / SWEET_EMMC_LOG_BLKSIZE) %
++		    (SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE));
++		out_lba = base + (uint64_t)(1 + ring_blk) *
++		    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
++		for (j = 0; j < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; j++) {
++			rc = oe_write_lba(out_lba + j,
++			    blk + (uint64_t)j * OE_BLOCK_SIZE);
++			if (rc != 0) {
++				printf("SWEET PANICDUMP: ring write failed "
++				    "block 0x%llx rc=%d\n", out_lba + j, rc);
++				return;
++			}
++		}
++	}
++	printf("SWEET PANICDUMP: wrote %u bytes (header + %u ring blocks) "
++	    "-> block 0x%llx seq=%llu total=%llu\n",
++	    (SWEET_EMMC_LOG_BLKSIZE +
++	    nblocks * SWEET_EMMC_LOG_BLKSIZE), nblocks, base,
++	    (unsigned long long)seq, (unsigned long long)total);
+ }
+ #endif /* ONC_SWEET_4K */
+ 
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -47,6 +47,17 @@
+ volatile uint64_t sweet_secondary_marks[8];
+ volatile uint64_t sweet_smp_stage;
+ volatile uint64_t sweet_smp_vector_hit;
++}
++
++/*
++ * 0147: last PSCI CPU_ON parameters, so the SMP timeout IOLog/panic is
++ * self-contained even when the earlier CPU_ON console lines were lost (the
++ * panic can happen before the SWEETLOG flusher starts).
++ */
++extern "C" {
++volatile uint64_t sweet_psci_last_target;
++volatile uint64_t sweet_psci_last_entry;
++volatile int32_t sweet_psci_last_rc;
+ }
+ 
+ static inline void
+@@ -289,11 +300,21 @@
+ 				uint64_t vec = __atomic_load_n(
+ 				    &sweet_smp_vector_hit, __ATOMIC_ACQUIRE);
+ 				uint64_t delta = mach_absolute_time() - onc_start_time;
+-
+-				IOLog("SWEET CPU: cpu=%u start phys=0x%x NOT alive after 5s "
+-				    "mark=0x%llx stage=0x%llx vec=0x%llx init=%u sig=%u "
+-				    "delta=%llu\n",
++				/* 0147: self-contained PSCI parameters. */
++				uint64_t psci_target = __atomic_load_n(
++				    &sweet_psci_last_target, __ATOMIC_ACQUIRE);
++				uint64_t psci_entry = __atomic_load_n(
++				    &sweet_psci_last_entry, __ATOMIC_ACQUIRE);
++				int32_t psci_rc = __atomic_load_n(
++				    &sweet_psci_last_rc, __ATOMIC_ACQUIRE);
++
++				IOLog("SWEET CPU: cpu=%u start phys=0x%x "
++				    "target=0x%llx entry=0x%llx rc=%d NOT alive "
++				    "after 5s mark=0x%llx stage=0x%llx vec=0x%llx "
++				    "init=%u sig=%u delta=%llu\n",
+ 				    i, topology->cpus[i].phys_id,
++				    (unsigned long long)psci_target,
++				    (unsigned long long)psci_entry, (int)psci_rc,
+ 				    (unsigned long long)mark,
+ 				    (unsigned long long)stage,
+ 				    (unsigned long long)vec,
+@@ -301,9 +322,12 @@
+ 				    __ATOMIC_ACQUIRE),
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned long long)delta);
+-				panic("SWEET CPU: cpu=%u startup timeout mark=0x%llx "
+-				    "stage=0x%llx vec=0x%llx init=%u sig=%u phys=0x%x "
+-				    "delta=%llu", i,
++				panic("SWEET CPU: cpu=%u startup timeout "
++				    "target=0x%llx entry=0x%llx rc=%d mark=0x%llx "
++				    "stage=0x%llx vec=0x%llx init=%u sig=%u "
++				    "phys=0x%x delta=%llu", i,
++				    (unsigned long long)psci_target,
++				    (unsigned long long)psci_entry, (int)psci_rc,
+ 				    (unsigned long long)mark,
+ 				    (unsigned long long)stage,
+ 				    (unsigned long long)vec,
+@@ -430,10 +454,17 @@
+ 	sweet_smp_mark(getCPUNumber(), 0);
+ 	__atomic_store_n(&sweet_smp_stage, 0, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_smp_vector_hit, 0, __ATOMIC_RELEASE);
++	/* 0147: remember the PSCI parameters for the SMP timeout report. */
++	__atomic_store_n(&sweet_psci_last_target, (uint64_t)cpu->phys_id,
++	    __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_psci_last_entry, (uint64_t)entry,
++	    __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_psci_last_rc, 0x7fffffff, __ATOMIC_RELEASE);
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++	__atomic_store_n(&sweet_psci_last_rc, rc, __ATOMIC_RELEASE);
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {

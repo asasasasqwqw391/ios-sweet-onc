@@ -1,0 +1,248 @@
+Gate secondary-CPU start on eMMC init (BCB cleared + SWEETLOG running).
+
+0144 gave us the safe secondary-CPU marks, but the CPU1-timeout panic still
+happens BEFORE onc_emmc_init() clears the Android BCB / starts the SWEETLOG
+flusher, so the reset lands back in the recovery partition (iOS image): a
+recovery loop with no adb and no log.  (0144's IMEM restart_reason does not
+override ABL's BCB boot-recovery decision.)
+
+0145 (2 files):
+
+  iokit/Kernel/arm/SweetCPU.cpp
+    - new C-linkage `volatile int sweet_emmc_ready` (defined for ONC builds);
+    - startAll(): the boot CPU is started and verified exactly as today, then
+      the remaining CPUs are gated on `sweet_emmc_ready`, polling every 1 ms
+      (onc_spin_us) for up to `sweetemmcgate=<secs>` (default 30 s, 0 = no
+      gate).  Logs the gate start/release/timeout and then continues with the
+      unchanged per-CPU start/SGI1 handshake.
+
+  bsd/dev/onc_emmc.c
+    - onc_emmc_init() sets `sweet_emmc_ready = 1` AFTER the 0133 BCB clear and
+      AFTER the 0132 SWEETLOG flusher has been started, printing
+      `SWEET CPU: eMMC ready, SMP may start`;
+    - panic-time flush: `sweet_emmc_log_flush_panic()` (called from the 0137
+      PE_halt_restart hook before the reset fallback) wakes the 0132 flusher
+      thread repeatedly for <=1 s so the console ring - which already contains
+      the panic text (and the 0144 mark/stage line) - is written to the eMMC
+      log tail before the watchdog bite.  Other CPUs are still running there:
+      the panic path calls halt_all_cpus() only AFTER PEHaltRestart returns.
+
+Deadlock check: grepped the tree for consumers of the all-CPU-initialized
+state: `gIOAllCPUInitializedKey` / `kIOAllCPUInitializedKey` have only
+publishers (AppleARMSMP.cpp, SweetCPU.cpp) and the definition in IOService.cpp;
+`ml_cpu_init_completed()` has only the two publishers plus scheduler-internal
+`.cpu_init_completed` callbacks (sched_amp / sched_clutch; sched_dualq is NULL;
+our config is traditional/multiq and does not need it).  No
+`IOService::waitForService` on "IOAllCPUInitialized" exists, so blocking
+startAll() cannot block BSD init / onc_emmc_init, and vice versa.
+
+Expected console sequence with cpus=4:
+  ... arm_init hook / early install / safety WDT ...
+  SWEET CPU: requested=4 selected=4 (limit=8)
+  SWEET CPU: startAll entered (registered=4/4 boot_mpidr=0x0)
+  SWEET CPU: cpu=0 start phys=0x0 cluster=0
+  SWEET CPU: cpu=0 mpidr=0x0 came alive; SGI1 OK
+  SWEET CPU: gated on eMMC init (max 30 s)
+  ... onc_emmc_init runs: SWEET HALT already hooked early, safety WDT
+      disarmed, SWEET MISC: cleared BCB ..., SWEET LOG: console log ...
+  SWEET CPU: eMMC ready, SMP may start
+  SWEET CPU: eMMC gate released after X ms; SMP may start
+  SWEET CPU: cpu=1 start phys=0x1 cluster=0
+  ... CPU1 panic (mark/stage from 0144) ...
+  SWEET HALT: type=... -> WDT reset
+  SWEET LOG: panic flush
+  ... reset -> ABL: BCB already clear -> boot=TWRP -> TWRP adb pulls the
+      SWEETLOG with the panic text.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -48,6 +48,19 @@
+ volatile uint64_t sweet_smp_stage;
+ volatile uint64_t sweet_smp_vector_hit;
+ }
++
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++/*
++ * 0145: eMMC-init gate for the secondary CPUs.  onc_emmc_init() sets this
++ * after the Android BCB has been cleared (0133) and the SWEETLOG flusher is
++ * running (0132), so an SMP bring-up panic from that point on resets into
++ * boot=TWRP with the panic text already queued in the log tail, instead of
++ * looping back into the recovery partition.
++ */
++extern "C" {
++volatile int sweet_emmc_ready;
++}
++#endif
+ 
+ static inline void
+ sweet_smp_mark(uint32_t cpu, uint64_t mark)
+@@ -318,6 +331,58 @@
+ 		ONC_STAGE(0xB4);
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++#if defined(SWEET) && defined(ONC_SWEET_4K)
++		/*
++		 * 0145: the boot CPU is started exactly as before, but the
++		 * secondaries wait until onc_emmc_init() has cleared the Android
++		 * BCB and started the SWEETLOG flusher.  Then an SMP bring-up
++		 * panic resets into boot=TWRP (not the recovery partition) and the
++		 * panic text - including the 0144 mark/stage line - reaches the
++		 * log tail instead of a recovery loop.
++		 */
++		if (i == topology->boot_cpu->cpu_id &&
++		    topology->num_cpus > 1) {
++			uint32_t gate_secs = 30;
++
++			if (!PE_parse_boot_argn("sweetemmcgate", &gate_secs,
++			    sizeof(gate_secs))) {
++				gate_secs = 30;
++			}
++			if (gate_secs == 0) {
++				IOLog("SWEET CPU: eMMC gate disabled "
++				    "(sweetemmcgate=0)\n");
++			} else {
++				const uint64_t gate_start = mach_absolute_time();
++				uint64_t gate_deadline;
++
++				IOLog("SWEET CPU: gated on eMMC init (max %u s)\n",
++				    gate_secs);
++				nanoseconds_to_deadline((uint64_t)gate_secs *
++				    NSEC_PER_SEC, &gate_deadline);
++				while (!__atomic_load_n(&sweet_emmc_ready,
++				    __ATOMIC_ACQUIRE)) {
++					if (mach_absolute_time() > gate_deadline) {
++						IOLog("SWEET CPU: eMMC gate "
++						    "timeout (%u s), starting SMP "
++						    "anyway\n", gate_secs);
++						break;
++					}
++					onc_spin_us(1000);
++				}
++				if (__atomic_load_n(&sweet_emmc_ready,
++				    __ATOMIC_ACQUIRE)) {
++					uint64_t gate_ns = 0;
++
++					absolutetime_to_nanoseconds(
++					    mach_absolute_time() - gate_start,
++					    &gate_ns);
++					IOLog("SWEET CPU: eMMC gate released "
++					    "after %llu ms; SMP may start\n",
++					    (unsigned long long)(gate_ns / 1000000ULL));
++				}
++			}
++		}
++#endif /* SWEET && ONC_SWEET_4K */
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ONC_STAGE(0xB5);
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -261,6 +261,12 @@
+ static void sweet_wdt_arm_pre_shutdown(void);
+ /* 0143: early hook install + safety WDT (called from arm_init()). */
+ void sweet_early_reset_install(void);
++#if defined(ONC_SWEET_4K)
++/* 0145: defined in SweetCPU.cpp; set by onc_emmc_init() to unblock SMP. */
++extern volatile int sweet_emmc_ready;
++/* 0145: persist the console ring before a panic/reboot reset. */
++void sweet_emmc_log_flush_panic(void);
++#endif
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2140,6 +2146,14 @@
+ 	return 0;
+ }
+ 
++/*
++ * 0145: the flusher sleeps on this file-static event so the panic path can
++ * wake it and persist the console ring (which already contains the panic text)
++ * before resetting.
++ */
++static int sweet_emcmlog_chan;
++static int sweet_emcmlog_started;
++
+ static void
+ sweet_emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -2148,7 +2162,6 @@
+ 	uint64_t seq = 0;
+ 	uint32_t secs = SWEET_EMMC_LOG_SECS;
+ 	uint32_t on = 1;
+-	int chan;
+ 
+ 	if (PE_parse_boot_argn("sweetlog", &on, sizeof(on)) && on == 0) {
+ 		printf("SWEET LOG: disabled by sweetlog=0\n");
+@@ -2160,12 +2173,13 @@
+ 	}
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    (SWEET_EMMC_LOG_BLOCKS * SWEET_EMMC_LOG_BLKSIZE) >> 10, base);
++	sweet_emcmlog_started = 1;
+ 	for (;;) {
+ 		uint64_t total, start, rpos;
+ 		uint32_t nblocks, got, i;
+ 		int error = 0;
+ 
+-		(void)tsleep(&chan, PZERO, "emcmlog", hz * (int)secs);
++		(void)tsleep(&sweet_emcmlog_chan, PZERO, "emcmlog", hz * (int)secs);
+ 		total = sweet_log_position();
+ 		if (total == flushed) {
+ 			continue;
+@@ -2223,6 +2237,30 @@
+ 			return;
+ 		}
+ 		flushed = start + (uint64_t)nblocks * SWEET_EMMC_LOG_BLKSIZE;
++	}
++}
++
++/*
++ * 0145: panic/reboot-time flush.  The console ring already contains the panic
++ * text (console output is ring-backed), but the flusher thread may be asleep
++ * for up to emcmlogsecs seconds and the reset happens shortly after
++ * PEHaltRestart().  Wake it repeatedly so it writes the newest ring blocks to
++ * the log tail before the watchdog bites.  PeHaltRestart runs before
++ * halt_all_cpus() in the panic path, so the other CPUs are still running and
++ * the flusher can make progress.  Best effort, bounded to ~1 s.
++ */
++void
++sweet_emmc_log_flush_panic(void)
++{
++	int i;
++
++	if (!sweet_emcmlog_started || !oe.ready) {
++		return;
++	}
++	printf("SWEET LOG: panic flush\n");
++	for (i = 0; i < 10; i++) {
++		thread_wakeup((event_t)(void *)&sweet_emcmlog_chan);
++		delay(100000);	/* 100 ms per try */
+ 	}
+ }
+ 
+@@ -2485,6 +2523,10 @@
+ sweet_pe_halt_restart(unsigned int type)
+ {
+ 	printf("SWEET HALT: type=%u -> WDT reset\n", type);
++#if defined(ONC_SWEET_4K)
++	/* 0145: persist the panic text to the SWEETLOG tail before resetting. */
++	sweet_emmc_log_flush_panic();
++#endif
+ 	sweet_reset_fallback();
+ 	for (;;) {
+ 		delay(1000000);
+@@ -2865,6 +2907,16 @@
+ 	} else {
+ 		printf("SWEET LOG: partition too small for the log tail, disabled\n");
+ 	}
++	/*
++	 * 0145: the Android BCB has been cleared (0133) and - when the partition
++	 * is large enough - the SWEETLOG flusher is running (0132).  Unblock
++	 * SweetCPU::startAll() only now: an SMP bring-up panic from here on
++	 * resets into boot=TWRP and its text is queued for the log tail.
++	 */
++	if (!sweet_emmc_ready) {
++		__atomic_store_n(&sweet_emmc_ready, 1, __ATOMIC_RELEASE);
++		printf("SWEET CPU: eMMC ready, SMP may start\n");
++	}
+ 	return 0;
+ 
+ fail:

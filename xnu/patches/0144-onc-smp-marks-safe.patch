@@ -1,0 +1,463 @@
+Revert the unsafe 0142 start.s instrumentation + safe secondary-only marks +
+IMEM fastboot restart reason.
+
+Regression: 0141-only boots (console visible, CPU1 timeout panic), while
+0142+0143 never reaches the console (white/shim screen) even with
+`sweetearlyreset=0`.  0142's SWEET_MARK/SWEET_STAGE writes were placed in
+reset_vector, start_cpu and common_start, which the BOOT CPU also executes
+(clobbering x10-x12 and touching the early V=P mapping); the boot path must
+stay byte-identical to the CI base.
+
+0144 (3 files):
+
+  osfmk/arm64/start.s
+    - all 0142 hunks reverted: outside `sweet_secondary_entry` this file is
+      byte-identical to the CI base (post-0141) again;
+    - minimal secondary-only marks inside `sweet_secondary_entry` (PSCI CPU_ON
+      entry - the boot CPU never executes it):
+        mark 1 / stage 0xE0  entry reached (x0 = context = logical cpu id)
+        mark 0x12 / stage 0xE2  firmware entered the secondary at EL2
+        mark 2 / stage 0xE3  EL1 path, just before b LowResetVectorBase
+      Register safety: no stack exists at PSCI CPU_ON entry, so nothing is
+      pushed via SP (stp x29,x30 is not possible); the macro uses only
+      x2/x3/x16/x17 (dead at this entry - SMCCC only defines x0), never
+      touches x0/x1 or x18-x30, saves x0 in x2 and restores it at every exit,
+      and computes the MMU-off physical address with the existing
+      PA(sym) = PC_pa + (sym_VA - entry_VA) trick.  `dsb sy` after each store.
+
+  iokit/Kernel/arm/SweetCPU.cpp
+    - unchanged (C marks 5/6/7 in initCPU and the panic/IOLog diagnostics that
+      print mark/stage/vec/init/sig are kept).
+
+  bsd/dev/onc_emmc.c
+    - `sweet_early_reset_install()` (0143) additionally writes the Qualcomm
+      IMEM restart reason 0x77665500 ("bootloader") at physical 0x0860065c
+      before arming the safety WDT, so an early panic reset goes to FASTBOOT
+      (host loop already handles that).  `sweetearlyfb=0` disables.
+      onc_emmc_init() clears the reason after a live boot passes the early
+      phase, so later resets (sweetrebootat) still land in TWRP;
+      banner "SWEET RESET: restart reason cleared (normal boot)".
+
+  osfmk/arm/arm_init.c
+    - kprintf markers around the 0143 call in arm_init():
+        "SWEET RESET: arm_init hook +" / "SWEET RESET: arm_init hook -"
+      The call stays right after PE_init_cpu(), which is after arm_vm_init()
+      (post-0141 arm_init.c line 544) and after PE_init_printf(FALSE) - see
+      plan.
+
+Expected console on a 0144 kernel:
+  SWEET RESET: arm_init hook +
+  SWEET RESET: early restart reason 0x77665500 (fastboot)
+  SWEET RESET: early hook install, safety WDT 120 s
+  SWEET WDT: armed bite in 3932160 ticks
+  SWEET WDT: bite (STS=0x...)
+  SWEET RESET: arm_init hook -
+  ... normal boot ...
+  SWEET HALT: PE_halt_restart already hooked early
+  SWEET WDT: safety WDT disarmed (STS=0x...)
+  SWEET RESET: restart reason cleared (normal boot)
+and a panic before onc_emmc_init now resets into fastboot (reason 0x77665500
+is still set), while a panic after it resets normally (reason cleared).
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -36,44 +36,6 @@
+ #include <arm64/tunables/tunables.s>
+ #include <arm64/exception_asm.h>
+ 
+-/*
+- * 0142: secondary-CPU progress marks, usable with the MMU OFF.
+- *
+- * The progress variables live in kernel BSS, addressable only through the KVA
+- * once the MMU is on.  The early entry path runs with the MMU off, so derive
+- * the physical address from the PC: the image is linked V=P, hence
+- *     PA(sym) = PC_pa + (sym_VA - entry_VA)
+- * (no absolute constants, works for every link address).
+- * Clobbers x10, x11, x12; \index is read before x10-x12 are touched.
+- */
+-.macro SWEET_MARK mark, index
+-	adr	x10, .
+-	adrp	x11, EXT(sweet_secondary_marks)@page
+-	add	x11, x11, EXT(sweet_secondary_marks)@pageoff
+-	adrp	x12, EXT(sweet_secondary_entry)@page
+-	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
+-	sub	x11, x11, x12
+-	add	x10, x10, x11
+-	MOV64	x11, \mark
+-	str	x11, [x10, \index, lsl #3]
+-	dsb	sy
+-.endm
+-
+-/* Last stage reached by any secondary (single slot, MMU-off safe). */
+-.macro SWEET_STAGE stage
+-	adr	x10, .
+-	adrp	x11, EXT(sweet_smp_stage)@page
+-	add	x11, x11, EXT(sweet_smp_stage)@pageoff
+-	adrp	x12, EXT(sweet_secondary_entry)@page
+-	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
+-	sub	x11, x11, x12
+-	add	x10, x10, x11
+-	MOV64	x11, \stage
+-	str	x11, [x10]
+-	dsb	sy
+-.endm
+-
+-
+ #if __ARM_KERNEL_PROTECT__
+ #include <arm/pmap.h>
+ #endif /* __ARM_KERNEL_PROTECT__ */
+@@ -151,34 +113,14 @@
+ 	b		EXT(reset_vector)
+ 
+ 	/* EL1 SP1: These vectors trap errors during early startup on non-boot CPUs. */
+-#if defined(SWEET) && defined(ONC_SWEET_4K)
+-	/*
+-	 * 0142: an early fault on a secondary used to spin silently here.  Record
+-	 * which vector was taken in sweet_smp_vector_hit (MMU-off safe write)
+-	 * before spinning, so the timeout panic shows it.
+-	 */
+ 	.align	9
+-	MOV64	x9, 0xF1
+-	b	Lsweet_vec_hit
+-	.align	7
+-	MOV64	x9, 0xF2
+-	b	Lsweet_vec_hit
+-	.align	7
+-	MOV64	x9, 0xF3
+-	b	Lsweet_vec_hit
+-	.align	7
+-	MOV64	x9, 0xF4
+-	b	Lsweet_vec_hit
+-#else
+-	.align	9
+-	b		.
+-	.align	7
+-	b		.
+-	.align	7
+-	b		.
+-	.align	7
+-	b		.
+-#endif
++	b		.
++	.align	7
++	b		.
++	.align	7
++	b		.
++	.align	7
++	b		.
+ 
+ 	.align	7
+ 	.globl EXT(reset_vector)
+@@ -201,21 +143,6 @@
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if defined(SWEET) && defined(ONC_SWEET_4K)
+-	/*
+-	 * 0142: mark 3 - reset_vector reached on a secondary (x0 was clobbered by
+-	 * the VBAR setup above).  Index the per-CPU array from MPIDR using the
+-	 * Qualcomm layout: idx = (Aff1 & 0xff) * 4 + (Aff0 & 3).
+-	 */
+-	and	x13, x15, #0xff
+-	ubfx	x12, x15, #8, #8
+-	add	x13, x13, x12, lsl #2
+-	cmp	x13, #8
+-	b.hs	9f
+-	SWEET_MARK 3, x13
+-9:
+-	SWEET_STAGE 0xE4
+-#endif
+ #if HAS_CLUSTER || defined(SWEET)
+ 	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
+ #else
+@@ -235,7 +162,6 @@
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
+-	SWEET_STAGE 0xE5
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -265,10 +191,8 @@
+ 	msr		TPIDR_EL1, x13
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
+-	SWEET_STAGE 0xE7
+ 	blr		x0
+ Lskip_cpu_reset_handler:
+-	SWEET_STAGE 0xE6
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -356,6 +280,51 @@
+ 
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ #if defined(SWEET)
++/*
++ * 0144: secondary-only progress marks.
++ *
++ * This function runs ONLY on PSCI CPU_ON (secondaries); the boot CPU takes
++ * _start -> start_first_cpu and never executes anything here, so the
++ * boot-CPU path is byte-identical to the CI base again (0142's marks in
++ * reset_vector/start_cpu/common_start are reverted by this patch).
++ *
++ * A PSCI CPU_ON entry has no stack (SMCCC only defines x0 = context_id), so
++ * nothing is pushed via SP.  Only x2/x3/x16/x17 are used; all of them are
++ * dead at this entry (caller-saved / intra-procedure scratch, and this is the
++ * first code to run).  x0 (context id) is saved in x2 and restored at the end
++ * of every mark; x0/x1 and x18-x30 are never touched.
++ *
++ * MMU is off: PA(sym) = PC_pa + (sym_VA - entry_VA) (image linked V=P).
++ */
++.macro SWEET_ENTRY_MARK mark, stage
++	mov	x2, x0
++	cmp	x2, #8
++	b.hs	9f
++	/* per-cpu mark: sweet_secondary_marks[context] = mark */
++	adr	x3, .
++	adrp	x16, EXT(sweet_secondary_marks)@page
++	add	x16, x16, EXT(sweet_secondary_marks)@pageoff
++	adrp	x17, EXT(sweet_secondary_entry)@page
++	add	x17, x17, EXT(sweet_secondary_entry)@pageoff
++	sub	x17, x16, x17
++	add	x16, x3, x17
++	MOV64	x17, \mark
++	str	x17, [x16, x2, lsl #3]
++	dsb	sy
++	/* single global stage slot: sweet_smp_stage = stage */
++	adr	x3, .
++	adrp	x16, EXT(sweet_smp_stage)@page
++	add	x16, x16, EXT(sweet_smp_stage)@pageoff
++	adrp	x17, EXT(sweet_secondary_entry)@page
++	add	x17, x17, EXT(sweet_secondary_entry)@pageoff
++	sub	x17, x16, x17
++	add	x16, x3, x17
++	MOV64	x17, \stage
++	str	x17, [x16]
++	dsb	sy
++9:
++	mov	x0, x2
++.endm
+ 
+ /* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
+  * Keep this separate from __start (which requires x0=boot_args PA).
+@@ -365,24 +334,16 @@
+ 	.align 2
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+-	/* 0142: mark 1 - entry reached.  x0 = PSCI context (logical cpu id). */
+-	cmp	x0, #8
+-	b.hs	1f
+-	SWEET_MARK 1, x0
+-1:
+-	SWEET_STAGE 0xE0
++	/* 0144: mark 1 - entry reached (x0 = PSCI context = logical cpu id). */
++	SWEET_ENTRY_MARK 1, 0xE0
+ 	msr		DAIFSet, #0xf
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+ 	cmp		x1, #0x8
+ 	b.ne	Lsweet_secondary_bad_el
+-	/* 0142: 0x12 - firmware entered the secondary at EL2. */
+-	cmp	x0, #8
+-	b.hs	1f
+-	SWEET_MARK 0x12, x0
+-1:
+-	SWEET_STAGE 0xE2
++	/* 0144: mark 0x12 - firmware entered the secondary at EL2. */
++	SWEET_ENTRY_MARK 0x12, 0xE2
+ 	adrp	x1, EXT(LowExceptionVectorBase)@page
+ 	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
+ 	msr		VBAR_EL2, x1
+@@ -419,39 +380,14 @@
+ 	msr		SPSR_EL2, x1
+ 	eret
+ Lsweet_secondary_bad_el:
+-	SWEET_STAGE 0xEF
+ 	b		.
+ Lsweet_secondary_el1:
+-	/* 0142: mark 2 - EL1 path, about to enter LowResetVectorBase. */
+-	cmp	x0, #8
+-	b.hs	1f
+-	SWEET_MARK 2, x0
+-1:
+-	SWEET_STAGE 0xE3
++	/* 0144: mark 2 - EL1 path, about to enter LowResetVectorBase. */
++	SWEET_ENTRY_MARK 2, 0xE3
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
+-
+-#if defined(SWEET) && defined(ONC_SWEET_4K)
+-/*
+- * 0142: common lander for the four early-vector stubs above.  x9 holds the
+- * vector code; write it to sweet_smp_vector_hit using the PC-derived physical
+- * address (the MMU may still be off), then spin.
+- */
+-Lsweet_vec_hit:
+-	adr	x10, .
+-	adrp	x11, EXT(sweet_smp_vector_hit)@page
+-	add	x11, x11, EXT(sweet_smp_vector_hit)@pageoff
+-	adrp	x12, EXT(sweet_secondary_entry)@page
+-	add	x12, x12, EXT(sweet_secondary_entry)@pageoff
+-	sub	x11, x11, x12
+-	add	x10, x10, x11
+-	str	x9, [x10]
+-	dsb	sy
+-9:	b	9b
+-#endif
+-
+ 
+ 	.align 2
+ 	.globl EXT(resume_idle_cpu)
+@@ -519,18 +455,6 @@
+ 	add		lr, lr, x22
+ 	sub		lr, lr, x23
+ 
+-#if defined(SWEET) && defined(ONC_SWEET_4K)
+-	/* 0142: mark 4 - start_cpu done (stacks/TPIDR set), before common_start. */
+-	mrs	x15, MPIDR_EL1
+-	and	x13, x15, #0xff
+-	ubfx	x12, x15, #8, #8
+-	add	x13, x13, x12, lsl #2
+-	cmp	x13, #8
+-	b.hs	9f
+-	SWEET_MARK 4, x13
+-9:
+-	SWEET_STAGE 0xE8
+-#endif
+ 	b		common_start
+ 
+ /*
+@@ -913,7 +837,6 @@
+  *	TPIDRRO_EL0 - CPU number
+  */
+ common_start:
+-	SWEET_STAGE 0xEA
+ 
+ #if HAS_NEX_PG
+ 	mov x19, lr
+@@ -947,7 +870,6 @@
+ 	mov		x19, lr
+ 	bl		EXT(set_mmu_ttb)
+ 	mov		lr, x19
+-	SWEET_STAGE 0xEB
+ 
+ #if defined(SWEET)
+ 	MOV64	x9, 0xBFEE0000
+@@ -1064,11 +986,9 @@
+ 	str	x8, [x9]
+ 	dsb	sy
+ #endif
+-	SWEET_STAGE 0xEC
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+-	SWEET_STAGE 0xED
+ 
+ #if defined(SWEET)
+ 	MOV64	x9, 0xBFEE0000
+@@ -1196,7 +1116,6 @@
+ 	bl		EXT(phystokv)
+ 
+ 	mov		lr, x19
+-	SWEET_STAGE 0xEE
+ 
+ 	/* Return to arm_init() */
+ 	ret
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -656,7 +656,9 @@
+ 		 */
+ 		extern void sweet_early_reset_install(void);
+ 
++		kprintf("SWEET RESET: arm_init hook +\n");
+ 		sweet_early_reset_install();
++		kprintf("SWEET RESET: arm_init hook -\n");
+ 	}
+ #endif
+ 	fiq_context_init(TRUE);
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -2523,16 +2523,53 @@
+  */
+ #define SWEET_EARLY_WDT_SECS 120u
+ 
++/*
++ * 0144: IMEM restart reason.  An early panic reset should land in the
++ * bootloader (fastboot) instead of the recovery/normal chain, so the host
++ * loop can start the next cycle from fastboot without the shim having to
++ * clear the Android BCB on a failing boot.  onc: IMEM restart_reason is at
++ * physical 0x0860065c, value 0x77665500 = "bootloader" (same constants as
++ * xnuios/shim-onc/shim.c).  `sweetearlyfb=0` disables it.
++ */
++#define SWEET_IMEM_PHYS                0x08600000u
++#define SWEET_IMEM_SIZE                0x1000u
++#define SWEET_IMEM_RESTART_REASON      0x65cu
++#define SWEET_RESTART_REASON_BOOTLOADER 0x77665500u
++
++static vm_offset_t sweet_imem_base;
++static int sweet_early_fb_set;
++
++static int
++sweet_restart_reason(uint32_t value)
++{
++	if (sweet_imem_base == 0) {
++		sweet_imem_base = ml_io_map(SWEET_IMEM_PHYS, SWEET_IMEM_SIZE);
++	}
++	if (sweet_imem_base == 0) {
++		printf("SWEET RESET: IMEM 0x%x not mappable\n", SWEET_IMEM_PHYS);
++		return -1;
++	}
++	oe_wr(sweet_imem_base, SWEET_IMEM_RESTART_REASON, value);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
+ void
+ sweet_early_reset_install(void)
+ {
+ 	uint32_t on = 1;
+ 	uint32_t secs = 0;
++	uint32_t earlyfb = 1;
+ 	uint32_t ticks;
+ 
+ 	if (PE_parse_boot_argn("sweetearlyreset", &on, sizeof(on)) && on == 0) {
+ 		printf("SWEET RESET: early hook disabled (sweetearlyreset=0)\n");
+ 		return;
++	}
++	if (PE_parse_boot_argn("sweetearlyfb", &earlyfb, sizeof(earlyfb)) &&
++	    earlyfb == 0) {
++		printf("SWEET RESET: early fastboot reason disabled (sweetearlyfb=0)\n");
++		earlyfb = 0;
+ 	}
+ 	if (PE_parse_boot_argn("sweetearlywdts", &secs, sizeof(secs)) &&
+ 	    secs != 0) {
+@@ -2543,6 +2580,13 @@
+ 		secs = SWEET_EARLY_WDT_SECS;
+ 	}
+ 	ticks = secs * 32768u;
++	if (earlyfb != 0) {
++		if (sweet_restart_reason(SWEET_RESTART_REASON_BOOTLOADER) == 0) {
++			sweet_early_fb_set = 1;
++			printf("SWEET RESET: early restart reason 0x%x (fastboot)\n",
++			    SWEET_RESTART_REASON_BOOTLOADER);
++		}
++	}
+ 	printf("SWEET RESET: early hook install, safety WDT %u s\n", secs);
+ 	if (sweet_wdt_get() == 0) {
+ 		printf("SWEET RESET: WDT not mappable yet, hook only\n");
+@@ -2729,6 +2773,12 @@
+ 	}
+ #if defined(ONC_SWEET_4K)
+ 	sweet_wdt_disarm();
++	if (sweet_early_fb_set) {
++		if (sweet_restart_reason(0) == 0) {
++			sweet_early_fb_set = 0;
++			printf("SWEET RESET: restart reason cleared (normal boot)\n");
++		}
++	}
+ #endif
+ 
+ 	/* Clear the Android BCB now so the NEXT reset boots boot=TWRP. */

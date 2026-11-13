@@ -1,0 +1,398 @@
+Fix the panic-dump tail write (LBA 0 / EIO) + halt delay + halt summary.
+
+0147's panic dump failed on hardware:
+  ONC EMMC: root "userdata" ... 52919 MiB
+  ONC EMMC: wr_fall lba=0 ...            (write at LBA 0)
+  SWEET PANICDUMP: header write failed rc=-5
+The header was never written, so TWRP kept decoding the previous boot's stale
+ring.  The card init and PIO writes themselves are fine (0146's early BCB clear
+works), so only the panic-dump base computation/validation is wrong.
+
+0148:
+  bsd/dev/onc_emmc.c
+    - sweet_early_card_init(int force): the panic path forces a fresh
+      reprogram of controller+card (takeover, CMD0/1/2/3/9/7/8) instead of
+      trusting the state left by 0146/onc_emmc_init; a stale card/controller
+      state is one plausible cause of the first write timing out.  The 0146
+      BCB path keeps the non-forced call.
+    - sweet_panic_log_dump() rewritten:
+        * always re-runs the GPT scan, copies userdata first_lba/nblocks into
+          locals and validates them: first >= 2, nblocks > 2*area,
+          first+nblocks-1 <= sec_count (when known), first and base fit in
+          32 bits (SDHCI CMD24 block address), and
+          base = first + nblocks - SWEET_EMMC_LOG_LBAS (4100 KiB = 8200 x
+          512-byte LBAs) is >= 2.  Any violation prints the exact numbers and
+          returns without touching the card;
+        * prints userdata first= / blocks= / base= / total= / sec_count=
+          before writing, and stage+lba+rc on every failure;
+        * writes the RING blocks first, the HEADER last, so a partial failure
+          cannot leave a header pointing at stale ring data;
+        * same 0132 layout/decoder compatibility, newest
+          `sweetpanicdumpkb` KiB (default 32), `sweetpanicdump=0` disables;
+        * failure-tolerant (prints and returns; reset continues).
+    - sweet_pe_halt_restart():
+        * `sweethaltms=<N>` (default 250 ms, clamped 0..10000) between the
+          SWEET HALT line and the dump, printed for the camera;
+        * after the dump, one compact summary line
+          `SWEET HALT: summary cpu= target= entry= rc= mark= stage= init= sig=`
+          from the 0147 globals (+ new originals), or "n/a" when the panic is
+          not the SMP timeout.
+  iokit/Kernel/arm/SweetCPU.cpp
+    - new C-linkage globals sweet_smp_last_cpu/init/sig; cpu = -1 until the
+      5 s timeout sets them right before panicking, so the halt summary can
+      always print the SMP state.
+
+Expected on the next panic (with sweethaltms=2000):
+  SWEET HALT: type=... -> WDT reset
+  SWEET HALT: delaying 2000 ms before panic dump
+  SWEET PANICDUMP: userdata first=0x... blocks=0x... base=0x... total=...
+  SWEET PANICDUMP: wrote ... (ring N blocks + header last) -> lba 0x... seq=...
+  SWEET HALT: summary cpu=1 target=0x1 entry=0x... rc=0 mark=... stage=... init=0 sig=0
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -263,6 +263,15 @@
+ void sweet_early_reset_install(void);
+ /* 0147: panic-time console-ring dump via the early raw-eMMC path. */
+ void sweet_panic_log_dump(void);
++/* 0148: SMP failure summary for the halt hook (defined in SweetCPU.cpp). */
++extern volatile int32_t sweet_smp_last_cpu;
++extern volatile uint64_t sweet_smp_last_init;
++extern volatile uint64_t sweet_smp_last_sig;
++extern volatile uint64_t sweet_psci_last_target;
++extern volatile uint64_t sweet_psci_last_entry;
++extern volatile int32_t sweet_psci_last_rc;
++extern volatile uint64_t sweet_secondary_marks[8];
++extern volatile uint64_t sweet_smp_stage;
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2488,13 +2497,59 @@
+ {
+ 	printf("SWEET HALT: type=%u -> WDT reset\n", type);
+ #if defined(ONC_SWEET_4K)
++	{
++		uint32_t haltms = 250;
++
++		/* 0148: hold the panic screen long enough for the camera. */
++		if (PE_parse_boot_argn("sweethaltms", &haltms, sizeof(haltms))) {
++			if (haltms > 10000) {
++				haltms = 10000;
++			}
++		} else {
++			haltms = 250;
++		}
++		if (haltms != 0) {
++			printf("SWEET HALT: delaying %u ms before panic dump\n",
++			    haltms);
++			delay((uint64_t)haltms * 1000);
++		}
++	}
+ 	/*
+-	 * 0147: persist the console ring (which already contains the panic text)
+-	 * to the userdata log tail before resetting, so the TWRP loop can read
+-	 * the full panic even when it happened before the SWEETLOG flusher
+-	 * started.  Bounded and failure-tolerant.
++	 * 0147/0148: persist the console ring (which already contains the panic
++	 * text) to the userdata log tail before resetting.  Ring blocks first,
++	 * header last; bounded and failure-tolerant.
+ 	 */
+ 	sweet_panic_log_dump();
++	{
++		/* 0148: one photo of the last line always shows the SMP failure
++		 * (target/entry/rc from startCPU(), mark/stage from the 0144
++		 * instrumentation). */
++		int32_t scpu = __atomic_load_n(&sweet_smp_last_cpu,
++		    __ATOMIC_ACQUIRE);
++
++		if (scpu >= 0 && scpu < 8) {
++			printf("SWEET HALT: summary cpu=%d target=0x%llx "
++			    "entry=0x%llx rc=%d mark=0x%llx stage=0x%llx "
++			    "init=%llu sig=%llu\n", (int)scpu,
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_psci_last_target, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_psci_last_entry, __ATOMIC_ACQUIRE),
++			    (int)__atomic_load_n(&sweet_psci_last_rc,
++			    __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_secondary_marks[scpu], __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_smp_stage, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_smp_last_init, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_smp_last_sig, __ATOMIC_ACQUIRE));
++		} else {
++			printf("SWEET HALT: summary n/a (panic is not the "
++			    "SMP timeout)\n");
++		}
++	}
+ #endif
+ 	sweet_reset_fallback();
+ 	for (;;) {
+@@ -2638,7 +2693,7 @@
+  * no CMD6/HS, no PLL.
+  */
+ static int
+-sweet_early_card_init(void)
++sweet_early_card_init(int force)
+ {
+ 	uint32_t resp[4] = { 0, 0, 0, 0 };
+ 	uint32_t ist = 0;
+@@ -2646,7 +2701,7 @@
+ 	uint32_t i;
+ 	int rc = 0;
+ 
+-	if (oe.hc != 0 && oe.rca != 0) {
++	if (!force && oe.hc != 0 && oe.rca != 0) {
+ 		return 0;	/* already initialised (0146 or onc_emmc_init()) */
+ 	}
+ 	if (oe.hc == 0) {
+@@ -2768,7 +2823,7 @@
+ 		    "BCB not cleared\n");
+ 		return;
+ 	}
+-	rc = sweet_early_card_init();
++	rc = sweet_early_card_init(0);
+ 	if (rc != 0) {
+ 		printf("SWEET EARLYMISC: eMMC init failed rc=%d\n", rc);
+ 		return;
+@@ -2808,6 +2863,21 @@
+  * 400 kHz legacy link this is roughly 0.8 s.  Never panics/hangs; any failure
+  * prints a reason and returns so the reset still happens.
+  */
++/*
++ * 0147/0148: write the console ring to the userdata log tail, in exactly the
++ * layout the 0132 flusher uses (tools/sweet-log.py decodes it unchanged).
++ * Called from the 0144 halt hook before the reset.
++ *
++ * 0148 fixes the first-flight failure (write at LBA 0, EIO): the panic path
++ * now forces a fresh card re-init, takes local copies of the userdata GPT
++ * geometry and hard-validates it before computing
++ *   base = userdata_first + userdata_nblocks - 8200   (4100 KiB of 512B LBAs)
++ * (32-bit CMD24 block address, >= 2, inside the card).  The ring blocks are
++ * written first and the header LAST, so a partial failure can never advertise
++ * a header with stale ring data.  Every failure prints stage + lba + rc.
++ * Bounded (default 32 KiB + 4 KiB header ~0.8 s at 400 kHz) and best effort:
++ * it never panics or hangs; the reset always continues.
++ */
+ void
+ sweet_panic_log_dump(void)
+ {
+@@ -2815,6 +2885,9 @@
+ 	static uint8_t blk[SWEET_EMMC_LOG_BLKSIZE];
+ 	static uint8_t oldhdr[OE_BLOCK_SIZE];
+ 	struct sweet_emmc_log_header h;
++	uint64_t first;
++	uint64_t nblk;
++	uint64_t area;
+ 	uint64_t base;
+ 	uint64_t total;
+ 	uint64_t start_abs;
+@@ -2830,28 +2903,60 @@
+ 		printf("SWEET PANICDUMP: disabled (sweetpanicdump=0)\n");
+ 		return;
+ 	}
+-	rc = sweet_early_card_init();
++
++	/* 0148: force a fresh controller/card program in the panic path.  The
++	 * normal driver may have left a state where the first write times out. */
++	rc = sweet_early_card_init(1);
+ 	if (rc != 0) {
+-		printf("SWEET PANICDUMP: eMMC init failed rc=%d\n", rc);
++		printf("SWEET PANICDUMP: eMMC init failed rc=%d (stage=init)\n", rc);
+ 		return;
+ 	}
+-	/* Always (re)scan so oe.first_lba/nblocks point at userdata, whatever
+-	 * partition the normal root selection used.  A few single-block reads. */
+ 	rc = oe_gpt_scan("userdata");
+ 	if (rc != 0) {
+-		printf("SWEET PANICDUMP: GPT scan failed rc=%d\n", rc);
++		printf("SWEET PANICDUMP: GPT scan failed rc=%d (stage=gpt)\n", rc);
+ 		return;
+ 	}
+-	if (oe.nblocks <= 2 * SWEET_EMMC_LOG_LBAS) {
+-		printf("SWEET PANICDUMP: userdata too small for the log tail\n");
++
++	first = oe.first_lba;
++	nblk = oe.nblocks;
++	area = SWEET_EMMC_LOG_LBAS;	/* 4100 KiB = 8200 x 512-byte LBAs */
++	total = sweet_log_position();
++	printf("SWEET PANICDUMP: userdata first=0x%llx blocks=0x%llx "
++	    "sec_count=0x%llx area=0x%llx total=%llu\n",
++	    (unsigned long long)first, (unsigned long long)nblk,
++	    (unsigned long long)oe.sec_count, (unsigned long long)area,
++	    (unsigned long long)total);
++
++	if (first < 2 || nblk <= 2 * area || nblk < area) {
++		printf("SWEET PANICDUMP: invalid userdata geometry "
++		    "(first=0x%llx blocks=0x%llx), refusing\n",
++		    (unsigned long long)first, (unsigned long long)nblk);
+ 		return;
+ 	}
+-	base = oe.first_lba + oe.nblocks - SWEET_EMMC_LOG_LBAS;
+-	total = sweet_log_position();
++	if (oe.sec_count >= 2 &&
++	    first + nblk - 1 > (uint64_t)oe.sec_count) {
++		printf("SWEET PANICDUMP: userdata past end of card "
++		    "(last=0x%llx sec_count=0x%llx), refusing\n",
++		    (unsigned long long)(first + nblk - 1),
++		    (unsigned long long)oe.sec_count);
++		return;
++	}
++	base = first + nblk - area;
++	if (base < 2 || base > 0xFFFFFFFFull) {
++		printf("SWEET PANICDUMP: computed base 0x%llx is not a valid "
++		    "32-bit LBA (first=0x%llx blocks=0x%llx area=0x%llx), "
++		    "refusing\n", (unsigned long long)base,
++		    (unsigned long long)first, (unsigned long long)nblk,
++		    (unsigned long long)area);
++		return;
++	}
+ 	if (total == 0) {
+ 		printf("SWEET PANICDUMP: console ring is empty\n");
+ 		return;
+ 	}
++	printf("SWEET PANICDUMP: base=0x%llx (last 4100 KiB of userdata), "
++	    "total=%llu\n", (unsigned long long)base,
++	    (unsigned long long)total);
+ 
+ 	if (PE_parse_boot_argn("sweetpanicdumpkb", &kb, sizeof(kb)) &&
+ 	    kb >= 4) {
+@@ -2898,6 +3003,40 @@
+ 		}
+ 	}
+ 
++	/* Ring blocks FIRST (the header is written last). */
++	for (i = 0; i < nblocks; i++) {
++		uint64_t abs = start_abs + (uint64_t)i * SWEET_EMMC_LOG_BLKSIZE;
++		uint64_t pos = abs;
++		uint32_t got;
++		uint32_t ring_blk;
++		uint64_t out_lba;
++
++		memset(blk, 0, sizeof(blk));
++		got = sweet_log_copy(&pos, (char *)blk,
++		    SWEET_EMMC_LOG_BLKSIZE);
++		if (got == 0) {
++			printf("SWEET PANICDUMP: ring block %u empty "
++			    "(abs=0x%llx), skipping\n", i,
++			    (unsigned long long)abs);
++			continue;
++		}
++		ring_blk = (uint32_t)((abs / SWEET_EMMC_LOG_BLKSIZE) %
++		    (SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE));
++		out_lba = base + (uint64_t)(1 + ring_blk) *
++		    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
++		for (j = 0; j < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; j++) {
++			rc = oe_write_lba(out_lba + j,
++			    blk + (uint64_t)j * OE_BLOCK_SIZE);
++			if (rc != 0) {
++				printf("SWEET PANICDUMP: ring write failed "
++				    "stage=ring lba=0x%llx rc=%d\n",
++				    (unsigned long long)(out_lba + j), rc);
++				return;
++			}
++		}
++	}
++
++	/* Header LAST. */
+ 	memset(hdr, 0, sizeof(hdr));
+ 	memset(&h, 0, sizeof(h));
+ 	memcpy(h.magic, "SWEETLOG", 8);
+@@ -2909,42 +3048,16 @@
+ 	for (i = 0; i < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; i++) {
+ 		rc = oe_write_lba(base + i, hdr + (uint64_t)i * OE_BLOCK_SIZE);
+ 		if (rc != 0) {
+-			printf("SWEET PANICDUMP: header write failed rc=%d\n", rc);
++			printf("SWEET PANICDUMP: header write failed "
++			    "stage=header lba=0x%llx rc=%d\n",
++			    (unsigned long long)(base + i), rc);
+ 			return;
+ 		}
+ 	}
+-
+-	for (i = 0; i < nblocks; i++) {
+-		uint64_t abs = start_abs + (uint64_t)i * SWEET_EMMC_LOG_BLKSIZE;
+-		uint64_t pos = abs;
+-		uint32_t got;
+-		uint32_t ring_blk;
+-		uint64_t out_lba;
+-
+-		memset(blk, 0, sizeof(blk));
+-		got = sweet_log_copy(&pos, (char *)blk,
+-		    SWEET_EMMC_LOG_BLKSIZE);
+-		if (got == 0) {
+-			continue;
+-		}
+-		ring_blk = (uint32_t)((abs / SWEET_EMMC_LOG_BLKSIZE) %
+-		    (SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE));
+-		out_lba = base + (uint64_t)(1 + ring_blk) *
+-		    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
+-		for (j = 0; j < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; j++) {
+-			rc = oe_write_lba(out_lba + j,
+-			    blk + (uint64_t)j * OE_BLOCK_SIZE);
+-			if (rc != 0) {
+-				printf("SWEET PANICDUMP: ring write failed "
+-				    "block 0x%llx rc=%d\n", out_lba + j, rc);
+-				return;
+-			}
+-		}
+-	}
+-	printf("SWEET PANICDUMP: wrote %u bytes (header + %u ring blocks) "
+-	    "-> block 0x%llx seq=%llu total=%llu\n",
+-	    (SWEET_EMMC_LOG_BLKSIZE +
+-	    nblocks * SWEET_EMMC_LOG_BLKSIZE), nblocks, base,
++	printf("SWEET PANICDUMP: wrote %u bytes (ring %u blocks + header last) "
++	    "-> lba 0x%llx seq=%llu total=%llu\n",
++	    (SWEET_EMMC_LOG_BLKSIZE + nblocks * SWEET_EMMC_LOG_BLKSIZE),
++	    nblocks, (unsigned long long)base,
+ 	    (unsigned long long)seq, (unsigned long long)total);
+ }
+ #endif /* ONC_SWEET_4K */
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -58,6 +58,16 @@
+ volatile uint64_t sweet_psci_last_target;
+ volatile uint64_t sweet_psci_last_entry;
+ volatile int32_t sweet_psci_last_rc;
++}
++
++/*
++ * 0148: last SMP timeout state, so the halt hook's summary line can print it
++ * from the panic path (cpu = -1 until the 5 s timeout sets it).
++ */
++extern "C" {
++volatile int32_t sweet_smp_last_cpu = -1;
++volatile uint64_t sweet_smp_last_init;
++volatile uint64_t sweet_smp_last_sig;
+ }
+ 
+ static inline void
+@@ -236,6 +246,10 @@
+ 	IOLog("SWEET CPU: startAll entered (registered=%u/%u boot_mpidr=0x%x)\n",
+ 	    __atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE),
+ 	    topology->num_cpus, topology->boot_cpu->phys_id);
++	/* 0148: no SMP failure recorded yet. */
++	__atomic_store_n(&sweet_smp_last_cpu, -1, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_smp_last_init, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_smp_last_sig, 0, __ATOMIC_RELEASE);
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -300,6 +314,15 @@
+ 				uint64_t vec = __atomic_load_n(
+ 				    &sweet_smp_vector_hit, __ATOMIC_ACQUIRE);
+ 				uint64_t delta = mach_absolute_time() - onc_start_time;
++				/* 0148: remember the SMP failure for the halt summary. */
++				__atomic_store_n(&sweet_smp_last_cpu, (int32_t)i,
++				    __ATOMIC_RELEASE);
++				__atomic_store_n(&sweet_smp_last_init,
++				    (uint64_t)(__atomic_load_n(&cpu->initialized,
++				    __ATOMIC_ACQUIRE) != 0), __ATOMIC_RELEASE);
++				__atomic_store_n(&sweet_smp_last_sig,
++				    (uint64_t)sweet_cpu_signal_is_enabled(i),
++				    __ATOMIC_RELEASE);
+ 				/* 0147: self-contained PSCI parameters. */
+ 				uint64_t psci_target = __atomic_load_n(
+ 				    &sweet_psci_last_target, __ATOMIC_ACQUIRE);

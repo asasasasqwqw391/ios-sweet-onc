@@ -1,0 +1,229 @@
+Clear the Android BCB from the kernel very early (arm_init, raw SDHCI).
+
+A CPU-bring-up panic happens before onc_emmc_init(), which is where 0133 clears
+the Android BCB, so the reset lands in the recovery partition (iOS image) - a
+recovery loop with no adb/log.  The shim-based BCB clear is unreliable on this
+device and 0145's eMMC SMP gate deadlocked, so 0146 clears the BCB directly
+from the kernel, at arm_init(), before IOKit/BSD/SMP.
+
+  bsd/dev/onc_emmc.c
+    - new global `sweet_early_misc_clear()` (ONC builds), reusing the already
+      proven, lock-free low-level helpers in this file (no IOKit/threads/
+      bdevsw/locks): ml_io_map + busy-loop delays + SDHCI PIO.
+      Flow: GCC sdcc1_apps 400 kHz from XO -> core_mem HC_MODE/PWRCTL ->
+      SDHCI reset/power -> CMD0/CMD1(poll OCR)/CMD2/CMD3/CMD9/CMD7 ->
+      CMD8 EXT_CSD (legacy 400 kHz 1-bit, no CMD6/HS) -> oe_gpt_scan()
+      (records the "misc" partition, CRC-checked) -> 4096 zero bytes
+      (8 x 512 B) at misc's first LBA using oe_write_lba().
+      Success: `SWEET EARLYMISC: cleared BCB at block 0x...`.
+      Failure: a precise reason, then boot continues (no panic/hang).
+      `sweetearlymisc=0` disables; needs `emmcroot_orw=1` like 0133.
+      The later onc_emmc_init()/0133 path is unchanged and clears again
+      idempotently.
+
+  osfmk/arm/arm_init.c
+    - call it right after sweet_early_reset_install() inside the existing
+      0143/0144 ONC block (VM/console up, before machine_startup/IOKit);
+      0144's `SWEET RESET: arm_init hook +/-` markers are kept.
+
+0145 deadlock analysis (no gate is re-added here): the hang at
+`SWEET CPU: gated on eMMC init` is consistent with (a) mach_absolute_time()
+not advancing early enough for nanoseconds_to_deadline() to expire (rtclock is
+initialised later; 0106 had replaced early IOSleep waits for this class of
+problem) and (b) the busy-spin startAll thread starving the BSD-init thread
+that would call onc_emmc_init().  Together the flag never becomes 1 and the
+deadline never fires; only the 120 s safety WDT ends the boot.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -2613,6 +2613,172 @@
+ 	printf("SWEET WDT: safety WDT disarmed (STS=0x%x)\n",
+ 	    oe_rd(wdt, SWEET_WDT_STS));
+ }
++
++/*
++ * 0146: very early Android-BCB clear.
++ *
++ * Called from arm_init() right after sweet_early_reset_install(), i.e. after
++ * arm_vm_init() (ml_io_map works) and PE_init_printf() (printf works), but
++ * before machine_startup()/IOKit and before SweetCPU::startAll().  A panic in
++ * the CPU bring-up therefore already has the Android BCB cleared and resets
++ * into boot=TWRP.
++ *
++ * Self-contained early path: no IOKit, no threads, no bdevsw, no locks.  It
++ * reuses only the lock-free low-level helpers defined above in this file
++ * (oe_gcc_clock_init/oe_core_init/oe_sdhci_takeover/oe_issue16/oe_issue/
++ * oe_pio_read/oe_read_lba/oe_write_lba/oe_gpt_scan), with ml_io_map for the
++ * register windows and busy-loop delays.  The card is left in the same
++ * 400 kHz legacy / 1-bit mode that 0133 and the shim probe use for writes;
++ * no CMD6/HS switch is attempted, so no PLL is needed.
++ *
++ * Failure is never fatal: it prints a reason and returns; the normal
++ * onc_emmc_init() path (and its 0133 BCB clear) still runs later.
++ */
++void
++sweet_early_misc_clear(void)
++{
++	uint8_t zero[OE_BLOCK_SIZE];
++	uint32_t resp[4] = { 0, 0, 0, 0 };
++	uint32_t ist = 0;
++	uint32_t ocr = 0;
++	uint32_t on = 1;
++	uint32_t orw = 0;
++	uint32_t i;
++	int rc;
++	bool ok = false;
++
++	if (PE_parse_boot_argn("sweetearlymisc", &on, sizeof(on)) && on == 0) {
++		printf("SWEET EARLYMISC: disabled (sweetearlymisc=0)\n");
++		return;
++	}
++	if (!PE_parse_boot_argn("emmcroot_orw", &orw, sizeof(orw)) || orw == 0) {
++		printf("SWEET EARLYMISC: emmcroot_orw=0 (read-only), BCB not cleared\n");
++		return;
++	}
++	if (oe.hc != 0) {
++		printf("SWEET EARLYMISC: eMMC already mapped, skipped\n");
++		return;
++	}
++
++	oe.writable = true;
++	oe.secsize = OE_BLOCK_SIZE;
++	oe.kick_always = true;	/* probe-style kick for the few commands below */
++	oe.hc = ml_io_map(OE_SDCC_HC_PHYS, OE_SDCC_HC_SIZE);
++	oe.core = ml_io_map(OE_SDCC_CORE_PHYS, OE_SDCC_CORE_SIZE);
++	oe.gcc = ml_io_map(OE_GCC_PHYS, OE_GCC_SIZE);
++	if (oe.hc == 0 || oe.core == 0 || oe.gcc == 0) {
++		printf("SWEET EARLYMISC: ml_io_map failed (hc=0x%lx core=0x%lx gcc=0x%lx)\n",
++		    (unsigned long)oe.hc, (unsigned long)oe.core,
++		    (unsigned long)oe.gcc);
++		goto out;
++	}
++	printf("SWEET EARLYMISC: early eMMC init (hc=0x%lx core=0x%lx gcc=0x%lx)\n",
++	    (unsigned long)oe.hc, (unsigned long)oe.core, (unsigned long)oe.gcc);
++
++	oe_gcc_clock_init();
++	oe_core_init();
++	rc = oe_sdhci_takeover();
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: SDHCI takeover failed rc=%d\n", rc);
++		goto out;
++	}
++
++	/* Card identification, same sequence as oe_card_init() but without the
++	 * optional CMD6/HS step (400 kHz legacy / 1-bit is enough to write). */
++	(void)oe_issue16(OE_CMD_IDX(0) | OE_RSP_NONE, 0xF0F0F0F0u, NULL, &ist);
++	rc = oe_issue16(OE_CMD_IDX(0) | OE_RSP_NONE, 0, NULL, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD0 failed rc=%d int=0x%08x\n", rc, ist);
++		goto out;
++	}
++	for (i = 0; i < 40; i++) {
++		(void)oe_issue(OE_CMD_IDX(1) | OE_RSP_48, 0x40FF8080u, resp, &ist);
++		ocr = resp[0];
++		if ((ocr & 0x80000000u) != 0) {
++			break;
++		}
++		delay(25000);
++	}
++	if ((ocr & 0x80000000u) == 0) {
++		printf("SWEET EARLYMISC: CMD1 never signalled power-up (ocr=0x%08x)\n",
++		    ocr);
++		goto out;
++	}
++	rc = oe_issue(OE_CMD_IDX(2) | OE_RSP_136 | OE_CC_CRC, 0, resp, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD2 (CID) failed int=0x%08x\n", ist);
++		goto out;
++	}
++	rc = oe_issue(OE_CMD_IDX(3) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
++	    1u << 16, resp, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD3 (RCA) failed int=0x%08x\n", ist);
++		goto out;
++	}
++	oe.rca = (resp[0] >> 16) & 0xFFFFu;
++	if (oe.rca == 0) {
++		oe.rca = 1;
++	}
++	rc = oe_issue(OE_CMD_IDX(9) | OE_RSP_136 | OE_CC_CRC,
++	    oe.rca << 16, resp, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD9 (CSD) failed int=0x%08x\n", ist);
++		goto out;
++	}
++	rc = oe_issue(OE_CMD_IDX(7) | OE_RSP_48_BUSY | OE_CC_CRC | OE_CC_IDX,
++	    oe.rca << 16, resp, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD7 (select) failed int=0x%08x\n", ist);
++		goto out;
++	}
++	rc = oe_pio_read(OE_CMD_IDX(8) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX |
++	    OE_CC_DATA, 0, oe_sector);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: EXT_CSD (CMD8) read failed rc=%d\n", rc);
++		goto out;
++	}
++	oe.sec_count = oe_le32(&oe_sector[212]);
++	if (oe.sec_count < 2) {
++		printf("SWEET EARLYMISC: invalid SEC_COUNT 0x%08x\n", oe.sec_count);
++		goto out;
++	}
++	printf("SWEET EARLYMISC: card ready rca=%u sectors=0x%08x "
++	    "cache_ctrl=0x%02x hs_timing=%u bus_width=%u
++",
++	    oe.rca, oe.sec_count, oe_sector[33], oe_sector[185],
++	    oe_sector[183]);
++
++	/* GPT scan: the shared reader also records the "misc" partition. */
++	rc = oe_gpt_scan("userdata");
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: GPT scan failed rc=%d\n", rc);
++		goto out;
++	}
++	if (oe.misc_lba == 0 ||
++	    oe.misc_nblocks < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE) {
++		printf("SWEET EARLYMISC: misc partition not found or too small\n");
++		goto out;
++	}
++
++	/* Only action: 4096 zero bytes (8 x 512) at the start of misc. */
++	memset(zero, 0, sizeof(zero));
++	for (i = 0; i < SWEET_MISC_CLEAR_BYTES / OE_BLOCK_SIZE; i++) {
++		rc = oe_write_lba(oe.misc_lba + i, zero);
++		if (rc != 0) {
++			printf("SWEET EARLYMISC: BCB write failed at block 0x%llx rc=%d\n",
++			    oe.misc_lba + i, rc);
++			goto out;
++		}
++	}
++	printf("SWEET EARLYMISC: cleared BCB at block 0x%llx\n", oe.misc_lba);
++	ok = true;
++
++out:
++	oe.kick_always = false;
++	if (!ok) {
++		printf("SWEET EARLYMISC: early BCB clear failed, continuing boot\n");
++	}
++}
+ #endif /* ONC_SWEET_4K */
+ 
+ 
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -658,6 +658,16 @@
+ 
+ 		kprintf("SWEET RESET: arm_init hook +\n");
+ 		sweet_early_reset_install();
++		{
++			/*
++			 * 0146: clear the Android BCB from the kernel before
++			 * IOKit/SMP starts, so a CPU-bring-up panic resets into
++			 * boot=TWRP instead of the recovery partition.
++			 */
++			extern void sweet_early_misc_clear(void);
++
++			sweet_early_misc_clear();
++		}
+ 		kprintf("SWEET RESET: arm_init hook -\n");
+ 	}
+ #endif

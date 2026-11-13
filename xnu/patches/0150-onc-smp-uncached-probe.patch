@@ -1,0 +1,361 @@
+SMP probe: PSCI_AFFINITY_INFO + cache-cleaned/uncached mark readout.
+
+We must distinguish "TZ never started CPU1" from "CPU1 started but our early
+marks are hidden by the boot CPU's cached zero lines / it died before C init".
+The secondary entry runs with MMU/caches off; the boot CPU clears the mark
+words with normal cached stores right before CPU_ON, which can hide them.
+
+  iokit/Kernel/arm/SweetCPU.cpp
+    - new sweet_psci_affinity_info() (PSCI_AFFINITY_INFO 0x84000004, level 0;
+      0=ON, 1=OFF, 2=ON_PENDING, negative = error);
+    - startCPU(): query affinity BEFORE CPU_ON, immediately after the SMC and
+      again before returning, store in sweet_smp_aff_before/after/again and
+      print them in the CPU_ON log line;
+    - before CPU_ON: push the zeroed mark/stage/vector words to PoC and drop
+      the boot CPU's dirty cache lines (dc civac + dsb/isb);
+    - new boot arg `sweetmtest=1` (default off): after CPU_ON, poll the
+      uncached mark for up to 2 s and print the first nonzero value + elapsed
+      ms;
+    - startAll() timeout: dc civac the mark lines on the boot CPU, then read
+      both the cached copy and an uncached copy through an ml_io_map() alias of
+      the marks physical page; the timeout IOLog/panic prints
+      `ctx=... aff=before/after/again mark=0x... mark_uncached=0x...
+       stage=0x...` (entry is the ml_static_vtop() value, ctx the PSCI
+      context id);
+    - new globals sweet_smp_aff_before/after/again,
+      sweet_smp_mark_cached/uncached, sweet_psci_last_context.
+  bsd/dev/onc_emmc.c
+    - SWEET HALT: summary now carries `aff=b/a/g mark=cached/uncached` (plus
+      cpu/target/entry/rc/stage/init/sig), one photo = all the SMP data.
+
+Interpretation (plan):
+  * CPU_ON rc=0 + AFFINITY off after + off again -> TZ stub / target encoding;
+  * AFFINITY off right after, on later -> core came up late;
+  * AFFINITY on + mark_uncached=0 -> core started and died before our first
+    store (entry/EL/warm-boot issue);
+  * mark_uncached != 0 -> the core ran and our timeout logic was wrong;
+  * cached=0 but uncached!=0 -> cache false negative confirmed.
+
+Base = post-0149 CI main (reconstructed from the post-0148 buildtree + 0149
+patch because the 0149 run did not exist yet).
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -70,6 +70,22 @@
+ volatile uint64_t sweet_smp_last_sig;
+ }
+ 
++/*
++ * 0150: PSCI_AFFINITY_INFO results and the timeout mark readout, so the halt
++ * summary line (photo) carries everything needed to interpret the failure.
++ */
++extern "C" {
++volatile int32_t sweet_smp_aff_before = -2;
++volatile int32_t sweet_smp_aff_after = -2;
++volatile int32_t sweet_smp_aff_again = -2;
++volatile uint64_t sweet_smp_mark_cached;
++volatile uint64_t sweet_smp_mark_uncached;
++volatile uint64_t sweet_psci_last_context;
++
++/* 0150: ml_io_map() is only declared for MACH_KERNEL_PRIVATE builds. */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++}
++
+ static inline void
+ sweet_smp_mark(uint32_t cpu, uint64_t mark)
+ {
+@@ -150,6 +166,120 @@
+ 	while (__builtin_arm_rsr64("CNTVCT_EL0") < until) {
+ 		__asm__ volatile("yield" ::: "memory");
+ 	}
++}
++
++/*
++ * 0150: PSCI_AFFINITY_INFO (64-bit function id 0x84000004) for the SMP probe.
++ * level 0 is the lowest affinity level.  Returns 0 = ON/running, 1 = OFF,
++ * 2 = ON_PENDING, negative = PSCI error (e.g. -1 NOT_SUPPORTED,
++ * -3 INVALID_PARAMETERS).
++ */
++static int32_t
++sweet_psci_affinity_info(uint64_t target, uint32_t level)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000004ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = level;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/*
++ * 0150: dc civac (clean+invalidate to PoC) over a VA range, then dsb/isb so
++ * the next load comes from memory.  Used to (a) push the zeroed mark words to
++ * DRAM and drop the boot CPU's dirty lines before CPU_ON, and (b) invalidate
++ * the boot CPU's view when reading the marks back on timeout.
++ */
++static void
++sweet_dc_civac_region(vm_offset_t va, size_t size)
++{
++	vm_offset_t start = va & ~(vm_offset_t)0x3F;
++	vm_offset_t end = (va + size + 0x3F) & ~(vm_offset_t)0x3F;
++	vm_offset_t a;
++
++	for (a = start; a < end; a += 0x40) {
++		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	__asm__ volatile("isb" ::: "memory");
++}
++
++static void
++sweet_smp_cleaninval_marks(void)
++{
++	sweet_dc_civac_region((vm_offset_t)&sweet_secondary_marks[0],
++	    sizeof(sweet_secondary_marks));
++	sweet_dc_civac_region((vm_offset_t)&sweet_smp_stage,
++	    sizeof(sweet_smp_stage));
++	sweet_dc_civac_region((vm_offset_t)&sweet_smp_vector_hit,
++	    sizeof(sweet_smp_vector_hit));
++}
++
++/* 0150: uncached alias of the physical page holding sweet_secondary_marks[]. */
++static volatile uint64_t *
++sweet_smp_marks_uncached(void)
++{
++	static volatile uint64_t *alias = NULL;
++
++	if (alias == NULL) {
++		vm_offset_t va = (vm_offset_t)&sweet_secondary_marks[0];
++		vm_offset_t off = va & 0xFFF;
++		vm_offset_t page_pa = ml_static_vtop(va) & ~(vm_offset_t)0xFFF;
++		vm_offset_t map = ml_io_map(page_pa, 0x2000);
++
++		if (map != 0) {
++			alias = (volatile uint64_t *)(map + off);
++		} else {
++			IOLog("SWEET CPU: uncached mark alias unavailable\n");
++		}
++	}
++	return alias;
++}
++
++static uint64_t
++sweet_smp_mark_uncached_read(uint32_t cpu)
++{
++	volatile uint64_t *marks = sweet_smp_marks_uncached();
++
++	if (marks == NULL || cpu >= 8) {
++		return 0;
++	}
++	return marks[cpu];
++}
++
++/*
++ * 0150: `sweetmtest=1` - after CPU_ON, poll the uncached mark for up to 2 s
++ * and print the first nonzero value with elapsed time.  Cheap way to see
++ * whether the secondary ever runs, without waiting for the 5 s timeout.
++ */
++static void
++sweet_smp_mark_test(uint32_t cpu)
++{
++	uint64_t start = mach_absolute_time();
++	uint64_t deadline;
++	uint64_t value;
++
++	nanoseconds_to_deadline(2 * NSEC_PER_SEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		value = sweet_smp_mark_uncached_read(cpu);
++		if (value != 0) {
++			uint64_t ns = 0;
++
++			absolutetime_to_nanoseconds(mach_absolute_time() -
++			    start, &ns);
++			IOLog("SWEET CPU: mtest cpu=%u mark_uncached=0x%llx "
++			    "after %llu ms\n", cpu, (unsigned long long)value,
++			    (unsigned long long)(ns / 1000000ULL));
++			return;
++		}
++		onc_spin_us(1000);
++	}
++	IOLog("SWEET CPU: mtest cpu=%u no mark within 2 s "
++	    "(uncached=0x%llx)\n", cpu,
++	    (unsigned long long)sweet_smp_mark_uncached_read(cpu));
+ }
+ 
+ bool
+@@ -306,9 +436,14 @@
+ 				/*
+ 				 * 0142: where did the secondary stop?  mark/stage are
+ 				 * written by start.s (MMU-off safe), 5/6/7 by initCPU.
++				 * 0150: clean+invalidate the boot CPU's mark lines and
++				 * read a second copy through an uncached alias, so a
++				 * cache false negative cannot hide secondary progress.
+ 				 */
++				sweet_smp_cleaninval_marks();
+ 				uint64_t mark = __atomic_load_n(
+ 				    &sweet_secondary_marks[i], __ATOMIC_ACQUIRE);
++				uint64_t mark_unc = sweet_smp_mark_uncached_read(i);
+ 				uint64_t stage = __atomic_load_n(
+ 				    &sweet_smp_stage, __ATOMIC_ACQUIRE);
+ 				uint64_t vec = __atomic_load_n(
+@@ -323,22 +458,40 @@
+ 				__atomic_store_n(&sweet_smp_last_sig,
+ 				    (uint64_t)sweet_cpu_signal_is_enabled(i),
+ 				    __ATOMIC_RELEASE);
++				__atomic_store_n(&sweet_smp_mark_cached, mark,
++				    __ATOMIC_RELEASE);
++				__atomic_store_n(&sweet_smp_mark_uncached, mark_unc,
++				    __ATOMIC_RELEASE);
+ 				/* 0147: self-contained PSCI parameters. */
+ 				uint64_t psci_target = __atomic_load_n(
+ 				    &sweet_psci_last_target, __ATOMIC_ACQUIRE);
+ 				uint64_t psci_entry = __atomic_load_n(
+ 				    &sweet_psci_last_entry, __ATOMIC_ACQUIRE);
++				uint64_t psci_ctx = __atomic_load_n(
++				    &sweet_psci_last_context, __ATOMIC_ACQUIRE);
+ 				int32_t psci_rc = __atomic_load_n(
+ 				    &sweet_psci_last_rc, __ATOMIC_ACQUIRE);
++				/* 0150: affinity probe results. */
++				int32_t aff_before = __atomic_load_n(
++				    &sweet_smp_aff_before, __ATOMIC_ACQUIRE);
++				int32_t aff_after = __atomic_load_n(
++				    &sweet_smp_aff_after, __ATOMIC_ACQUIRE);
++				int32_t aff_again = __atomic_load_n(
++				    &sweet_smp_aff_again, __ATOMIC_ACQUIRE);
+ 
+ 				IOLog("SWEET CPU: cpu=%u start phys=0x%x "
+-				    "target=0x%llx entry=0x%llx rc=%d NOT alive "
+-				    "after 5s mark=0x%llx stage=0x%llx vec=0x%llx "
+-				    "init=%u sig=%u delta=%llu\n",
++				    "target=0x%llx entry=0x%llx ctx=%llu rc=%d "
++				    "aff=%d/%d/%d NOT alive after 5s "
++				    "mark=0x%llx mark_uncached=0x%llx stage=0x%llx "
++				    "vec=0x%llx init=%u sig=%u delta=%llu\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    (unsigned long long)psci_target,
+-				    (unsigned long long)psci_entry, (int)psci_rc,
++				    (unsigned long long)psci_entry,
++				    (unsigned long long)psci_ctx, (int)psci_rc,
++				    (int)aff_before, (int)aff_after,
++				    (int)aff_again,
+ 				    (unsigned long long)mark,
++				    (unsigned long long)mark_unc,
+ 				    (unsigned long long)stage,
+ 				    (unsigned long long)vec,
+ 				    (unsigned)__atomic_load_n(&cpu->initialized,
+@@ -346,12 +499,17 @@
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned long long)delta);
+ 				panic("SWEET CPU: cpu=%u startup timeout "
+-				    "target=0x%llx entry=0x%llx rc=%d mark=0x%llx "
++				    "target=0x%llx entry=0x%llx ctx=%llu rc=%d "
++				    "aff=%d/%d/%d mark=0x%llx mark_uncached=0x%llx "
+ 				    "stage=0x%llx vec=0x%llx init=%u sig=%u "
+ 				    "phys=0x%x delta=%llu", i,
+ 				    (unsigned long long)psci_target,
+-				    (unsigned long long)psci_entry, (int)psci_rc,
++				    (unsigned long long)psci_entry,
++				    (unsigned long long)psci_ctx, (int)psci_rc,
++				    (int)aff_before, (int)aff_after,
++				    (int)aff_again,
+ 				    (unsigned long long)mark,
++				    (unsigned long long)mark_unc,
+ 				    (unsigned long long)stage,
+ 				    (unsigned long long)vec,
+ 				    (unsigned)__atomic_load_n(&cpu->initialized,
+@@ -477,18 +635,47 @@
+ 	sweet_smp_mark(getCPUNumber(), 0);
+ 	__atomic_store_n(&sweet_smp_stage, 0, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_smp_vector_hit, 0, __ATOMIC_RELEASE);
++	/* 0150: push the zeroes to PoC and drop the boot CPU's dirty lines, so a
++	 * cache-off store from the secondary cannot be hidden by them. */
++	__builtin_arm_dsb(DSB_SY);
++	sweet_smp_cleaninval_marks();
+ 	/* 0147: remember the PSCI parameters for the SMP timeout report. */
+ 	__atomic_store_n(&sweet_psci_last_target, (uint64_t)cpu->phys_id,
+ 	    __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_psci_last_entry, (uint64_t)entry,
+ 	    __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_psci_last_context, (uint64_t)getCPUNumber(),
++	    __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_psci_last_rc, 0x7fffffff, __ATOMIC_RELEASE);
+-	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+-	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
++	/* 0150: affinity before CPU_ON (0=ON, 1=OFF, 2=ON_PENDING). */
++	int32_t aff_before = sweet_psci_affinity_info(cpu->phys_id, 0);
++	__atomic_store_n(&sweet_smp_aff_before, aff_before, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_smp_aff_after, -2, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_smp_aff_again, -2, __ATOMIC_RELEASE);
++	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u "
++	    "aff_before=%d\n", getCPUNumber(), cpu->phys_id, (uint64_t)entry,
++	    getCPUNumber(), (int)aff_before);
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	__atomic_store_n(&sweet_psci_last_rc, rc, __ATOMIC_RELEASE);
+-	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	/* 0150: did the TZ actually power the core? */
++	int32_t aff_after = sweet_psci_affinity_info(cpu->phys_id, 0);
++	__atomic_store_n(&sweet_smp_aff_after, aff_after, __ATOMIC_RELEASE);
++	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d aff_after=%d\n",
++	    getCPUNumber(), (int)rc, (int)aff_after);
++	/* 0150: optional cheap probe - poll the uncached mark for up to 2 s. */
++	{
++		uint32_t mtest = 0;
++
++		if (PE_parse_boot_argn("sweetmtest", &mtest, sizeof(mtest)) &&
++		    mtest != 0) {
++			sweet_smp_mark_test(getCPUNumber());
++		}
++	}
++	int32_t aff_again = sweet_psci_affinity_info(cpu->phys_id, 0);
++	__atomic_store_n(&sweet_smp_aff_again, aff_again, __ATOMIC_RELEASE);
++	IOLog("SWEET CPU: cpu=%u PSCI affinity again=%d\n", getCPUNumber(),
++	    (int)aff_again);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+ 		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -274,6 +274,12 @@
+ extern volatile int32_t sweet_psci_last_rc;
+ extern volatile uint64_t sweet_secondary_marks[8];
+ extern volatile uint64_t sweet_smp_stage;
++/* 0150: PSCI_AFFINITY_INFO + uncached mark readout for the halt summary. */
++extern volatile int32_t sweet_smp_aff_before;
++extern volatile int32_t sweet_smp_aff_after;
++extern volatile int32_t sweet_smp_aff_again;
++extern volatile uint64_t sweet_smp_mark_cached;
++extern volatile uint64_t sweet_smp_mark_uncached;
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2531,16 +2537,25 @@
+ 
+ 		if (scpu >= 0 && scpu < 8) {
+ 			printf("SWEET HALT: summary cpu=%d target=0x%llx "
+-			    "entry=0x%llx rc=%d mark=0x%llx stage=0x%llx "
+-			    "init=%llu sig=%llu\n", (int)scpu,
++			    "entry=0x%llx rc=%d aff=%d/%d/%d "
++			    "mark=0x%llx/0x%llx stage=0x%llx init=%llu "
++			    "sig=%llu\n", (int)scpu,
+ 			    (unsigned long long)__atomic_load_n(
+ 			    &sweet_psci_last_target, __ATOMIC_ACQUIRE),
+ 			    (unsigned long long)__atomic_load_n(
+ 			    &sweet_psci_last_entry, __ATOMIC_ACQUIRE),
+ 			    (int)__atomic_load_n(&sweet_psci_last_rc,
+ 			    __ATOMIC_ACQUIRE),
++			    (int)__atomic_load_n(&sweet_smp_aff_before,
++			    __ATOMIC_ACQUIRE),
++			    (int)__atomic_load_n(&sweet_smp_aff_after,
++			    __ATOMIC_ACQUIRE),
++			    (int)__atomic_load_n(&sweet_smp_aff_again,
++			    __ATOMIC_ACQUIRE),
+ 			    (unsigned long long)__atomic_load_n(
+-			    &sweet_secondary_marks[scpu], __ATOMIC_ACQUIRE),
++			    &sweet_smp_mark_cached, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_smp_mark_uncached, __ATOMIC_ACQUIRE),
+ 			    (unsigned long long)__atomic_load_n(
+ 			    &sweet_smp_stage, __ATOMIC_ACQUIRE),
+ 			    (unsigned long long)__atomic_load_n(

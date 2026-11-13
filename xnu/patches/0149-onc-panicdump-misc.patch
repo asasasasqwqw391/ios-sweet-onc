@@ -1,0 +1,534 @@
+Panic dump: reuse card state, early write self-test, misc fallback target.
+
+0148 gets the geometry right but the CMD24 write to the userdata tail times
+out right after the panic path's FORCED card re-init (CMD timeout, CMD inhibit
+stuck); writes into misc with the untouched early state work every boot, so
+0149 stops forcing a second init.
+
+  bsd/dev/onc_emmc.c
+    - panic dump: `sweet_early_card_init(oe.rca != 0 ? 0 : 1)` - reuse the
+      already-initialised card (force only when it was never brought up);
+      print the CMD13 (SEND_STATUS) R1 status before writing;
+    - new `sweet_early_card_status()` (CMD13) helper;
+    - new `sweet_early_write_selftest()` (called from arm_init after the 0146
+      early misc clear): safe scratch block `misc_first + 0x80`, save original
+      512 B, write zeros, read back + verify, print
+      `SWEET EARLYMISC: write selftest OK/FAIL ...` (lba/rc/stage on failure),
+      then restore the original block.  `sweetearlywtest=0` disables;
+    - panic dump fallback: userdata tail remains primary; if it fails (or
+      `sweetpanicdumpdev=misc`), write the same SWEETLOG header+ring into misc
+      at `misc_first + 8` with area = (misc_nblocks - 8) * 512 bytes
+      (32 KiB + header fits in the 1 MiB misc partition), header last;
+      each candidate prints `SWEET PANICDUMP: target=userdata|misc base=...
+      bytes=...`, failures print stage+lba+rc, and the fallback success line
+      says `SWEET PANICDUMP: target=misc wrote ... -> lba 0x...`;
+  osfmk/arm/arm_init.c
+    - `sweet_early_write_selftest()` call right after `sweet_early_misc_clear()`.
+
+Expected (cpus=4, sweethaltms=2000):
+  SWEET EARLYMISC: write selftest OK lba=0x2080          (every boot)
+  ...
+  SWEET PANICDUMP: CMD13 status=0x000...
+  SWEET PANICDUMP: userdata first=... blocks=... misc first=... blocks=... total=...
+  SWEET PANICDUMP: target=userdata base=0x... bytes=4198400
+  SWEET PANICDUMP: wrote ... (ring N blocks + header last) -> lba 0x... seq=...
+or, if the userdata write still fails:
+  SWEET PANICDUMP: target=userdata base=0x... bytes=...
+  SWEET PANICDUMP: ring write failed stage=ring lba=0x... rc=...
+  SWEET PANICDUMP: target=misc base=0x2008 bytes=...
+  SWEET PANICDUMP: wrote ... -> lba 0x2008 seq=...
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -263,6 +263,8 @@
+ void sweet_early_reset_install(void);
+ /* 0147: panic-time console-ring dump via the early raw-eMMC path. */
+ void sweet_panic_log_dump(void);
++/* 0149: raw write self-test on the early eMMC path (called from arm_init()). */
++void sweet_early_write_selftest(void);
+ /* 0148: SMP failure summary for the halt hook (defined in SweetCPU.cpp). */
+ extern volatile int32_t sweet_smp_last_cpu;
+ extern volatile uint64_t sweet_smp_last_init;
+@@ -2878,97 +2880,150 @@
+  * Bounded (default 32 KiB + 4 KiB header ~0.8 s at 400 kHz) and best effort:
+  * it never panics or hangs; the reset always continues.
+  */
++/*
++ * 0149: CMD13 (SEND_STATUS) on the selected card.  Returns the R1 status
++ * word, or 0xFFFFFFFF when the command itself failed (printed).
++ */
++static uint32_t
++sweet_early_card_status(void)
++{
++	uint32_t resp[4] = { 0, 0, 0, 0 };
++	uint32_t ist = 0;
++	int rc;
++
++	rc = oe_issue(OE_CMD_IDX(13) | OE_RSP_48 | OE_CC_CRC | OE_CC_IDX,
++	    oe.rca << 16, resp, &ist);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: CMD13 (status) failed rc=%d int=0x%08x\n",
++		    rc, ist);
++		return 0xFFFFFFFFu;
++	}
++	return resp[0];
++}
++
++/*
++ * 0149: raw PIO write self-test, run once from arm_init() right after the
++ * 0146 early misc clear (same card state that just cleared the BCB).  It uses
++ * a safe scratch block 64 KiB into the 1 MiB misc partition
++ * (misc_first + 0x80), writes 512 B of zeros, reads them back, verifies, and
++ * restores the original contents, so it proves the early write path on every
++ * boot without destroying anything.  `sweetearlywtest=0` disables.
++ */
+ void
+-sweet_panic_log_dump(void)
++sweet_early_write_selftest(void)
++{
++	uint8_t orig[OE_BLOCK_SIZE];
++	uint8_t zero[OE_BLOCK_SIZE];
++	uint8_t rb[OE_BLOCK_SIZE];
++	uint64_t lba;
++	uint32_t on = 1;
++	int rc;
++
++	if (PE_parse_boot_argn("sweetearlymisc", &on, sizeof(on)) && on == 0) {
++		return;		/* early eMMC path disabled altogether */
++	}
++	on = 1;
++	if (PE_parse_boot_argn("sweetearlywtest", &on, sizeof(on)) && on == 0) {
++		printf("SWEET EARLYMISC: write selftest disabled "
++		    "(sweetearlywtest=0)\n");
++		return;
++	}
++	rc = sweet_early_card_init(0);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL init rc=%d\n", rc);
++		return;
++	}
++	if (oe.misc_lba == 0) {
++		rc = oe_gpt_scan("userdata");
++		if (rc != 0) {
++			printf("SWEET EARLYMISC: write selftest FAIL gpt rc=%d\n",
++			    rc);
++			return;
++		}
++	}
++	if (oe.misc_lba < 2 || oe.misc_nblocks <= 0x80 + 1) {
++		printf("SWEET EARLYMISC: write selftest FAIL no scratch block "
++		    "(misc lba=0x%llx blocks=0x%llx)\n",
++		    (unsigned long long)oe.misc_lba,
++		    (unsigned long long)oe.misc_nblocks);
++		return;
++	}
++	lba = oe.misc_lba + 0x80;
++	printf("SWEET EARLYMISC: write selftest CMD13 status=0x%08x\n",
++	    sweet_early_card_status());
++	memset(zero, 0, sizeof(zero));
++	rc = oe_read_lba(lba, orig);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL read-orig "
++		    "lba=0x%llx rc=%d\n", (unsigned long long)lba, rc);
++		return;
++	}
++	rc = oe_write_lba(lba, zero);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL write lba=0x%llx "
++		    "rc=%d\n", (unsigned long long)lba, rc);
++		return;
++	}
++	rc = oe_read_lba(lba, rb);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL readback "
++		    "lba=0x%llx rc=%d\n", (unsigned long long)lba, rc);
++	} else if (memcmp(zero, rb, sizeof(zero)) != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL verify "
++		    "lba=0x%llx (readback differs)\n",
++		    (unsigned long long)lba);
++	} else {
++		printf("SWEET EARLYMISC: write selftest OK lba=0x%llx\n",
++		    (unsigned long long)lba);
++	}
++	/* Restore whatever was there before the test. */
++	rc = oe_write_lba(lba, orig);
++	if (rc != 0) {
++		printf("SWEET EARLYMISC: write selftest FAIL restore "
++		    "lba=0x%llx rc=%d\n", (unsigned long long)lba, rc);
++	} else {
++		printf("SWEET EARLYMISC: write selftest restored block 0x%llx\n",
++		    (unsigned long long)lba);
++	}
++}
++
++/*
++ * 0149: write the SWEETLOG area (header + newest ring blocks, header LAST)
++ * into one target.  `area_blocks` is the size of the target area in 4 KiB
++ * blocks (header included); the header advertises
++ * size = area_blocks * SWEET_EMMC_LOG_BLKSIZE so tools/sweet-log.py can
++ * decode an area of that size unchanged.  Returns 0 on success, an errno on
++ * failure (with stage+lba+rc printed).
++ */
++static int
++sweet_panic_dump_write(const char *dev, uint64_t base, uint64_t area_blocks,
++    uint64_t total, uint32_t kb)
+ {
+ 	static uint8_t hdr[SWEET_EMMC_LOG_BLKSIZE];
+ 	static uint8_t blk[SWEET_EMMC_LOG_BLKSIZE];
+ 	static uint8_t oldhdr[OE_BLOCK_SIZE];
+ 	struct sweet_emmc_log_header h;
+-	uint64_t first;
+-	uint64_t nblk;
+-	uint64_t area;
+-	uint64_t base;
+-	uint64_t total;
+ 	uint64_t start_abs;
+ 	uint64_t seq = 1;
+-	uint32_t on = 1;
+-	uint32_t kb = 32;
++	uint64_t ring_size;
+ 	uint32_t nblocks;
+ 	uint32_t i;
+ 	uint32_t j;
+ 	int rc;
+ 
+-	if (PE_parse_boot_argn("sweetpanicdump", &on, sizeof(on)) && on == 0) {
+-		printf("SWEET PANICDUMP: disabled (sweetpanicdump=0)\n");
+-		return;
+-	}
+-
+-	/* 0148: force a fresh controller/card program in the panic path.  The
+-	 * normal driver may have left a state where the first write times out. */
+-	rc = sweet_early_card_init(1);
+-	if (rc != 0) {
+-		printf("SWEET PANICDUMP: eMMC init failed rc=%d (stage=init)\n", rc);
+-		return;
+-	}
+-	rc = oe_gpt_scan("userdata");
+-	if (rc != 0) {
+-		printf("SWEET PANICDUMP: GPT scan failed rc=%d (stage=gpt)\n", rc);
+-		return;
+-	}
+-
+-	first = oe.first_lba;
+-	nblk = oe.nblocks;
+-	area = SWEET_EMMC_LOG_LBAS;	/* 4100 KiB = 8200 x 512-byte LBAs */
+-	total = sweet_log_position();
+-	printf("SWEET PANICDUMP: userdata first=0x%llx blocks=0x%llx "
+-	    "sec_count=0x%llx area=0x%llx total=%llu\n",
+-	    (unsigned long long)first, (unsigned long long)nblk,
+-	    (unsigned long long)oe.sec_count, (unsigned long long)area,
+-	    (unsigned long long)total);
+-
+-	if (first < 2 || nblk <= 2 * area || nblk < area) {
+-		printf("SWEET PANICDUMP: invalid userdata geometry "
+-		    "(first=0x%llx blocks=0x%llx), refusing\n",
+-		    (unsigned long long)first, (unsigned long long)nblk);
+-		return;
+-	}
+-	if (oe.sec_count >= 2 &&
+-	    first + nblk - 1 > (uint64_t)oe.sec_count) {
+-		printf("SWEET PANICDUMP: userdata past end of card "
+-		    "(last=0x%llx sec_count=0x%llx), refusing\n",
+-		    (unsigned long long)(first + nblk - 1),
+-		    (unsigned long long)oe.sec_count);
+-		return;
+-	}
+-	base = first + nblk - area;
+-	if (base < 2 || base > 0xFFFFFFFFull) {
+-		printf("SWEET PANICDUMP: computed base 0x%llx is not a valid "
+-		    "32-bit LBA (first=0x%llx blocks=0x%llx area=0x%llx), "
+-		    "refusing\n", (unsigned long long)base,
+-		    (unsigned long long)first, (unsigned long long)nblk,
+-		    (unsigned long long)area);
+-		return;
+-	}
+-	if (total == 0) {
+-		printf("SWEET PANICDUMP: console ring is empty\n");
+-		return;
+-	}
+-	printf("SWEET PANICDUMP: base=0x%llx (last 4100 KiB of userdata), "
+-	    "total=%llu\n", (unsigned long long)base,
+-	    (unsigned long long)total);
+-
+-	if (PE_parse_boot_argn("sweetpanicdumpkb", &kb, sizeof(kb)) &&
+-	    kb >= 4) {
+-		if (kb > SWEET_EMMC_LOG_RING / 1024) {
+-			kb = SWEET_EMMC_LOG_RING / 1024;
+-		}
+-	} else {
+-		kb = 32;
+-	}
++	if (area_blocks < 2) {
++		printf("SWEET PANICDUMP: target=%s area too small "
++		    "(0x%llx blocks)\n", dev,
++		    (unsigned long long)area_blocks);
++		return EINVAL;
++	}
++	ring_size = area_blocks * SWEET_EMMC_LOG_BLKSIZE;
+ 	nblocks = kb / (SWEET_EMMC_LOG_BLKSIZE / 1024);
+ 	if (nblocks == 0) {
+ 		nblocks = 1;
++	}
++	if ((uint64_t)nblocks > area_blocks - 1) {
++		nblocks = (uint32_t)(area_blocks - 1);
+ 	}
+ 	if (nblocks > SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE) {
+ 		nblocks = SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE;
+@@ -2986,8 +3041,7 @@
+ 		nblocks = (uint32_t)nb;
+ 	}
+ 	if (nblocks == 0) {
+-		printf("SWEET PANICDUMP: nothing to write\n");
+-		return;
++		nblocks = 1;	/* write the header only */
+ 	}
+ 
+ 	/* Read the previous header (if any) so seq keeps incrementing. */
+@@ -3015,23 +3069,20 @@
+ 		got = sweet_log_copy(&pos, (char *)blk,
+ 		    SWEET_EMMC_LOG_BLKSIZE);
+ 		if (got == 0) {
+-			printf("SWEET PANICDUMP: ring block %u empty "
+-			    "(abs=0x%llx), skipping\n", i,
+-			    (unsigned long long)abs);
+ 			continue;
+ 		}
+ 		ring_blk = (uint32_t)((abs / SWEET_EMMC_LOG_BLKSIZE) %
+-		    (SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE));
++		    area_blocks);
+ 		out_lba = base + (uint64_t)(1 + ring_blk) *
+ 		    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
+ 		for (j = 0; j < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; j++) {
+ 			rc = oe_write_lba(out_lba + j,
+ 			    blk + (uint64_t)j * OE_BLOCK_SIZE);
+ 			if (rc != 0) {
+-				printf("SWEET PANICDUMP: ring write failed "
+-				    "stage=ring lba=0x%llx rc=%d\n",
+-				    (unsigned long long)(out_lba + j), rc);
+-				return;
++				printf("SWEET PANICDUMP: target=%s ring write "
++				    "failed stage=ring lba=0x%llx rc=%d\n",
++				    dev, (unsigned long long)(out_lba + j), rc);
++				return rc;
+ 			}
+ 		}
+ 	}
+@@ -3041,24 +3092,195 @@
+ 	memset(&h, 0, sizeof(h));
+ 	memcpy(h.magic, "SWEETLOG", 8);
+ 	h.version = 1;
+-	h.size = SWEET_EMMC_LOG_RING;
++	h.size = (uint32_t)ring_size;
+ 	h.total = total;
+ 	h.seq = seq;
+ 	memcpy(hdr, &h, sizeof(h));
+ 	for (i = 0; i < SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE; i++) {
+ 		rc = oe_write_lba(base + i, hdr + (uint64_t)i * OE_BLOCK_SIZE);
+ 		if (rc != 0) {
+-			printf("SWEET PANICDUMP: header write failed "
+-			    "stage=header lba=0x%llx rc=%d\n",
++			printf("SWEET PANICDUMP: target=%s header write failed "
++			    "stage=header lba=0x%llx rc=%d\n", dev,
+ 			    (unsigned long long)(base + i), rc);
++			return rc;
++		}
++	}
++	printf("SWEET PANICDUMP: target=%s wrote %u bytes (ring %u blocks + "
++	    "header last) -> lba 0x%llx seq=%llu total=%llu size=%llu\n",
++	    dev, (SWEET_EMMC_LOG_BLKSIZE + nblocks * SWEET_EMMC_LOG_BLKSIZE),
++	    nblocks, (unsigned long long)base, (unsigned long long)seq,
++	    (unsigned long long)total, (unsigned long long)ring_size);
++	return 0;
++}
++
++/*
++ * 0147/0148/0149: panic-time console-ring dump into eMMC.
++ *
++ * 0149: reuse the card state that already cleared the BCB this boot instead
++ * of forcing a second init (the forced re-init is the prime suspect for the
++ * CMD24 timeouts), print the CMD13 status, keep the userdata tail as the
++ * primary target and fall back to the misc partition (block misc_first + 8,
++ * 1 MiB partition) when the userdata write fails.  `sweetpanicdumpdev=misc`
++ * forces the misc target; `sweetpanicdump=0` disables;
++ * `sweetpanicdumpkb=<N>` (default 32) sets the ring bytes.
++ * Always header last, bounded, failure-tolerant: any failure prints
++ * stage+lba+rc and the reset continues.
++ */
++void
++sweet_panic_log_dump(void)
++{
++	struct sweet_panic_target {
++		const char *name;
++		uint64_t base;
++		uint64_t area_blocks;
++		int valid;
++	} cand[2], tmp;
++	uint64_t area;
++	uint64_t total;
++	uint32_t on = 1;
++	uint32_t kb = 32;
++	char dev[16] = "userdata";
++	int force_misc = 0;
++	int ncand = 0;
++	int first_cand = 0;
++	int i;
++	int rc;
++
++	if (PE_parse_boot_argn("sweetpanicdump", &on, sizeof(on)) && on == 0) {
++		printf("SWEET PANICDUMP: disabled (sweetpanicdump=0)\n");
++		return;
++	}
++
++	/* 0149: reuse the already-initialised card (it wrote misc at arm_init);
++	 * only force a full re-init if the card was never brought up. */
++	rc = sweet_early_card_init(oe.rca != 0 ? 0 : 1);
++	if (rc != 0) {
++		printf("SWEET PANICDUMP: eMMC init failed rc=%d (stage=init)\n", rc);
++		return;
++	}
++	printf("SWEET PANICDUMP: CMD13 status=0x%08x\n",
++	    sweet_early_card_status());
++
++	rc = oe_gpt_scan("userdata");
++	if (rc != 0) {
++		printf("SWEET PANICDUMP: GPT scan failed rc=%d (stage=gpt)\n", rc);
++		return;
++	}
++	total = sweet_log_position();
++	if (total == 0) {
++		printf("SWEET PANICDUMP: console ring is empty\n");
++		return;
++	}
++	printf("SWEET PANICDUMP: userdata first=0x%llx blocks=0x%llx "
++	    "misc first=0x%llx blocks=0x%llx sec_count=0x%llx total=%llu\n",
++	    (unsigned long long)oe.first_lba, (unsigned long long)oe.nblocks,
++	    (unsigned long long)oe.misc_lba, (unsigned long long)oe.misc_nblocks,
++	    (unsigned long long)oe.sec_count, (unsigned long long)total);
++
++	if (PE_parse_boot_argn("sweetpanicdumpkb", &kb, sizeof(kb)) &&
++	    kb >= 4) {
++		if (kb > SWEET_EMMC_LOG_RING / 1024) {
++			kb = SWEET_EMMC_LOG_RING / 1024;
++		}
++	} else {
++		kb = 32;
++	}
++	if (PE_parse_boot_argn("sweetpanicdumpdev", dev, sizeof(dev)) &&
++	    strcmp(dev, "misc") == 0) {
++		force_misc = 1;
++	}
++	printf("SWEET PANICDUMP: target=%s requested (userdata tail primary)\n",
++	    force_misc ? "misc" : "userdata");
++
++	/* Candidate 1: userdata tail (unchanged 0132 layout). */
++	area = SWEET_EMMC_LOG_LBAS;	/* 4100 KiB = 8200 x 512-byte LBAs */
++	{
++		uint64_t cfirst = oe.first_lba;
++		uint64_t cnblk = oe.nblocks;
++		uint64_t cbase = 0;
++		int valid = 0;
++
++		if (cfirst >= 2 && cnblk > 2 * area && cnblk >= area) {
++			cbase = cfirst + cnblk - area;
++			if (cbase >= 2 && cbase <= 0xFFFFFFFFull &&
++			    (oe.sec_count < 2 ||
++			    cfirst + cnblk - 1 <= (uint64_t)oe.sec_count)) {
++				valid = 1;
++			}
++		}
++		if (valid) {
++			cand[ncand].name = "userdata";
++			cand[ncand].base = cbase;
++			cand[ncand].area_blocks = 1 +
++			    SWEET_EMMC_LOG_RING / SWEET_EMMC_LOG_BLKSIZE;
++			cand[ncand].valid = 1;
++			ncand++;
++		} else {
++			printf("SWEET PANICDUMP: userdata target invalid "
++			    "(first=0x%llx blocks=0x%llx base=0x%llx)\n",
++			    (unsigned long long)cfirst,
++			    (unsigned long long)cnblk,
++			    (unsigned long long)cbase);
++		}
++	}
++
++	/* Candidate 2: misc partition at misc_first + 8 (1 MiB partition). */
++	{
++		uint64_t cbase = 0;
++		uint64_t carea = 0;
++		int valid = 0;
++
++		if (oe.misc_lba >= 2 && oe.misc_nblocks > 8 + 8) {
++			cbase = oe.misc_lba + 8;
++			carea = (oe.misc_nblocks - 8) /
++			    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE);
++			if (cbase <= 0xFFFFFFFFull && carea >= 2 &&
++			    (oe.sec_count < 2 ||
++			    cbase + carea *
++			    (SWEET_EMMC_LOG_BLKSIZE / OE_BLOCK_SIZE) - 1 <=
++			    (uint64_t)oe.sec_count)) {
++				valid = 1;
++			}
++		}
++		if (valid) {
++			cand[ncand].name = "misc";
++			cand[ncand].base = cbase;
++			cand[ncand].area_blocks = carea;
++			cand[ncand].valid = 1;
++			ncand++;
++		} else {
++			printf("SWEET PANICDUMP: misc target invalid "
++			    "(first=0x%llx blocks=0x%llx)\n",
++			    (unsigned long long)oe.misc_lba,
++			    (unsigned long long)oe.misc_nblocks);
++		}
++	}
++
++	if (ncand == 0) {
++		printf("SWEET PANICDUMP: no valid target, aborting\n");
++		return;
++	}
++	if (force_misc && ncand > 1 && strcmp(cand[0].name, "misc") != 0) {
++		/* put the misc entry first */
++		tmp = cand[0];
++
++		cand[0] = cand[1];
++		cand[1] = tmp;
++	}
++	for (i = first_cand; i < ncand; i++) {
++		printf("SWEET PANICDUMP: target=%s base=0x%llx bytes=%llu\n",
++		    cand[i].name, (unsigned long long)cand[i].base,
++		    (unsigned long long)(cand[i].area_blocks *
++		    SWEET_EMMC_LOG_BLKSIZE));
++		rc = sweet_panic_dump_write(cand[i].name, cand[i].base,
++		    cand[i].area_blocks, total, kb);
++		if (rc == 0) {
+ 			return;
+ 		}
+-	}
+-	printf("SWEET PANICDUMP: wrote %u bytes (ring %u blocks + header last) "
+-	    "-> lba 0x%llx seq=%llu total=%llu\n",
+-	    (SWEET_EMMC_LOG_BLKSIZE + nblocks * SWEET_EMMC_LOG_BLKSIZE),
+-	    nblocks, (unsigned long long)base,
+-	    (unsigned long long)seq, (unsigned long long)total);
++		printf("SWEET PANICDUMP: target=%s failed rc=%d, trying next\n",
++		    cand[i].name, rc);
++	}
++	printf("SWEET PANICDUMP: all targets failed\n");
+ }
+ #endif /* ONC_SWEET_4K */
+ 
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -665,8 +665,11 @@
+ 			 * boot=TWRP instead of the recovery partition.
+ 			 */
+ 			extern void sweet_early_misc_clear(void);
++			extern void sweet_early_write_selftest(void);
+ 
+ 			sweet_early_misc_clear();
++			/* 0149: prove the raw PIO write path on every boot. */
++			sweet_early_write_selftest();
+ 		}
+ 		kprintf("SWEET RESET: arm_init hook -\n");
+ 	}

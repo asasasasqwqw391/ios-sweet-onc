@@ -169,8 +169,8 @@ deadline never fires; only the 120 s safety WDT ends the boot.
 +		goto out;
 +	}
 +	printf("SWEET EARLYMISC: card ready rca=%u sectors=0x%08x "
-+	    "cache_ctrl=0x%02x hs_timing=%u bus_width=%u
-+",
++	    "cache_ctrl=0x%02x hs_timing=%u bus_width=%u\n"
++	    "  (EXT_CSD; raw 400 kHz legacy mode)\n",
 +	    oe.rca, oe.sec_count, oe_sector[33], oe_sector[185],
 +	    oe_sector[183]);
 +

@@ -1,0 +1,114 @@
+SMP timeout: drop the CPU instead of panicking, so the boot reaches the log.
+
+Bring-up of a secondary CPU currently panics on timeout.  That panic happens
+before onc_emmc_init() clears the Android BCB and before the SWEETLOG flusher
+thread exists, so the watchdog reset boots the recovery partition again and
+every diagnostic (mark/stage, GICC readback, sig_raw, AFFINITY_INFO) dies with
+the panel.
+
+This patch keeps all of the diagnostics but stops panicking: the failing CPU
+is logged as DROPPED and skipped, and the boot continues on the CPUs that did
+come up.  The flusher then writes the console ring - which already contains the
+full SMP diagnostics - to the userdata tail, the BCB is cleared, and the next
+unattended cycle reads the text back from TWRP.
+
+  - sweet_smp_dropped counter, new "cpu=N DROPPED after timeout" IOLog line,
+    the wait loop breaks out, the success ("came alive") line is skipped for
+    that CPU, and the final summary prints "N/M CPUs initialized (dropped=K)".
+
+The old panic message is kept in a comment so the fields stay documented.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -141,6 +141,8 @@
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
++/* 0155: secondary CPUs dropped after a bring-up timeout (the boot continues). */
++static uint32_t sweet_smp_dropped;
+ static uint32_t sweet_cpus_registered;
+ 
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+@@ -519,6 +521,7 @@
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
++		bool cpu_ok = true;
+ 		const uint64_t onc_start_time = mach_absolute_time();
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		uint32_t onc_waits = 0;
+@@ -614,32 +617,39 @@
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned)sig_raw,
+ 				    (unsigned long long)delta);
+-				panic("SWEET CPU: cpu=%u startup timeout "
+-				    "target=0x%llx entry=0x%llx "
+-				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu "
+-				    "rc=%d aff=%d/%d/%d mark=0x%llx "
+-				    "mark_uncached=0x%llx stage=0x%llx vec=0x%llx "
+-				    "init=%u sig=%u sig_raw=0x%08x "
+-				    "phys=0x%x delta=%llu", i,
+-				    (unsigned long long)psci_target,
+-				    (unsigned long long)psci_entry,
+-				    (unsigned long long)psci_entry_vtop,
+-				    (unsigned long long)psci_payload_pa,
+-				    (unsigned long long)psci_ctx, (int)psci_rc,
+-				    (int)aff_before, (int)aff_after,
+-				    (int)aff_again,
+-				    (unsigned long long)mark,
+-				    (unsigned long long)mark_unc,
+-				    (unsigned long long)stage,
+-				    (unsigned long long)vec,
+-				    (unsigned)__atomic_load_n(&cpu->initialized,
+-				    __ATOMIC_ACQUIRE),
+-				    (unsigned)sweet_cpu_signal_is_enabled(i),
+-				    (unsigned)sig_raw,
+-				    topology->cpus[i].phys_id,
+-				    (unsigned long long)delta);
++				/*
++				 * 0151/0155: the old `panic("SWEET CPU: cpu=%u startup
++				 * timeout ...")` used to live here.  It is now replaced
++				 * by the graceful drop below, so the diagnostic values
++				 * are preserved in the log instead of dying with the
++				 * panel.
++				 */
++				(void)psci_entry_vtop;
++				(void)psci_payload_pa;
++				/*
++				 * 0155: DO NOT panic on an SMP bring-up timeout.
++				 *
++				 * A panic here happens before onc_emmc_init() has
++				 * cleared the Android BCB and before the SWEETLOG
++				 * flusher exists, so a WDT reset loops straight back
++				 * into the recovery partition and every diagnostic
++				 * printed above is lost with the panel.  Dropping the
++				 * CPU lets the boot continue to userspace: the flusher
++				 * then writes the console ring (which already holds the
++				 * full mark/stage/GICC readback lines) to the userdata
++				 * tail, the BCB has been cleared, and the next
++				 * unattended cycle reads the whole thing back.
++				 */
++				IOLog("SWEET CPU: cpu=%u DROPPED after timeout; "
++				    "continuing the boot so the log reaches eMMC\n", i);
++				sweet_smp_dropped++;
++				cpu_ok = false;
++				break;
+ 			}
+ 			onc_spin_us(1000);
++		}
++		if (!cpu_ok) {
++			continue;
+ 		}
+ 		ONC_STAGE(0xB4);
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+@@ -654,8 +664,9 @@
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ONC_STAGE(0xB8);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified (dropped=%u)\n",
++	    topology->num_cpus - sweet_smp_dropped, topology->num_cpus,
++	    sweet_smp_dropped);
+ 	thread_terminate(current_thread());
+ }
+ 

@@ -1,0 +1,506 @@
+SMP PA fix: translate secondary-CPU entry/context with BootArgs (not V=P).
+
+The kernel is NOT V=P: the SWEETXNU payload header has
+virt_base=0xfffffff006000000, phys_base=0x98000000, so
+    pa(va) = BootArgs->physBase + (va - BootArgs->virtBase)
+and the kernel entry PA is ~0x99411488.  ml_static_vtop(&sweet_secondary_entry)
+returned 0x39413800 (outside the kernel physical window), so the TZ-powered
+CPU1 jumped to a random PA and died instantly; 0144's start.s "V=P" delta math
+is invalid for the same reason.
+
+  osfmk/arm64/start.s
+    - sweet_secondary_entry is now address-math-free: SMCCC delivers the PSCI
+      context id in x0, which the boot CPU sets to
+      pa(&sweet_secondary_marks[logical]); first store
+      `MOV64 x8,0x4d41524b; str x8,[x0]; dsb sy`, then a second magic
+      (0x4b5241b2) to [x0,#8] after the EL branch (EL1 and EL2 paths).
+      The 0144 adrp/delta macro and its marks are deleted; the remaining
+      EL2/EL1 bring-up flow is unchanged and boot-CPU paths are untouched.
+  osfmk/arm64/arm_vm_init.c
+    - read-only sweet_get_ptov_entries() accessor (first ptov_table entries)
+      for the diagnostic print; ml_static_vtop() returned a stale ptov_table
+      hit instead of panicking, so its value must not be used for secondary
+      CPUs on this port.
+  iokit/Kernel/arm/SweetCPU.cpp
+    - sweet_kva_to_pa() via BootArgs for the CPU_ON entry (x2) and context
+      (x3 = PA of the mark word); prints boot virt/phys, entry_va,
+      entry_vtop (ml_static_vtop), entry BootArgs PA, payload-derived entry PA,
+      marks VA/vtop/PA and ptov_table[0] in the CPU_ON log and at timeout;
+    - 0150's uncached mark alias uses the BootArgs translation now;
+    - timeout IOLog/panic carry entry_vtop and payload PA.
+  bsd/dev/onc_emmc.c
+    - SWEET HALT: summary now shows entry, vtop, payload and ctx.
+
+Expected: entry BootArgs PA ~0x99411488 (payload entry 0xfffffff007411488),
+ctx = PA of sweet_secondary_marks[1] (~0x9cxxxxxx), and if CPU1 runs our entry
+the first word of the mark array becomes 0x4d41524b (+0x4b5241b2 at +8).
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -281,112 +281,78 @@
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
+ #if defined(SWEET)
+ /*
+- * 0144: secondary-only progress marks.
+- *
+- * This function runs ONLY on PSCI CPU_ON (secondaries); the boot CPU takes
+- * _start -> start_first_cpu and never executes anything here, so the
+- * boot-CPU path is byte-identical to the CI base again (0142's marks in
+- * reset_vector/start_cpu/common_start are reverted by this patch).
+- *
+- * A PSCI CPU_ON entry has no stack (SMCCC only defines x0 = context_id), so
+- * nothing is pushed via SP.  Only x2/x3/x16/x17 are used; all of them are
+- * dead at this entry (caller-saved / intra-procedure scratch, and this is the
+- * first code to run).  x0 (context id) is saved in x2 and restored at the end
+- * of every mark; x0/x1 and x18-x30 are never touched.
+- *
+- * MMU is off: PA(sym) = PC_pa + (sym_VA - entry_VA) (image linked V=P).
+- */
+-.macro SWEET_ENTRY_MARK mark, stage
+-	mov	x2, x0
+-	cmp	x2, #8
+-	b.hs	9f
+-	/* per-cpu mark: sweet_secondary_marks[context] = mark */
+-	adr	x3, .
+-	adrp	x16, EXT(sweet_secondary_marks)@page
+-	add	x16, x16, EXT(sweet_secondary_marks)@pageoff
+-	adrp	x17, EXT(sweet_secondary_entry)@page
+-	add	x17, x17, EXT(sweet_secondary_entry)@pageoff
+-	sub	x17, x16, x17
+-	add	x16, x3, x17
+-	MOV64	x17, \mark
+-	str	x17, [x16, x2, lsl #3]
+-	dsb	sy
+-	/* single global stage slot: sweet_smp_stage = stage */
+-	adr	x3, .
+-	adrp	x16, EXT(sweet_smp_stage)@page
+-	add	x16, x16, EXT(sweet_smp_stage)@pageoff
+-	adrp	x17, EXT(sweet_secondary_entry)@page
+-	add	x17, x17, EXT(sweet_secondary_entry)@pageoff
+-	sub	x17, x16, x17
+-	add	x16, x3, x17
+-	MOV64	x17, \stage
+-	str	x17, [x16]
+-	dsb	sy
+-9:
+-	mov	x0, x2
+-.endm
+-
+-/* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
+- * Keep this separate from __start (which requires x0=boot_args PA).
+- * Firmware may return at EL1 or EL2; check before accessing EL1 state.
+- * The EL2 path assumes no resident hypervisor and CNTVOFF_EL2=0 on boot.
++ * 0151: secondary-only PSCI entry.
++ *
++ * The kernel is NOT V=P on this port (SWEETXNU payload: virtBase
++ * 0xfffffff006000000, physBase 0x98000000), so 0144's "PA = PC + (sym_VA -
++ * entry_VA)" delta math is invalid and has been deleted.
++ *
++ * The boot CPU translates every secondary-CPU address with
++ *     pa(va) = BootArgs->physBase + (va - BootArgs->virtBase)
++ * and passes x1 = target MPIDR, x2 = pa(&sweet_secondary_entry),
++ * x3 = pa(&sweet_secondary_marks[logical]) as the PSCI context id.  On entry
++ * SMCCC delivers the context id in x0, so the first store needs no address
++ * computation at all.  The mark word is the only state needed to prove that
++ * this entry ran; a second magic at +8 proves the EL branch was reached.
+  */
+ 	.align 2
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+-	/* 0144: mark 1 - entry reached (x0 = PSCI context = logical cpu id). */
+-	SWEET_ENTRY_MARK 1, 0xE0
+-	msr		DAIFSet, #0xf
+-	mrs		x1, CurrentEL
+-	cmp		x1, #0x4
++	/* 0151: first magic "MARK" - the entry ran; no address math. */
++	MOV64	x8, 0x4d41524b
++	str	x8, [x0]
++	dsb	sy
++	msr	DAIFSet, #0xf
++	mrs	x1, CurrentEL
++	cmp	x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+-	cmp		x1, #0x8
++	cmp	x1, #0x8
+ 	b.ne	Lsweet_secondary_bad_el
+-	/* 0144: mark 0x12 - firmware entered the secondary at EL2. */
+-	SWEET_ENTRY_MARK 0x12, 0xE2
++	/* 0151: second magic after the EL branch (EL2 path). */
++	MOV64	x9, 0x4b5241b2
++	str	x9, [x0, #8]
++	dsb	sy
+ 	adrp	x1, EXT(LowExceptionVectorBase)@page
+-	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
+-	msr		VBAR_EL2, x1
++	add	x1, x1, EXT(LowExceptionVectorBase)@pageoff
++	msr	VBAR_EL2, x1
+ 	/* No stage 2, AArch64 EL1, no EL2 interrupt or FP/debug traps. */
+-	mov		x1, #(1 << 31)
+-	msr		HCR_EL2, x1
+-	msr		VTTBR_EL2, xzr
+-	msr		CPTR_EL2, xzr
+-	msr		MDCR_EL2, xzr
+-	mov		x1, #3
+-	msr		CNTHCTL_EL2, x1
+-	msr		CNTVOFF_EL2, xzr
++	mov	x1, #(1 << 31)
++	msr	HCR_EL2, x1
++	msr	VTTBR_EL2, xzr
++	msr	CPTR_EL2, xzr
++	msr	MDCR_EL2, xzr
++	mov	x1, #3
++	msr	CNTHCTL_EL2, x1
++	msr	CNTVOFF_EL2, xzr
+ #if HAS_GIC_V2
+-	/*
+-	 * onc: a GIC-400 has no GICv3 ICC_*_EL2 system registers, so touching
+-	 * them here would UNDEF if PSCI enters the secondary at EL2 (the boot
+-	 * CPU runs at EL1 per the shim).  The GICv2 driver uses GICD/GICC MMIO.
+-	 */
++	/* onc: a GIC-400 has no GICv3 ICC_*_EL2 system registers. */
+ #else
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+-	mrs		x1, ICC_SRE_EL2
+-	orr		x1, x1, #1
+-	orr		x1, x1, #8
+-	msr		ICC_SRE_EL2, x1
++	mrs	x1, ICC_SRE_EL2
++	orr	x1, x1, #1
++	orr	x1, x1, #8
++	msr	ICC_SRE_EL2, x1
+ #endif
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+-	msr		SCTLR_EL1, x1
++	msr	SCTLR_EL1, x1
+ 	isb
+ 	adrp	x1, Lsweet_secondary_el1@page
+-	add		x1, x1, Lsweet_secondary_el1@pageoff
+-	msr		ELR_EL2, x1
+-	mov		x1, #0x3c5			// DAIF masked, AArch64 EL1h
+-	msr		SPSR_EL2, x1
++	add	x1, x1, Lsweet_secondary_el1@pageoff
++	msr	ELR_EL2, x1
++	mov	x1, #0x3c5			// DAIF masked, AArch64 EL1h
++	msr	SPSR_EL2, x1
+ 	eret
+ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
+-	/* 0144: mark 2 - EL1 path, about to enter LowResetVectorBase. */
+-	SWEET_ENTRY_MARK 2, 0xE3
+-	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+-	msr		SPSel, #1
+-	b		EXT(LowResetVectorBase)
++	/* 0151: second magic after the EL branch (EL1 path). */
++	MOV64	x9, 0x4b5241b2
++	str	x9, [x0, #8]
++	dsb	sy
++	/* x0 (the mark PA) is unused from here on; reset_vector selects the CPU
++	 * data by MPIDR. */
++	msr	SPSel, #1
++	b	EXT(LowResetVectorBase)
+ #endif /* SWEET */
+ 
+ 	.align 2
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -421,6 +421,36 @@
+ 		    (void*)va, (unsigned long long)gVirtBase, (unsigned long long)gPhysSize);
+ 	}
+ 	return (vm_address_t)(va) - gVirtBase + gPhysBase;
++}
++
++/*
++ * 0151: read-only accessor for the first ptov_table entries.  The SweetCPU SMP
++ * bring-up log uses it to show why ml_static_vtop() returned a PA outside the
++ * kernel physical window for a kernel text VA (a stale/early ptov_table hit
++ * instead of the "illegal VA" panic path).
++ */
++void
++sweet_get_ptov_entries(uint64_t *va, uint64_t *pa, uint64_t *len, uint32_t max,
++    uint32_t *count)
++{
++	uint32_t n = 0;
++
++	for (size_t i = 0; (i < PTOV_TABLE_SIZE) && (i < (size_t)max) &&
++	    (ptov_table[i].len != 0); i++) {
++		if (va != NULL) {
++			va[n] = ptov_table[i].va;
++		}
++		if (pa != NULL) {
++			pa[n] = ptov_table[i].pa;
++		}
++		if (len != NULL) {
++			len[n] = ptov_table[i].len;
++		}
++		n++;
++	}
++	if (count != NULL) {
++		*count = n;
++	}
+ }
+ 
+ /*
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
+ 
+ /*
+  * onc: stage markers.  <arm64/sweet_early.h> is not pulled in here on purpose:
+@@ -84,6 +85,20 @@
+ 
+ /* 0150: ml_io_map() is only declared for MACH_KERNEL_PRIVATE builds. */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++}
++
++/*
++ * 0151: PA fix / diagnostics.  The kernel is NOT V=P, so secondary-CPU
++ * addresses are translated with BootArgs (pa = physBase + (va - virtBase)).
++ * The p2v accessor exposes the first ptov_table entries to explain why
++ * ml_static_vtop() returned a value outside the kernel physical window.
++ */
++extern "C" {
++extern boot_args *BootArgs;
++volatile uint64_t sweet_psci_last_entry_vtop;
++volatile uint64_t sweet_psci_last_payload_pa;
++void sweet_get_ptov_entries(uint64_t *va, uint64_t *pa, uint64_t *len,
++    uint32_t max, uint32_t *count);
+ }
+ 
+ static inline void
+@@ -218,7 +233,76 @@
+ 	    sizeof(sweet_smp_vector_hit));
+ }
+ 
+-/* 0150: uncached alias of the physical page holding sweet_secondary_marks[]. */
++/*
++ * 0151: translate a kernel VA to a PA with BootArgs.  This is the correct
++ * translation for secondary-CPU entry/context addresses on this port: the
++ * kernel is not V=P (payload virtBase 0xfffffff006000000, physBase
++ * 0x98000000) and ml_static_vtop() returned a stale ptov_table value
++ * (0x39413800) for &sweet_secondary_entry.  Keep ml_static_vtop() only as a
++ * last-resort fallback for builds whose BootArgs are not up yet.
++ */
++static uint64_t
++sweet_kva_to_pa(uint64_t va)
++{
++	if (BootArgs != NULL && BootArgs->virtBase != 0 &&
++	    va >= BootArgs->virtBase) {
++		return BootArgs->physBase + (va - BootArgs->virtBase);
++	}
++	return (uint64_t)ml_static_vtop((vm_offset_t)va);
++}
++
++/* 0151: SWEETXNU payload header entry VA, for the PA cross-check. */
++#define SWEET_PAYLOAD_ENTRY_VA	0xfffffff007411488ULL
++
++static uint64_t
++sweet_payload_entry_pa(void)
++{
++	return sweet_kva_to_pa(SWEET_PAYLOAD_ENTRY_VA);
++}
++
++/*
++ * 0151: print the address math for one secondary CPU: BootArgs bases,
++ * entry_va / ml_static_vtop / BootArgs PA, the payload-derived entry PA, the
++ * mark word VA/vtop/PA and the first ptov_table entry.  If entry_vtop differs
++ * from entry_pa, the entry passed to PSCI was not our code.
++ */
++static void
++sweet_print_entry_math(const char *tag, uint32_t logical)
++{
++	uint64_t entry_va = (uint64_t)&sweet_secondary_entry;
++	uint64_t marks_va = (uint64_t)&sweet_secondary_marks[logical];
++	uint64_t entry_vtop = (uint64_t)ml_static_vtop((vm_offset_t)entry_va);
++	uint64_t entry_pa = sweet_kva_to_pa(entry_va);
++	uint64_t marks_vtop = (uint64_t)ml_static_vtop((vm_offset_t)marks_va);
++	uint64_t marks_pa = sweet_kva_to_pa(marks_va);
++	uint64_t payload_pa = sweet_payload_entry_pa();
++	uint64_t pv_va = 0;
++	uint64_t pv_pa = 0;
++	uint64_t pv_len = 0;
++	uint32_t pv_count = 0;
++
++	sweet_get_ptov_entries(&pv_va, &pv_pa, &pv_len, 1, &pv_count);
++	IOLog("SWEET CPU: %s cpu=%u boot_virt=0x%llx boot_phys=0x%llx "
++	    "entry_va=0x%llx entry_vtop=0x%llx entry_pa=0x%llx "
++	    "payload_va=0x%llx payload_pa=0x%llx "
++	    "marks_va=0x%llx marks_vtop=0x%llx marks_pa=0x%llx "
++	    "ptov0_va=0x%llx ptov0_pa=0x%llx ptov0_len=0x%llx\n",
++	    tag, logical,
++	    BootArgs != NULL ? (unsigned long long)BootArgs->virtBase : 0ULL,
++	    BootArgs != NULL ? (unsigned long long)BootArgs->physBase : 0ULL,
++	    (unsigned long long)entry_va, (unsigned long long)entry_vtop,
++	    (unsigned long long)entry_pa,
++	    (unsigned long long)SWEET_PAYLOAD_ENTRY_VA,
++	    (unsigned long long)payload_pa,
++	    (unsigned long long)marks_va, (unsigned long long)marks_vtop,
++	    (unsigned long long)marks_pa,
++	    (unsigned long long)pv_va, (unsigned long long)pv_pa,
++	    (unsigned long long)pv_len);
++}
++
++/*
++ * 0150: uncached alias of the physical page holding sweet_secondary_marks[].
++ */
+ static volatile uint64_t *
+ sweet_smp_marks_uncached(void)
+ {
+@@ -227,7 +311,10 @@
+ 	if (alias == NULL) {
+ 		vm_offset_t va = (vm_offset_t)&sweet_secondary_marks[0];
+ 		vm_offset_t off = va & 0xFFF;
+-		vm_offset_t page_pa = ml_static_vtop(va) & ~(vm_offset_t)0xFFF;
++		/* 0151: ml_static_vtop() returned a bogus PA for this kernel
++		 * (stale ptov_table hit), so translate with BootArgs. */
++		vm_offset_t page_pa = (vm_offset_t)
++		    (sweet_kva_to_pa((uint64_t)va) & ~(uint64_t)0xFFF);
+ 		vm_offset_t map = ml_io_map(page_pa, 0x2000);
+ 
+ 		if (map != 0) {
+@@ -407,6 +494,8 @@
+ 		IOLog("ONC: cpu%u processor_start (init=%u sig_en=%u irq=%llu vt=%llu)\n",
+ 		    i, (unsigned)__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 		    (unsigned)sweet_cpu_signal_is_enabled(i), onc_irq_count, onc_vtimer_count);
++		/* 0151: prove the entry PA math before starting the CPU. */
++		sweet_print_entry_math("startAll", i);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		ONC_STAGE(0xB2);
+ 		IOLog("ONC: cpu%u processor_start -> %d (init=%u sig_en=%u irq=%llu vt=%llu)\n",
+@@ -478,15 +567,24 @@
+ 				    &sweet_smp_aff_after, __ATOMIC_ACQUIRE);
+ 				int32_t aff_again = __atomic_load_n(
+ 				    &sweet_smp_aff_again, __ATOMIC_ACQUIRE);
+-
++				/* 0151: address-math cross-check at timeout. */
++				uint64_t psci_entry_vtop = __atomic_load_n(
++				    &sweet_psci_last_entry_vtop, __ATOMIC_ACQUIRE);
++				uint64_t psci_payload_pa = __atomic_load_n(
++				    &sweet_psci_last_payload_pa, __ATOMIC_ACQUIRE);
++
++				sweet_print_entry_math("timeout", i);
+ 				IOLog("SWEET CPU: cpu=%u start phys=0x%x "
+-				    "target=0x%llx entry=0x%llx ctx=%llu rc=%d "
++				    "target=0x%llx entry=0x%llx "
++				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu rc=%d "
+ 				    "aff=%d/%d/%d NOT alive after 5s "
+ 				    "mark=0x%llx mark_uncached=0x%llx stage=0x%llx "
+ 				    "vec=0x%llx init=%u sig=%u delta=%llu\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
++				    (unsigned long long)psci_entry_vtop,
++				    (unsigned long long)psci_payload_pa,
+ 				    (unsigned long long)psci_ctx, (int)psci_rc,
+ 				    (int)aff_before, (int)aff_after,
+ 				    (int)aff_again,
+@@ -499,12 +597,15 @@
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned long long)delta);
+ 				panic("SWEET CPU: cpu=%u startup timeout "
+-				    "target=0x%llx entry=0x%llx ctx=%llu rc=%d "
+-				    "aff=%d/%d/%d mark=0x%llx mark_uncached=0x%llx "
+-				    "stage=0x%llx vec=0x%llx init=%u sig=%u "
+-				    "phys=0x%x delta=%llu", i,
++				    "target=0x%llx entry=0x%llx "
++				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu "
++				    "rc=%d aff=%d/%d/%d mark=0x%llx "
++				    "mark_uncached=0x%llx stage=0x%llx vec=0x%llx "
++				    "init=%u sig=%u phys=0x%x delta=%llu", i,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
++				    (unsigned long long)psci_entry_vtop,
++				    (unsigned long long)psci_payload_pa,
+ 				    (unsigned long long)psci_ctx, (int)psci_rc,
+ 				    (int)aff_before, (int)aff_after,
+ 				    (int)aff_again,
+@@ -629,7 +730,15 @@
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+-	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	/* 0151: the kernel is NOT V=P; translate with BootArgs.  x2 = entry PA,
++	 * x3 = PA of this CPU's mark word (the PSCI context id). */
++	uint64_t entry_va = (uint64_t)&sweet_secondary_entry;
++	uint64_t entry_vtop = (uint64_t)ml_static_vtop((vm_offset_t)entry_va);
++	uint64_t entry_pa = sweet_kva_to_pa(entry_va);
++	uint64_t ctx_pa = sweet_kva_to_pa(
++	    (uint64_t)&sweet_secondary_marks[getCPUNumber()]);
++	uint64_t payload_pa = sweet_payload_entry_pa();
++	vm_offset_t entry = (vm_offset_t)entry_pa;
+ 	/* 0142: clear the progress marks before this CPU_ON so a stale value from
+ 	 * a previous attempt cannot be mistaken for progress. */
+ 	sweet_smp_mark(getCPUNumber(), 0);
+@@ -642,21 +751,27 @@
+ 	/* 0147: remember the PSCI parameters for the SMP timeout report. */
+ 	__atomic_store_n(&sweet_psci_last_target, (uint64_t)cpu->phys_id,
+ 	    __ATOMIC_RELEASE);
+-	__atomic_store_n(&sweet_psci_last_entry, (uint64_t)entry,
++	__atomic_store_n(&sweet_psci_last_entry, entry_pa, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_psci_last_entry_vtop, entry_vtop,
+ 	    __ATOMIC_RELEASE);
+-	__atomic_store_n(&sweet_psci_last_context, (uint64_t)getCPUNumber(),
++	__atomic_store_n(&sweet_psci_last_payload_pa, payload_pa,
+ 	    __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_psci_last_context, ctx_pa, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_psci_last_rc, 0x7fffffff, __ATOMIC_RELEASE);
+ 	/* 0150: affinity before CPU_ON (0=ON, 1=OFF, 2=ON_PENDING). */
+ 	int32_t aff_before = sweet_psci_affinity_info(cpu->phys_id, 0);
+ 	__atomic_store_n(&sweet_smp_aff_before, aff_before, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_smp_aff_after, -2, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&sweet_smp_aff_again, -2, __ATOMIC_RELEASE);
+-	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u "
+-	    "aff_before=%d\n", getCPUNumber(), cpu->phys_id, (uint64_t)entry,
+-	    getCPUNumber(), (int)aff_before);
++	sweet_print_entry_math("CPU_ON", getCPUNumber());
++	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_va=0x%llx "
++	    "entry_vtop=0x%llx entry_pa=0x%llx ctx_pa=0x%llx payload_pa=0x%llx "
++	    "aff_before=%d\n", getCPUNumber(), cpu->phys_id,
++	    (unsigned long long)entry_va, (unsigned long long)entry_vtop,
++	    (unsigned long long)entry_pa, (unsigned long long)ctx_pa,
++	    (unsigned long long)payload_pa, (int)aff_before);
+ 	__builtin_arm_dsb(DSB_SY);
+-	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry_pa, ctx_pa);
+ 	__atomic_store_n(&sweet_psci_last_rc, rc, __ATOMIC_RELEASE);
+ 	/* 0150: did the TZ actually power the core? */
+ 	int32_t aff_after = sweet_psci_affinity_info(cpu->phys_id, 0);
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -280,6 +280,10 @@
+ extern volatile int32_t sweet_smp_aff_again;
+ extern volatile uint64_t sweet_smp_mark_cached;
+ extern volatile uint64_t sweet_smp_mark_uncached;
++/* 0151: PA-fix diagnostics (entry_vtop vs BootArgs PA, payload entry PA). */
++extern volatile uint64_t sweet_psci_last_entry_vtop;
++extern volatile uint64_t sweet_psci_last_payload_pa;
++extern volatile uint64_t sweet_psci_last_context;
+ 
+ static LCK_GRP_DECLARE(onc_emmc_grp, "onc_emmc");
+ static LCK_MTX_DECLARE(onc_emmc_lock, &onc_emmc_grp);
+@@ -2537,13 +2541,20 @@
+ 
+ 		if (scpu >= 0 && scpu < 8) {
+ 			printf("SWEET HALT: summary cpu=%d target=0x%llx "
+-			    "entry=0x%llx rc=%d aff=%d/%d/%d "
++			    "entry=0x%llx vtop=0x%llx payload=0x%llx "
++			    "ctx=0x%llx rc=%d aff=%d/%d/%d "
+ 			    "mark=0x%llx/0x%llx stage=0x%llx init=%llu "
+ 			    "sig=%llu\n", (int)scpu,
+ 			    (unsigned long long)__atomic_load_n(
+ 			    &sweet_psci_last_target, __ATOMIC_ACQUIRE),
+ 			    (unsigned long long)__atomic_load_n(
+ 			    &sweet_psci_last_entry, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_psci_last_entry_vtop, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_psci_last_payload_pa, __ATOMIC_ACQUIRE),
++			    (unsigned long long)__atomic_load_n(
++			    &sweet_psci_last_context, __ATOMIC_ACQUIRE),
+ 			    (int)__atomic_load_n(&sweet_psci_last_rc,
+ 			    __ATOMIC_ACQUIRE),
+ 			    (int)__atomic_load_n(&sweet_smp_aff_before,

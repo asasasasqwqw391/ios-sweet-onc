@@ -1,0 +1,367 @@
+GIC-400 per-CPU CPU-interface frames (0x2000 stride) for the SGI handshake.
+
+0152's per-PE GIC enable still left `sig=0`: CPU1 runs
+sweet_secondary_entry -> initCPU (mark=0x7 init=1) but its self-IPI never
+arrives.  On a GIC-400 the CPU-interface frames are 0x2000 apart in the SoC
+address map; the DTB only describes CPU0's frame (0x0b002000), so our single
+gicc_base meant every secondary programmed CPU0's interface.  CPU1's own
+interface stayed disabled, the distributor never forwarded its self-SGI and
+cpu_signal_handler() never cleared SIGPdisabled.
+
+  pexpert/pexpert/arm64/SWEET.h
+    - GICD_ISPENDR0 (0x200) for the pending diagnostic.
+  pexpert/arm/pe_fiq.c
+    - gicc_this (this PE's frame) + gicc_stride (default 0x2000; boot arg
+      `sweetgiccoff=<n>`, 0x1000-aligned) and `sweetgiccbase=<hex>` to
+      override the CPU0 frame PA;
+    - pe_gic_setup_this_cpu() = gicc_base + stride*cpu
+      (cpu = ml_get_cpu_number_local());
+    - gicc_read32/gicc_write32 use gicc_this: pe_gic_ack(), pe_gic_eoi(), the
+      per-CPU enable and the dump now hit the current PE's frame;
+    - GICC window mapped 0x8000 bytes (4 frames), boot CPU's frame logged;
+    - pe_gic_cpu_enable() logs `GICC=0x.. ctlr/.. pmr/.. isen/..` per CPU;
+    - pe_gic_sgi_debug() logs GICC_HPPIR + GICD_ISPENDR0 for the SGI bit.
+  iokit/Kernel/arm/SweetCPU.cpp
+    - initCPU(): print GICC frame + readbacks before/after the enable;
+    - `sweetsgidbg=1`: after the IPI is queued, one-shot
+      pe_gic_sgi_debug(SGI1) (pending set but not forwarded vs forwarded and
+      taken); `sweetsgidbg=2` also clears SIGPdisabled directly (old fallback);
+    - timeout output: remove the bogus `cdp=` field, keep `sig_raw=0x%08x`.
+
+SGIR targeting: with the 0x2000 stride the CPU-interface number equals the
+logical CPU index, so GICD_SGIR_TARGET_LIST(1U << cpu) remains correct.
+
+Expected: per-CPU `GICC=0x.. ctlr=0x00000003 pmr=0xff isen=0x00140002`, then
+`came alive; SGI1 OK` and `SWEET CPU: 4/4 CPUs initialized`.
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -58,6 +58,7 @@
+ #define GICD_TYPER                0x0004
+ #define GICD_IGROUPR0             0x0080
+ #define GICD_ISENABLER0           0x0100
++#define GICD_ISPENDR0             0x0200   /* SGI/PPI pending set */
+ #define GICD_IPRIORITYR0          0x0400
+ #define GICD_ICFGR1               0x0C04   /* PPI 16..31 config, 2 bits each */
+ #define GICD_SGIR                 0x0F00
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -250,7 +250,9 @@
+  */
+ 
+ static vm_offset_t gicd_base;
+-static vm_offset_t gicc_base;
++static vm_offset_t gicc_base;      /* CPU0's frame (or sweetgiccbase override) */
++static vm_offset_t gicc_this;      /* this PE's CPU-interface frame (0153) */
++static uint32_t gicc_stride = 0x2000;  /* GIC-400: per-CPU GICC frame stride */
+ 
+ static uint32_t
+ gic_read32(vm_offset_t addr)
+@@ -266,8 +268,33 @@
+ 
+ #define gicd_read32(offset)        (gic_read32(gicd_base + (offset)))
+ #define gicd_write32(offset, data) (gic_write32(gicd_base + (offset), (data)))
+-#define gicc_read32(offset)        (gic_read32(gicc_base + (offset)))
+-#define gicc_write32(offset, data) (gic_write32(gicc_base + (offset), (data)))
++#define gicc_read32(offset)        (gic_read32(gicc_this + (offset)))
++#define gicc_write32(offset, data) (gic_write32(gicc_this + (offset), (data)))
++
++/*
++ * 0153: select THIS PE's GIC-400 CPU-interface frame.  The frames are
++ * gicc_stride (default 0x2000) apart in the SoC address map and the DTB only
++ * describes CPU0's frame, so a global gicc_base meant every PE programmed
++ * CPU0's interface.  ack/eoi/enable/dump must all use gicc_this.
++ */
++vm_offset_t
++pe_gic_setup_this_cpu(void)
++{
++	unsigned int cpu = ml_get_cpu_number_local();
++
++	if (!gicc_base) {
++		return 0;
++	}
++	gicc_this = gicc_base + (vm_offset_t)gicc_stride * (vm_offset_t)cpu;
++	return gicc_this;
++}
++
++/* 0153: this PE's current GICC frame (for the boot-arg/readback prints). */
++vm_offset_t
++pe_gic_this_cpu_frame(void)
++{
++	return gicc_this;
++}
+ 
+ /* Called from sleh_irq(): acknowledge the highest-priority pending Group 1 IRQ. */
+ uint32_t
+@@ -357,10 +384,12 @@
+ pe_gic_cpu_enable(void)
+ {
+ 	uint32_t gicc_ctlr;
+-
+-	if (!gicd_base || !gicc_base) {
++	vm_offset_t frame = pe_gic_setup_this_cpu();
++
++	if (!gicd_base || !frame) {
+ 		return;
+ 	}
++	/* SGI/PPI distributor state is banked per PE on a GICv2. */
+ 	gicd_write32(GICD_IGROUPR0, 0xFFFFFFFF);
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
+@@ -368,6 +397,7 @@
+ 	gicd_write32(GICD_ICFGR1, 0);
+ 	gicd_write32(GICD_ISENABLER0,
+ 	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	/* This PE's CPU interface (0153: frame = gicc_base + stride*cpu). */
+ 	gicc_write32(GICC_PMR, 0xFF);
+ 	gicc_write32(GICC_BPR, 0);
+ 	gicc_ctlr = gicc_read32(GICC_CTLR);
+@@ -375,13 +405,18 @@
+ 	gicc_write32(GICC_CTLR, gicc_ctlr);
+ 	__builtin_arm_dsb(DSB_SY);
+ 	__builtin_arm_isb(ISB_SY);
++	kprintf("SWEET GIC: cpu=%u GICC=0x%llx ctlr=0x%08x pmr=0x%02x "
++	    "isen=0x%08x sgi=%u vt=%u\n", ml_get_cpu_number_local(),
++	    (unsigned long long)frame, gicc_read32(GICC_CTLR),
++	    gicc_read32(GICC_PMR) & 0xFFu, gicd_read32(GICD_ISENABLER0),
++	    SWEET_IPI_SGI, sweet_vtimer_intid);
+ }
+ 
+ /* 0152: read this PE's GICv2 bank back (returns 0 if the GIC is unmapped). */
+ uint32_t
+ pe_gic_cpu_state(uint32_t *ctlr, uint32_t *pmr, uint32_t *isen)
+ {
+-	if (!gicd_base || !gicc_base) {
++	if (!gicd_base || !pe_gic_setup_this_cpu()) {
+ 		return 0;
+ 	}
+ 	if (ctlr != NULL) {
+@@ -397,19 +432,41 @@
+ }
+ 
+ /*
++ * 0153: one-shot SGI delivery diagnostic (`sweetsgidbg=1`), called right after
++ * the self-IPI is queued.  "pending set but never forwarded" points at a
++ * disabled/wrong GICC frame; "forwarded and taken" means the handler ran.
++ */
++void
++pe_gic_sgi_debug(uint32_t sgi)
++{
++	uint32_t ispendr;
++
++	if (!gicd_base || !gicc_this) {
++		kprintf("SWEET GIC: sgi dbg unmapped\n");
++		return;
++	}
++	ispendr = gicd_read32(GICD_ISPENDR0);
++	kprintf("SWEET GIC: sgi dbg cpu=%u frame=0x%llx ispendr=0x%08x "
++	    "sgi_pending=%u hppir=0x%08x ctlr=0x%08x pmr=0x%02x\n",
++	    ml_get_cpu_number_local(), (unsigned long long)gicc_this, ispendr,
++	    (ispendr >> (sgi & 0x1f)) & 1u, gicc_read32(GICC_HPPIR),
++	    gicc_read32(GICC_CTLR), gicc_read32(GICC_PMR) & 0xFFu);
++}
++
++/*
+  * onc: dump the GICv2 state from a hang-safe context (idle).  Reads GICC_HPPIR
+- * only -- reading GICC_IAR would acknowledge an interrupt.
+  */
+ void
+ pe_gic_dump(void)
+ {
+-	if (!gicd_base || !gicc_base) {
++	if (!gicd_base || !pe_gic_setup_this_cpu()) {
+ 		kprintf("ONC GIC: not mapped (gicd=%p gicc=%p)\n",
+ 		    (void *) gicd_base, (void *) gicc_base);
+ 		return;
+ 	}
+-	kprintf("ONC GIC: vt=%u D_CTLR=%x EN0=%x GRP0=%x PRI%u=%x "
+-	    "C_CTLR=%x PMR=%x BPR=%x HPPIR=%x\n",
++	kprintf("ONC GIC: cpu=%u frame=0x%llx vt=%u D_CTLR=%x EN0=%x "
++	    "GRP0=%x PRI%u=%x C_CTLR=%x PMR=%x BPR=%x HPPIR=%x\n",
++	    ml_get_cpu_number_local(), (unsigned long long)gicc_this,
+ 	    sweet_vtimer_intid,
+ 	    gicd_read32(GICD_CTLR),
+ 	    gicd_read32(GICD_ISENABLER0),
+@@ -466,14 +523,42 @@
+ 		soc_base_phys = pe_arm_get_soc_base_phys();
+ 		gicd_base = ml_io_map(soc_base_phys + ((uint64_t const *) prop)[0],
+ 		    ((uint64_t const *) prop)[1]);
+-		gicc_base = ml_io_map(soc_base_phys + ((uint64_t const *) prop)[2],
+-		    ((uint64_t const *) prop)[3]);
++		{
++			uint64_t gicc_phys = soc_base_phys +
++			    ((uint64_t const *) prop)[2];
++			uint64_t gicc_size = ((uint64_t const *) prop)[3];
++			uint64_t gicc_ovr = 0;
++			uint32_t gicc_off = 0;
++
++			/*
++			 * 0153: the DTB describes only CPU0's GICC frame; the
++			 * other CPUs' frames follow at gicc_stride intervals
++			 * (0x2000 on a GIC-400).  Map a 4-frame window and allow
++			 * both values to be overridden for A/B testing.
++			 */
++			if (PE_parse_boot_argn("sweetgiccbase", &gicc_ovr,
++			    sizeof(gicc_ovr)) && gicc_ovr != 0) {
++				gicc_phys = gicc_ovr;
++			}
++			if (PE_parse_boot_argn("sweetgiccoff", &gicc_off,
++			    sizeof(gicc_off)) && (gicc_off & 0xFFFu) == 0) {
++				gicc_stride = gicc_off;
++			}
++			if (gicc_size < 0x8000) {
++				gicc_size = 0x8000;
++			}
++			gicc_base = ml_io_map(gicc_phys, gicc_size);
++		}
+ 		if (!gicd_base || !gicc_base) {
+ 			panic("%s: cannot map GICD/GICC regions", __func__);
+ 		}
+-		kprintf("SWEET GICv2: GICD %p GICC %p, vtimer INTID %u, SGI %u\n",
+-		    (void *) gicd_base, (void *) gicc_base, sweet_vtimer_intid,
+-		    SWEET_IPI_SGI);
++		gicc_this = gicc_base;
++		(void)pe_gic_setup_this_cpu();
++		kprintf("SWEET GICv2: GICD %p GICC %p boot-frame 0x%llx "
++		    "stride 0x%x, vtimer INTID %u, SGI %u\n",
++		    (void *) gicd_base, (void *) gicc_base,
++		    (unsigned long long)gicc_this, gicc_stride,
++		    sweet_vtimer_intid, SWEET_IPI_SGI);
+ 	}
+ 
+ 	/*
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -101,11 +101,14 @@
+     uint32_t max, uint32_t *count);
+ }
+ 
+-/* 0152: per-CPU GICv2 bank bring-up + cpu_signal diagnostics. */
++/* 0152/0153: per-CPU GICv2 bring-up + cpu_signal diagnostics. */
+ extern "C" {
+ #if HAS_GIC_V2
+ void pe_gic_cpu_enable(void);
+ uint32_t pe_gic_cpu_state(uint32_t *ctlr, uint32_t *pmr, uint32_t *isen);
++vm_offset_t pe_gic_setup_this_cpu(void);
++vm_offset_t pe_gic_this_cpu_frame(void);
++void pe_gic_sgi_debug(uint32_t sgi);
+ #endif
+ uint32_t sweet_cpu_get_signal_raw(unsigned int cpu);
+ uint64_t sweet_cpu_data_va(unsigned int cpu);
+@@ -583,9 +586,8 @@
+ 				    &sweet_psci_last_entry_vtop, __ATOMIC_ACQUIRE);
+ 				uint64_t psci_payload_pa = __atomic_load_n(
+ 				    &sweet_psci_last_payload_pa, __ATOMIC_ACQUIRE);
+-				/* 0152: raw cpu_signal / CpuData for the handshake. */
++				/* 0152: raw cpu_signal for the handshake. */
+ 				uint32_t sig_raw = sweet_cpu_get_signal_raw(i);
+-				uint64_t cdp_va = sweet_cpu_data_va(i);
+ 
+ 				sweet_print_entry_math("timeout", i);
+ 				IOLog("SWEET CPU: cpu=%u start phys=0x%x "
+@@ -593,8 +595,8 @@
+ 				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu rc=%d "
+ 				    "aff=%d/%d/%d NOT alive after 5s "
+ 				    "mark=0x%llx mark_uncached=0x%llx stage=0x%llx "
+-				    "vec=0x%llx init=%u sig=%u sig_raw=0x%x "
+-				    "cdp=0x%llx delta=%llu\n",
++				    "vec=0x%llx init=%u sig=%u sig_raw=0x%08x "
++				    "delta=%llu\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
+@@ -611,14 +613,13 @@
+ 				    __ATOMIC_ACQUIRE),
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned)sig_raw,
+-				    (unsigned long long)cdp_va,
+ 				    (unsigned long long)delta);
+ 				panic("SWEET CPU: cpu=%u startup timeout "
+ 				    "target=0x%llx entry=0x%llx "
+ 				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu "
+ 				    "rc=%d aff=%d/%d/%d mark=0x%llx "
+ 				    "mark_uncached=0x%llx stage=0x%llx vec=0x%llx "
+-				    "init=%u sig=%u sig_raw=0x%x cdp=0x%llx "
++				    "init=%u sig=%u sig_raw=0x%08x "
+ 				    "phys=0x%x delta=%llu", i,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
+@@ -635,7 +636,6 @@
+ 				    __ATOMIC_ACQUIRE),
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
+ 				    (unsigned)sig_raw,
+-				    (unsigned long long)cdp_va,
+ 				    topology->cpus[i].phys_id,
+ 				    (unsigned long long)delta);
+ 			}
+@@ -685,22 +685,24 @@
+ 		uint32_t pmr = 0;
+ 		uint32_t isen = 0;
+ 		uint32_t mapped;
++		vm_offset_t frame = pe_gic_setup_this_cpu();
+ 
+ 		/*
+-		 * 0152: program THIS PE's banked GICv2 state (SGI + vtimer PPI,
+-		 * GICC_CTLR/PMR/BPR).  pe_init_fiq() only ran on the boot CPU;
+-		 * without this the self-IPI queued below stays pending on a
+-		 * secondary and SIGPdisabled is never cleared.
++		 * 0152/0153: program THIS PE's GICv2 state in THIS PE's
++		 * CPU-interface frame (GIC-400 frames are gicc_stride apart;
++		 * the DTB only describes CPU0's).  If the self-IPI below stays
++		 * pending, the frame/readback printed here shows it.
+ 		 */
+ 		mapped = pe_gic_cpu_state(&ctlr, &pmr, &isen);
+-		kprintf("SWEET CPU: cpu=%u GIC self before en=%u ctlr=0x%08x "
+-		    "pmr=0x%02x isen=0x%08x sgi=%u\n", getCPUNumber(), mapped,
+-		    ctlr, pmr, isen, SWEET_IPI_SGI);
++		kprintf("SWEET CPU: cpu=%u GICC=0x%llx GIC self before en=%u "
++		    "ctlr=0x%08x pmr=0x%02x isen=0x%08x sgi=%u\n",
++		    getCPUNumber(), (unsigned long long)frame, mapped, ctlr,
++		    pmr, isen, SWEET_IPI_SGI);
+ 		pe_gic_cpu_enable();
+ 		mapped = pe_gic_cpu_state(&ctlr, &pmr, &isen);
+-		kprintf("SWEET CPU: cpu=%u GIC self after en=%u ctlr=0x%08x "
+-		    "pmr=0x%02x isen=0x%08x\n", getCPUNumber(), mapped, ctlr,
+-		    pmr, isen);
++		kprintf("SWEET CPU: cpu=%u GICC=0x%llx GIC self after en=%u "
++		    "ctlr=0x%08x pmr=0x%02x isen=0x%08x\n", getCPUNumber(),
++		    (unsigned long long)frame, mapped, ctlr, pmr, isen);
+ 	}
+ #endif
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+@@ -713,19 +715,25 @@
+ 	{
+ 		uint32_t sgidbg = 0;
+ 
+-		/*
+-		 * 0152 last-resort debug fallback (`sweetsgidbg=1`): clear
+-		 * SIGPdisabled directly after the IPI is queued, so the handshake
+-		 * succeeds even if IPI delivery is broken.  Not the default: see
+-		 * the plan's SIGPdisabled audit.
+-		 */
+ 		if (PE_parse_boot_argn("sweetsgidbg", &sgidbg, sizeof(sgidbg)) &&
+ 		    sgidbg != 0) {
+-			sweet_cpu_sigpdisabled_clear();
+-			kprintf("SWEET CPU: cpu=%u sweetsgidbg cleared "
+-			    "SIGPdisabled directly (sig=0x%08x)\n",
+-			    getCPUNumber(),
+-			    sweet_cpu_get_signal_raw(getCPUNumber()));
++#if HAS_GIC_V2
++			/*
++			 * 0153: one-shot delivery diagnostic right after the
++			 * self-IPI is queued: pending-set-but-not-forwarded means a
++			 * disabled/wrong GICC frame, forwarded-and-taken means the
++			 * handler ran.
++			 */
++			pe_gic_sgi_debug(SWEET_IPI_SGI);
++#endif
++			if (sgidbg >= 2) {
++				/* 0152 last-resort fallback (not the default). */
++				sweet_cpu_sigpdisabled_clear();
++				kprintf("SWEET CPU: cpu=%u sweetsgidbg cleared "
++				    "SIGPdisabled directly (sig=0x%08x)\n",
++				    getCPUNumber(),
++				    sweet_cpu_get_signal_raw(getCPUNumber()));
++			}
+ 		}
+ 	}
+ 	/* 0142: mark 6 - self-IPI queued. */

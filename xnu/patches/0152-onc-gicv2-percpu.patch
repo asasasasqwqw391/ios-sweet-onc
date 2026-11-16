@@ -1,0 +1,262 @@
+GICv2 per-CPU bank bring-up so the secondary self-IPI clears SIGPdisabled.
+
+0151 proved CPU1 executes our entry (mark=0x7 init=1, affinity 1->2->0) but the
+SGI handshake never completes (sig=0 forever).  The GIC-400 banks the SGI/PPI
+distributor registers (IGROUPR0/IPRIORITYR0/ICFGR1/ISENABLER0) and the CPU
+interface (GICC_CTLR/PMR/BPR) per PE; pe_init_fiq() only ran on the boot CPU,
+so CPU1's bank was never programmed and the self-IPI stayed pending.
+
+  pexpert/arm/pe_fiq.c
+    - pe_gic_cpu_enable(): program THIS PE's bank (Group 1 for SGIs/PPIs,
+      priority 0xA0, ICFGR1 level, ISENABLER0 |= SGI1|vtimer, GICC_PMR=0xFF,
+      GICC_BPR=0, GICC_CTLR |= ENABLEGRP1|ENABLEGRP1A) + dsb/isb.  Idempotent.
+    - pe_gic_cpu_state(): read back this PE's GICC_CTLR/GICC_PMR/
+      GICD_ISENABLER0 (0 if the GIC is not mapped yet).
+  iokit/Kernel/arm/SweetCPU.cpp
+    - initCPU(): before signalCPU(this) print the before state, call
+      pe_gic_cpu_enable(), print the after state
+      (`SWEET CPU: cpu=%u GIC self before/after en=.. ctlr=.. pmr=.. isen=..`);
+      after queueing print `signalCPU done (SGI%u sig=0x..)`;
+    - `sweetsgidbg=1` fallback (default off): clear SIGPdisabled directly after
+      the IPI is queued (audit in the plan: only safe as a last-resort
+      bring-up hack; it defeats XNU's "IPIs blocked until the startup thread
+      unmasks IRQs" serialisation but the queued IPI still runs later);
+    - timeout path prints the failing CPU's raw cpu_signal and CpuData VA
+      (`sig_raw=0x%x cdp=0x%llx`) to tell "IPI not delivered" from "handler ran
+      but did not clear the bit".
+  osfmk/arm64/cpu.c
+    - SWEET helpers: sweet_cpu_get_signal_raw(), sweet_cpu_data_va(),
+      sweet_cpu_sigpdisabled_clear().
+
+Expected: `SWEET CPU: cpu=1 GIC self after en=1 ctlr=0x...3 isen=0x...03`
+(bit1 SGI1 + vtimer bit set), then `signalCPU done`, then the boot CPU prints
+`came alive; SGI1 OK` and finally `SWEET CPU: 4/4 CPUs initialized`.
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -341,6 +341,59 @@
+ 	gicd_write32(GICD_SGIR, GICD_SGIR_SGI(SWEET_IPI_SGI) |
+ 	    GICD_SGIR_TARGET_LIST(1U << iface));
+ 	__builtin_arm_isb(ISB_SY);
++}
++
++/*
++ * 0152: per-CPU GICv2 bank bring-up.
++ *
++ * On a GIC-400 the SGI/PPI distributor registers (IGROUPR0, IPRIORITYR0,
++ * ICFGR1, ISENABLER0) and the whole CPU interface (GICC_*) are banked per PE:
++ * every PE must program its own bank from its own context.  pe_init_fiq()
++ * only runs on the boot CPU, so without this the self-IPI queued by
++ * SweetCPU::initCPU() on a secondary stays pending and SIGPdisabled is never
++ * cleared (the SMP handshake times out with sig=0).
++ */
++void
++pe_gic_cpu_enable(void)
++{
++	uint32_t gicc_ctlr;
++
++	if (!gicd_base || !gicc_base) {
++		return;
++	}
++	gicd_write32(GICD_IGROUPR0, 0xFFFFFFFF);
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ICFGR1, 0);
++	gicd_write32(GICD_ISENABLER0,
++	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	gicc_write32(GICC_PMR, 0xFF);
++	gicc_write32(GICC_BPR, 0);
++	gicc_ctlr = gicc_read32(GICC_CTLR);
++	gicc_ctlr |= GICC_CTLR_ENABLEGRP1 | GICC_CTLR_ENABLEGRP1A;
++	gicc_write32(GICC_CTLR, gicc_ctlr);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++}
++
++/* 0152: read this PE's GICv2 bank back (returns 0 if the GIC is unmapped). */
++uint32_t
++pe_gic_cpu_state(uint32_t *ctlr, uint32_t *pmr, uint32_t *isen)
++{
++	if (!gicd_base || !gicc_base) {
++		return 0;
++	}
++	if (ctlr != NULL) {
++		*ctlr = gicc_read32(GICC_CTLR);
++	}
++	if (pmr != NULL) {
++		*pmr = gicc_read32(GICC_PMR);
++	}
++	if (isen != NULL) {
++		*isen = gicd_read32(GICD_ISENABLER0);
++	}
++	return 1;
+ }
+ 
+ /*
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -975,6 +975,41 @@
+ 	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
+ 	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
+ }
++
++/* 0152: raw cpu_signal / CpuData VA for the SMP timeout diagnostics. */
++uint32_t
++sweet_cpu_get_signal_raw(unsigned int cpu)
++{
++	if (cpu >= MAX_CPUS) {
++		return 0;
++	}
++	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
++	return cdp != NULL ? os_atomic_load(&cdp->cpu_signal, acquire) : 0;
++}
++
++uint64_t
++sweet_cpu_data_va(unsigned int cpu)
++{
++	if (cpu >= MAX_CPUS) {
++		return 0;
++	}
++	return (uint64_t)(uintptr_t)CpuDataEntries[cpu].cpu_data_vaddr;
++}
++
++/*
++ * 0152 (debug fallback, `sweetsgidbg=1` only): clear SIGPdisabled directly
++ * instead of waiting for the queued self-IPI to be delivered.  See the patch
++ * plan for the audit: this is a bring-up hack, not a correct handshake.
++ */
++void
++sweet_cpu_sigpdisabled_clear(void)
++{
++	cpu_data_t *cdp = getCpuDatap();
++
++	if (cdp != NULL) {
++		os_atomic_andnot(&cdp->cpu_signal, SIGPdisabled, relaxed);
++	}
++}
+ #endif
+ 
+ 
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -99,6 +99,17 @@
+ volatile uint64_t sweet_psci_last_payload_pa;
+ void sweet_get_ptov_entries(uint64_t *va, uint64_t *pa, uint64_t *len,
+     uint32_t max, uint32_t *count);
++}
++
++/* 0152: per-CPU GICv2 bank bring-up + cpu_signal diagnostics. */
++extern "C" {
++#if HAS_GIC_V2
++void pe_gic_cpu_enable(void);
++uint32_t pe_gic_cpu_state(uint32_t *ctlr, uint32_t *pmr, uint32_t *isen);
++#endif
++uint32_t sweet_cpu_get_signal_raw(unsigned int cpu);
++uint64_t sweet_cpu_data_va(unsigned int cpu);
++void sweet_cpu_sigpdisabled_clear(void);
+ }
+ 
+ static inline void
+@@ -572,6 +583,9 @@
+ 				    &sweet_psci_last_entry_vtop, __ATOMIC_ACQUIRE);
+ 				uint64_t psci_payload_pa = __atomic_load_n(
+ 				    &sweet_psci_last_payload_pa, __ATOMIC_ACQUIRE);
++				/* 0152: raw cpu_signal / CpuData for the handshake. */
++				uint32_t sig_raw = sweet_cpu_get_signal_raw(i);
++				uint64_t cdp_va = sweet_cpu_data_va(i);
+ 
+ 				sweet_print_entry_math("timeout", i);
+ 				IOLog("SWEET CPU: cpu=%u start phys=0x%x "
+@@ -579,7 +593,8 @@
+ 				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu rc=%d "
+ 				    "aff=%d/%d/%d NOT alive after 5s "
+ 				    "mark=0x%llx mark_uncached=0x%llx stage=0x%llx "
+-				    "vec=0x%llx init=%u sig=%u delta=%llu\n",
++				    "vec=0x%llx init=%u sig=%u sig_raw=0x%x "
++				    "cdp=0x%llx delta=%llu\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
+@@ -595,13 +610,16 @@
+ 				    (unsigned)__atomic_load_n(&cpu->initialized,
+ 				    __ATOMIC_ACQUIRE),
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
++				    (unsigned)sig_raw,
++				    (unsigned long long)cdp_va,
+ 				    (unsigned long long)delta);
+ 				panic("SWEET CPU: cpu=%u startup timeout "
+ 				    "target=0x%llx entry=0x%llx "
+ 				    "entry_vtop=0x%llx payload=0x%llx ctx=%llu "
+ 				    "rc=%d aff=%d/%d/%d mark=0x%llx "
+ 				    "mark_uncached=0x%llx stage=0x%llx vec=0x%llx "
+-				    "init=%u sig=%u phys=0x%x delta=%llu", i,
++				    "init=%u sig=%u sig_raw=0x%x cdp=0x%llx "
++				    "phys=0x%x delta=%llu", i,
+ 				    (unsigned long long)psci_target,
+ 				    (unsigned long long)psci_entry,
+ 				    (unsigned long long)psci_entry_vtop,
+@@ -616,6 +634,8 @@
+ 				    (unsigned)__atomic_load_n(&cpu->initialized,
+ 				    __ATOMIC_ACQUIRE),
+ 				    (unsigned)sweet_cpu_signal_is_enabled(i),
++				    (unsigned)sig_raw,
++				    (unsigned long long)cdp_va,
+ 				    topology->cpus[i].phys_id,
+ 				    (unsigned long long)delta);
+ 			}
+@@ -659,10 +679,55 @@
+ 
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+ 
++#if HAS_GIC_V2
++	{
++		uint32_t ctlr = 0;
++		uint32_t pmr = 0;
++		uint32_t isen = 0;
++		uint32_t mapped;
++
++		/*
++		 * 0152: program THIS PE's banked GICv2 state (SGI + vtimer PPI,
++		 * GICC_CTLR/PMR/BPR).  pe_init_fiq() only ran on the boot CPU;
++		 * without this the self-IPI queued below stays pending on a
++		 * secondary and SIGPdisabled is never cleared.
++		 */
++		mapped = pe_gic_cpu_state(&ctlr, &pmr, &isen);
++		kprintf("SWEET CPU: cpu=%u GIC self before en=%u ctlr=0x%08x "
++		    "pmr=0x%02x isen=0x%08x sgi=%u\n", getCPUNumber(), mapped,
++		    ctlr, pmr, isen, SWEET_IPI_SGI);
++		pe_gic_cpu_enable();
++		mapped = pe_gic_cpu_state(&ctlr, &pmr, &isen);
++		kprintf("SWEET CPU: cpu=%u GIC self after en=%u ctlr=0x%08x "
++		    "pmr=0x%02x isen=0x%08x\n", getCPUNumber(), mapped, ctlr,
++		    pmr, isen);
++	}
++#endif
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
++	kprintf("SWEET CPU: cpu=%u signalCPU done (SGI%u sig=0x%08x)\n",
++	    getCPUNumber(), SWEET_IPI_SGI,
++	    sweet_cpu_get_signal_raw(getCPUNumber()));
++	{
++		uint32_t sgidbg = 0;
++
++		/*
++		 * 0152 last-resort debug fallback (`sweetsgidbg=1`): clear
++		 * SIGPdisabled directly after the IPI is queued, so the handshake
++		 * succeeds even if IPI delivery is broken.  Not the default: see
++		 * the plan's SIGPdisabled audit.
++		 */
++		if (PE_parse_boot_argn("sweetsgidbg", &sgidbg, sizeof(sgidbg)) &&
++		    sgidbg != 0) {
++			sweet_cpu_sigpdisabled_clear();
++			kprintf("SWEET CPU: cpu=%u sweetsgidbg cleared "
++			    "SIGPdisabled directly (sig=0x%08x)\n",
++			    getCPUNumber(),
++			    sweet_cpu_get_signal_raw(getCPUNumber()));
++		}
++	}
+ 	/* 0142: mark 6 - self-IPI queued. */
+ 	sweet_smp_mark(getCPUNumber(), 6);
+ 	setCPUState(kIOCPUStateRunning);

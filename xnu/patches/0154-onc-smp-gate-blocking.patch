@@ -1,0 +1,155 @@
+SMP gate as a blocking wait: start the secondaries only after eMMC init.
+
+0145 gated the secondary CPUs on onc_emmc_init() with a busy spin
+(onc_spin_us) inside SweetCPU::startAll(), on a machine where only the boot
+CPU was online.  That starved the bootstrap thread that calls
+onc_emmc_init(), so the flag was never set and the ~120 s safety WDT reset
+the SoC.  This time the gate is a real sleep.
+
+Why gate at all: a secondary-CPU panic before onc_emmc_init() happens before
+the Android BCB is cleared and before the SWEETLOG flusher starts, so the
+reset boots the recovery partition again and the panic text only flashes on
+the panel.  After the gate the BCB is already clear (reset -> boot=TWRP) and
+the 0132 flusher writes the ring, panic text included, to the userdata tail.
+
+  - SweetCPU.cpp: new C-linkage volatile int sweet_emmc_ready plus a one-shot
+    gate inside the per-CPU start loop (skipped for the boot CPU): it blocks
+    with assert_wait_timeout(10 ms) + thread_block() until the flag is set,
+    up to sweetemmcgate=<secs> (default 60, 0 disables).  On timeout it logs
+    and starts the secondaries anyway, so a broken gate still yields data
+    instead of a hang.  No locks are held while waiting.
+  - onc_emmc.c: onc_emmc_init() sets the flag and thread_wakeup()s after the
+    0133 BCB clear and after the 0132 flusher start, printing
+    "SWEET CPU: eMMC ready, SMP may start".
+
+Expected: console up -> IOKit drivers -> "ONC EMMC: ... ready" ->
+"SWEET LOG: console log to the last ..." -> "SWEET CPU: eMMC ready, SMP may
+start" -> cpu=1 started -> "came alive; SGI1 OK" (or the timeout carrying
+mark/sig/GICC).  Any panic now happens after the BCB clear, so the reset
+returns to TWRP with the panic text on eMMC.
+
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -175,6 +175,57 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetCPU, IOCPU);
++
++/*
++ * 0154: eMMC-init gate for the secondary CPUs, as a BLOCKING wait.
++ *
++ * The first attempt (0145) busy-spun with onc_spin_us() in this kernel thread
++ * while only the boot CPU was online.  That starved the BSD-init thread that
++ * eventually calls onc_emmc_init(), so the flag was never set and the safety
++ * WDT reset the SoC after ~120 s.  Sleep instead: this thread blocks on a
++ * wait channel and the scheduler runs the bootstrap thread that brings up
++ * IOKit/BSD and the eMMC driver.
++ *
++ * Why gate at all: a secondary-CPU panic before onc_emmc_init() happens
++ * *before* the Android BCB is cleared and before the SWEETLOG flusher starts,
++ * so the reset lands back in the recovery partition and the panic text only
++ * flashes on the panel.  After the gate the BCB is already clear, the reset
++ * goes to boot=TWRP and the flusher writes the ring (with the panic text) to
++ * the userdata tail.
++ */
++extern "C" {
++volatile int sweet_emmc_ready;
++}
++
++/* 0154: the gate must only be evaluated once per boot. */
++static int sweet_emmc_gate_done;
++
++#define SWEET_EMMC_GATE_CHAN ((event_t)(uintptr_t)&sweet_emmc_ready)
++
++/* Wait (blocking) for the eMMC init, up to `secs` seconds.  Returns 1 if the
++ * eMMC came up, 0 on timeout.  Never spins, never holds a lock. */
++static int
++sweet_wait_emmc_ready(uint32_t secs)
++{
++	uint32_t waited_ms = 0;
++
++	while (__atomic_load_n(&sweet_emmc_ready, __ATOMIC_ACQUIRE) == 0) {
++		if (secs == 0 || waited_ms >= secs * 1000U) {
++			return 0;
++		}
++		/*
++		 * assert_wait_timeout() gives us a real sleep with a timeout, so a
++		 * missing wakeup (or a flusher that never starts) still returns.
++		 * 10 ms per iteration keeps the console quiet and the loop short.
++		 * scale_factor is ns per unit: 1000 * NSEC_PER_USEC == 1 ms.
++		 */
++		assert_wait_timeout((event_t)SWEET_EMMC_GATE_CHAN, THREAD_UNINT,
++		    10, 1000 * NSEC_PER_USEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		waited_ms += 10;
++	}
++	return 1;
++}
+ 
+ /*
+  * onc: interrupt-independent microsecond wait.
+@@ -501,6 +552,37 @@
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		/*
++		 * 0154: after the boot CPU is up and verified (i > 0 means we are
++		 * about to start a secondary), block until the eMMC driver has
++		 * cleared the Android BCB and started the SWEETLOG flusher.  A
++		 * secondary panic after that resets into boot=TWRP and the panic
++		 * text reaches the userdata log tail.  Blocking wait only: a busy
++		 * spin here starved the bootstrap thread (see sweet_wait_emmc_ready).
++		 */
++		if (i > 0 && !sweet_emmc_gate_done) {
++			uint32_t gate_secs = 60;
++
++			sweet_emmc_gate_done = 1;
++			PE_parse_boot_argn("sweetemmcgate", &gate_secs,
++			    sizeof(gate_secs));
++			if (gate_secs == 0) {
++				IOLog("SWEET CPU: eMMC gate disabled "
++				    "(sweetemmcgate=0), starting SMP now\n");
++			} else {
++				IOLog("SWEET CPU: waiting for eMMC init before "
++				    "starting secondaries (max %u s)\n", gate_secs);
++				if (sweet_wait_emmc_ready(gate_secs)) {
++					IOLog("SWEET CPU: eMMC ready -> starting "
++					    "%u secondaries\n",
++					    topology->num_cpus - 1);
++				} else {
++					IOLog("SWEET CPU: eMMC gate timeout "
++					    "(%u s), starting SMP anyway\n",
++					    gate_secs);
++				}
++			}
++		}
+ 		IOLog("SWEET CPU: cpu=%u start phys=0x%x cluster=%u\n",
+ 		    cpu->getCPUNumber(), topology->cpus[i].phys_id,
+ 		    topology->cpus[i].cluster_id);
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -267,6 +267,8 @@
+ void sweet_early_write_selftest(void);
+ /* 0148: SMP failure summary for the halt hook (defined in SweetCPU.cpp). */
+ extern volatile int32_t sweet_smp_last_cpu;
++/* 0154: eMMC-init gate for the secondary CPUs (defined in SweetCPU.cpp). */
++extern volatile int sweet_emmc_ready;
+ extern volatile uint64_t sweet_smp_last_init;
+ extern volatile uint64_t sweet_smp_last_sig;
+ extern volatile uint64_t sweet_psci_last_target;
+@@ -3560,6 +3562,15 @@
+ 	} else {
+ 		printf("SWEET LOG: partition too small for the log tail, disabled\n");
+ 	}
++	/*
++	 * 0154: the eMMC is up, the Android BCB is cleared and the SWEETLOG
++	 * flusher is running, so the secondary CPUs may start now: if one of them
++	 * panics, the reset goes to boot=TWRP and the panic text is already on its
++	 * way to the userdata tail.  Release SweetCPU::startAll()'s blocking wait.
++	 */
++	__atomic_store_n(&sweet_emmc_ready, 1, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)(uintptr_t)&sweet_emmc_ready);
++	printf("SWEET CPU: eMMC ready, SMP may start\n");
+ 	return 0;
+ 
+ fail:

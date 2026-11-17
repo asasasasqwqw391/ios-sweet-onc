@@ -1,0 +1,46 @@
+Do not claim SMP when a secondary CPU was dropped.
+
+0155 stopped panicking on a secondary bring-up timeout and dropped the CPU
+instead, but the code right after the start loop still published SMP to the
+rest of the kernel (ml_cpu_init_completed, cpusRunning, the
+gIOAllCPUInitializedKey resource and ml_set_max_cpus(4)).  With only the boot
+CPU actually online the machine layer then addresses CpuDataEntries for CPUs
+that never came up, which faulted immediately - the panel showed a panic and
+the boot never reached userspace, so the SWEETLOG flusher never ran and the
+SMP diagnostics were lost again (the userdata ring still showed the previous
+boot's "requested=1").
+
+This patch keeps the machine a 1-CPU machine when any CPU was dropped: it logs
+"N/M CPUs initialized, K dropped -> staying a 1-CPU machine" and returns
+without touching the SMP publish calls, so the boot continues into userspace,
+the flusher writes the console ring (mark/stage, GICC readback, sig_raw,
+AFFINITY_INFO and the DROPPED line) to the userdata tail, and the next
+unattended cycle reads it back from TWRP.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -655,7 +655,24 @@
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+-	/* Publish exactly once, after every selected CPU has completed initCPU(). */
++	/*
++	 * Publish exactly once, after every selected CPU has completed initCPU().
++	 *
++	 * 0156: if any CPU was dropped we must NOT claim SMP to the rest of the
++	 * kernel.  ml_set_max_cpus(4) with only one CPU online makes the machine
++	 * layer address CpuDataEntries for CPUs that never came up, which is what
++	 * turned 0155's graceful drop into a hard fault right afterwards.  Stay a
++	 * 1-CPU machine instead: the boot continues into userspace, the SWEETLOG
++	 * flusher writes the console ring - including all SMP diagnostics printed
++	 * above - to the userdata tail, and the next unattended cycle reads it.
++	 */
++	if (sweet_smp_dropped != 0) {
++		IOLog("SWEET CPU: %u/%u CPUs initialized, %u dropped -> staying "
++		    "a %u-CPU machine (SMP diagnostics above are in the log)\n",
++		    topology->num_cpus - sweet_smp_dropped, topology->num_cpus,
++		    sweet_smp_dropped, topology->num_cpus - sweet_smp_dropped);
++		thread_terminate(current_thread());
++	}
+ 	ONC_STAGE(0xB5);
+ 	ml_cpu_init_completed();
+ 	ONC_STAGE(0xB6);

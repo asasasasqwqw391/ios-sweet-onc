@@ -1,0 +1,116 @@
+Panic dump: restore early clock kick + use arm_init-cached GPT geometry.
+
+0147-0149 never produced a fresh SWEETLOG on hardware: every cpus=4 boot
+reset in ~56 s with the log tail still at seq=44 (a stale cpus=1 snapshot).
+Root cause (root in the panic dump itself, not SMP):
+
+  * sweet_early_card_init() clears oe.kick_always at its out: label (0147),
+    so the panic path issues CMD17 with the clock kick OFF.  By panic time
+    (seconds after boot, post IOKit/SMP activity) the GCC apps branch is
+    gated again and LBA0 read returns EIO(5) -- "LBA0 read failed rc=5".
+    0146's early misc clear SUCCEEDED because it kept kick_always=true for
+    the whole GPT-scan+write window.
+  * 0149's dump calls oe_gpt_scan("userdata") unconditionally and does a
+    bare `return` on failure.  That makes the misc fallback (built later at
+    misc_first+8) unreachable dead code, so no target is ever written.
+  * oe_gpt_scan() returns at its first oe_read_lba(0) before touching any
+    oe geometry.  The partition table cached by 0146 at arm_init
+    (first_lba / nblocks / misc_lba / misc_nblocks / sec_count) is file-static
+    and still valid; 0149's own write selftest already trusts it.
+
+0157 (bsd/dev/onc_emmc.c, sweet_panic_log_dump only):
+  - save oe.kick_always, set it true for the whole dump, restore on every
+    exit (matching 0146's successful early-clear conditions);
+  - skip the GPT re-scan when cached geometry is present (misc_lba or
+    first_lba non-zero); only re-scan when the cache is empty, in which case
+    a failure still returns but now prints "no cached geometry";
+  - this lets the existing userdata-tail-primary / misc-fallback candidate
+    chain actually run with a valid base and a working clock kick.
+
+Expected on the next cpus=4 panic (sweethaltms=2000, sweetsgidbg=1):
+  SWEET PANICDUMP: CMD13 status=0x00000...
+  SWEET PANICDUMP: using cached geometry ... / (no "GPT scan failed" abort)
+  SWEET PANICDUMP: target=userdata base=0x... bytes=...
+  SWEET PANICDUMP: target=userdata wrote ... -> lba 0x... seq=...
+  (or, if userdata write fails, the misc candidate is now reached)
+  After reboot, TWRP/unattended loop decodes a FRESH SWEETLOG with seq>44
+  containing the SWEET CPU/GIC self-readback and SGI debug lines.
+
+Failure-tolerant, bounded: still never panics/hangs; reset always continues.
+No change to SMP/GIC logic.  Patch numbering: next after 0156.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -3169,6 +3169,7 @@
+ 	int force_misc = 0;
+ 	int ncand = 0;
+ 	int first_cand = 0;
++	bool kickalways_saved;
+ 	int i;
+ 	int rc;
+ 
+@@ -3187,14 +3188,38 @@
+ 	printf("SWEET PANICDUMP: CMD13 status=0x%08x\n",
+ 	    sweet_early_card_status());
+ 
+-	rc = oe_gpt_scan("userdata");
+-	if (rc != 0) {
+-		printf("SWEET PANICDUMP: GPT scan failed rc=%d (stage=gpt)\n", rc);
+-		return;
++	/*
++	 * 0157: restore the early-path clock kick that 0146 kept ON for its
++	 * successful misc clear.  sweet_early_card_init() clears oe.kick_always
++	 * at its "out:" label (0147), so the panic path has been issuing CMD17
++	 * with the kick OFF -- LBA0 read returns EIO(5) and the 0149 GPT-scan
++	 * failure below aborts before the misc fallback can ever run.  Turn it
++	 * back on for the whole dump and restore it on every exit.
++	 */
++	kickalways_saved = oe.kick_always;
++	oe.kick_always = true;
++
++	/*
++	 * 0157: the partition table was already scanned and cached by 0146 at
++	 * arm_init (oe.first_lba/nblocks/misc_lba/misc_nblocks/sec_count are
++	 * file-static and survive).  A GPT is immutable at runtime, so re-scan
++	 * only when those fields are still empty -- exactly the rule 0149's own
++	 * write selftest uses.  This skips the EIO-prone LBA0/LBA1 CMD17s that
++	 * made the old unconditional re-scan abort the dump.
++	 */
++	if (oe.misc_lba == 0 || oe.first_lba == 0) {
++		rc = oe_gpt_scan("userdata");
++		if (rc != 0) {
++			printf("SWEET PANICDUMP: GPT scan failed rc=%d "
++			    "(stage=gpt, no cached geometry)\n", rc);
++			oe.kick_always = kickalways_saved;
++			return;
++		}
+ 	}
+ 	total = sweet_log_position();
+ 	if (total == 0) {
+ 		printf("SWEET PANICDUMP: console ring is empty\n");
++		oe.kick_always = kickalways_saved;
+ 		return;
+ 	}
+ 	printf("SWEET PANICDUMP: userdata first=0x%llx blocks=0x%llx "
+@@ -3284,6 +3309,7 @@
+ 
+ 	if (ncand == 0) {
+ 		printf("SWEET PANICDUMP: no valid target, aborting\n");
++		oe.kick_always = kickalways_saved;
+ 		return;
+ 	}
+ 	if (force_misc && ncand > 1 && strcmp(cand[0].name, "misc") != 0) {
+@@ -3301,12 +3327,14 @@
+ 		rc = sweet_panic_dump_write(cand[i].name, cand[i].base,
+ 		    cand[i].area_blocks, total, kb);
+ 		if (rc == 0) {
++			oe.kick_always = kickalways_saved;
+ 			return;
+ 		}
+ 		printf("SWEET PANICDUMP: target=%s failed rc=%d, trying next\n",
+ 		    cand[i].name, rc);
+ 	}
+ 	printf("SWEET PANICDUMP: all targets failed\n");
++	oe.kick_always = kickalways_saved;
+ }
+ #endif /* ONC_SWEET_4K */
+ 

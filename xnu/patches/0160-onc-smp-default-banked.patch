@@ -1,0 +1,74 @@
+SMP out of the box: banked GICC frame default + clear SIGPdisabled by default.
+
+Hardware-controlled A/B (kernel run 44727048801, cmdline only) finally solved
+the multi-year self-IPI problem:
+
+  sweetgiccoff=0x2000 (old default, per-CPU frames) -> cpus=4 dies before
+      any log;  sweetgiccoff=0 + sweetsgidbg=1 -> CPU1 runs to mark=7 but
+      "NOT alive after 5s, sig=0, sig_raw=0x80000000";
+  sweetgiccoff=0 + sweetsgidbg=2 -> SUCCESS:
+      cpu0/1/2/3 all "came alive; SGI1 OK",
+      "4/4 CPUs initialized, SGI1 verified (dropped=0)",
+      stable 17 min to sweetrebootat=960, reached launchd, log flush #80.
+
+Two facts, now made the kernel DEFAULT so no sweet* boot args are needed:
+
+1. pe_fiq.c: gicc_stride default 0x2000 -> 0.  The GIC-400 CPU-interface
+   registers are banked at ONE physical address (hardware selects the bank by
+   the current PE); 0153's "0x2000 apart per CPU" assumption was wrong.  The
+   sweetgiccoff/sweetgiccbase overrides remain for A/B.
+
+2. SweetCPU.cpp: SIGPdisabled is cleared directly at the end of initCPU by
+   default.  The self-IPI handler (cpu_signal_handler_internal) never clears
+   it on this GIC-400, so a real SGI1 does not complete the handshake.  New
+   boot arg `sweetclearsigp` defaults to 1 (= clear, working); =0 restores
+   the old pure-IPI behaviour for A/B.  The sweetsgidbg>=2 fallback stays.
+
+Verified baseline: xnu buildtree of run 44727048801 (through 0159).
+Next patch number: 0161.
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -252,7 +252,7 @@
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicc_base;      /* CPU0's frame (or sweetgiccbase override) */
+ static vm_offset_t gicc_this;      /* this PE's CPU-interface frame (0153) */
+-static uint32_t gicc_stride = 0x2000;  /* GIC-400: per-CPU GICC frame stride */
++static uint32_t gicc_stride = 0;  /* 0160: GICC frames are banked; all PEs share one frame */
+ 
+ static uint32_t
+ gic_read32(vm_offset_t addr)
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -798,6 +798,32 @@
+ 				    sweet_cpu_get_signal_raw(getCPUNumber()));
+ 			}
+ 		}
++		/*
++		 * 0160: make the successful SMP handshake the DEFAULT, no longer
++		 * dependent on `sweetsgidbg=2`.  Controlled A/B on hardware:
++		 *   sweetgiccoff=0 + sweetsgidbg=1 -> CPU1 NOT alive, sig=0;
++		 *   sweetgiccoff=0 + sweetsgidbg=2 -> 4/4 CPUs initialized,
++		 *     stable to sweetrebootat.  The self-IPI handler never clears
++		 *     SIGPdisabled on this GIC-400, so the handshake must clear it
++		 *     directly.  Default ON; sweetclearsigp=0 restores the pure-IPI
++		 *     behaviour for A/B.  gicc_stride now defaults to 0 (banked
++		 *     frame) in pe_fiq.c, together making cpus=4 work out of the box.
++		 */
++		{
++			uint32_t clearsigp = 1;
++
++			if (PE_parse_boot_argn("sweetclearsigp", &clearsigp,
++			    sizeof(clearsigp)) == 0) {
++				clearsigp = 1;	/* default ON */
++			}
++			if (clearsigp != 0) {
++				sweet_cpu_sigpdisabled_clear();
++				kprintf("SWEET CPU: cpu=%u cleared SIGPdisabled "
++				    "(0160 default, sig=0x%08x)\n",
++				    getCPUNumber(),
++				    sweet_cpu_get_signal_raw(getCPUNumber()));
++			}
++		}
+ 	}
+ 	/* 0142: mark 6 - self-IPI queued. */
+ 	sweet_smp_mark(getCPUNumber(), 6);

@@ -1,0 +1,55 @@
+Early eMMC path: wait for CMD/DAT inhibit between consecutive commands.
+
+Decisive evidence from the FIRST fresh SWEETLOG in 9 rounds (cpus=1,
+sweetrebootat=30, flush #4, total 36110): the arm_init early misc clear did
+
+  SWEET EARLYMISC: BCB write failed at block 0x2001 rc=5
+  ONC EMMC: wrfail lba=0x2001 rc=5
+  ONC EMMC: int=0x00018010 st=0x01f80101 clk=0x010e0007
+
+i.e. misc block 0x2000 (the BCB sector) was written OK, but the very next
+sector 0x2001 failed with EIO(5); PRESENT_STATE=0x01f80101 shows CMD_INHIBIT
+and DAT_INHIBIT still set from the preceding CMD24.  The normal driver has no
+such problem (its flusher writes the userdata tail fine and produced this log).
+
+Root cause: oe.dat_wait is a static field, zero-initialised, and set true ONLY
+in onc_emmc_init() at root mount (line ~3360).  Every early raw command
+(oe_pio_write/oe_read_lba, lines 716/762/878/1082) does
+    if (oe.dat_wait) oe_wait_ready(...)
+so before root mount NO inhibit wait happens.  A single early write works; a
+second immediate one collides.  This is the single-sector wall that made all
+panics dumps (0147/0148/0149/0157) fail: they write several ring sectors and
+a header, so the 2nd write always EIOs and no header/seq ever lands.  0157
+fixed kick_always and the GPT rescan but not this.
+
+0159 (bsd/dev/onc_emmc.c, sweet_early_card_init only): set oe.dat_wait = true
+alongside the existing oe.kick_always = true.  Now the early clear and the
+panic dump wait for CMD/DAT inhibit between commands and can write consecutive
+sectors.  This should let the 0157-fixed dump land a fresh SWEETLOG on a
+cpus=4 SMP timeout, finally exposing the GIC/SGI diagnostics.
+
+Minimal and safe: only affects the early raw path; the normal driver already
+sets dat_wait=true and is unchanged.  Next patch number: 0160.
+--- a/bsd/dev/onc_emmc.c
++++ b/bsd/dev/onc_emmc.c
+@@ -2750,6 +2750,20 @@
+ 	oe.writable = true;
+ 	oe.secsize = OE_BLOCK_SIZE;
+ 	oe.kick_always = true;	/* probe-style kick for the few commands below */
++	/*
++	 * 0159: the early raw path must wait for CMD/DAT inhibit between
++	 * commands, exactly like the normal driver does.  oe.dat_wait is a
++	 * static field that defaults to false and is only set true later in
++	 * onc_emmc_init() (root mount).  Without it, oe_pio_write()/oe_read_lba()
++	 * skip oe_wait_ready() and back-to-back commands collide: measured on a
++	 * cpus=1 boot, 0146 cleared misc block 0x2000 (first write OK) then
++	 * "wrfail lba=0x2001 rc=5, PRESENT_STATE=0x01f80101 (CMD+DAT inhibit
++	 * still set)".  That single-sector limit is why every multi-sector
++	 * panic dump (0147-0157) failed and only the stale flusher log was
++	 * ever read.  Set it here so the early clear and the panic dump can
++	 * write consecutive sectors.
++	 */
++	oe.dat_wait = true;
+ 
+ 	oe_gcc_clock_init();
+ 	oe_core_init();

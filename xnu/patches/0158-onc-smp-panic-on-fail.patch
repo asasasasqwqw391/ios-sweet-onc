@@ -1,0 +1,77 @@
+SMP timeout: restore panic (default ON) so the fixed panic-dump actually runs.
+
+0155 removed the panic() on a secondary bring-up timeout, replacing it with a
+graceful DROPPED+continue so "the boot reaches userspace and the SWEETLOG
+flusher writes the diagnostics".  0156 then stopped publishing SMP when any
+CPU was dropped.  On hardware BOTH log paths ended up dead:
+
+  * sweet_panic_log_dump() is called ONLY from sweet_pe_halt_restart(), i.e.
+    only on panic().  0155 removed the SMP panic => the dump (just fixed by
+    0157 with cached GPT geometry + kick_always) NEVER runs.
+  * the alternative flusher starts only after root mount (sweet_emmc_extras_start
+    in onc_emmc_init); with CPUs dropped the boot dies ~58 s in, before root
+    mount => the flusher NEVER runs either.
+  * normal sweetrebootat would reach PEHaltRestart via reboot_kernel(), but it
+    is set to 960 s while the phone resets at ~58 s through another path.
+  Result: 11D..11L plus 11M all decoded to the SAME stale seq=44 SWEETLOG,
+  and the misc partition was entirely zero -- no dump was ever attempted.
+
+0158 (iokit/Kernel/arm/SweetCPU.cpp, SMP startup-timeout branch only):
+  - a boot arg `sweetpaniconfail` (DEFAULT 1) restores panic() right after the
+    full diagnostic IOLog, so console ring already holds every GIC/SGI line;
+  - `sweetpaniconfail=0` keeps 0155's graceful drop for A/B.
+
+Safety: the reset hook is installed in arm_init() BEFORE IOKit/SMP
+(0143, sweet_early_reset_install) and 0146 already cleared the Android BCB
+there, so this panic goes sweet_pe_halt_restart() -> 0157 dump -> WDT reset ->
+ABL sees cleared BCB -> boot=TWRP.  The unattended loop then decodes a FRESH
+SWEETLOG with the complete startup-timeout + GIC readback + SGI debug text.
+
+This reverses only 0155's "no panic" decision on the failure path; the SMP
+bring-up sequence, 0153 GIC frames, 0157 dump fix are untouched.  Next patch
+number after this is 0159.
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -639,7 +639,42 @@
+ 				 * full mark/stage/GICC readback lines) to the userdata
+ 				 * tail, the BCB has been cleared, and the next
+ 				 * unattended cycle reads the whole thing back.
++				 *
++				 * 0158: that assumption proved false on hardware --
++				 * the boot dies ~58 s later, before root mount, so the
++				 * flusher never starts either and BOTH log paths end up
++				 * dead (9 consecutive stale SWEETLOGs, misc all zero).
++				 * Default to a panic here so the 0157-fixed
++				 * sweet_panic_log_dump() actually runs: the halt hook is
++				 * installed in arm_init() BEFORE SMP and 0146 already
++				 * cleared the BCB there, so the panic dumps the console
++				 * ring (holding all the lines above) and resets to TWRP.
++				 * sweetpaniconfail=0 restores the graceful drop.
+ 				 */
++				{
++					uint32_t pcf = 1;
++
++					if (!PE_parse_boot_argn("sweetpaniconfail",
++					    &pcf, sizeof(pcf)) || pcf != 0) {
++						panic("SWEET CPU: cpu=%u startup "
++						    "timeout (0158) target=0x%llx "
++						    "entry=0x%llx rc=%d aff=%d/%d/%d "
++						    "mark=0x%llx stage=0x%llx "
++						    "init=%u sig=%u sig_raw=0x%08x",
++						    i,
++						    (unsigned long long)psci_target,
++						    (unsigned long long)psci_entry,
++						    (int)psci_rc, (int)aff_before,
++						    (int)aff_after, (int)aff_again,
++						    (unsigned long long)mark,
++						    (unsigned long long)stage,
++						    (unsigned)__atomic_load_n(
++						    &cpu->initialized,
++						    __ATOMIC_ACQUIRE),
++						    (unsigned)sweet_cpu_signal_is_enabled(i),
++						    (unsigned)sig_raw);
++					}
++				}
+ 				IOLog("SWEET CPU: cpu=%u DROPPED after timeout; "
+ 				    "continuing the boot so the log reaches eMMC\n", i);
+ 				sweet_smp_dropped++;

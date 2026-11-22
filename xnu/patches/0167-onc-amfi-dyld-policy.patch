@@ -1,0 +1,53 @@
+0167-onc-amfi-dyld-policy -- implement __mac_syscall("AMFI", 90) so dyld gets
+amfiFlags and accepts DYLD_INSERT_LIBRARIES dylibs. Registered policy renamed
+"SWEET AMFI" -> "AMFI" (mac_syscall looks up by name); added mpo_policy_syscall
+returning allow=~0 for call 90.  From PureDarwin amfi_kext_main.c.
+Only bsd/kern/sweet_amfi.c.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,35 @@
+ 	}
+ }
+ 
++/* 0167: dyld's amfi_check_dyld_policy_self -- __mac_syscall("AMFI", 90,
++ * {input_flags, &output_flags}).  With no handler the call returns ENOPOLICY,
++ * dyld gets amfiFlags=0 and rejects every inserted dylib.  Grant all output
++ * flags (PureDarwin's permissive stand-in).  Log first use for diagnosis. */
++static uint64_t sweet_amfi_dyld_seen;
++static int
++sweet_amfi_policy_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	(void)p;
++	if (call == 90) {                       /* AMFI_CHECK_DYLD_POLICY_SELF */
++		uint64_t args[2];
++		uint64_t allow = ~0ULL;
++		int error = copyin(arg, args, sizeof(args));
++
++		if (!(sweet_amfi_dyld_seen & 1)) {
++			sweet_amfi_dyld_seen |= 1;
++			printf("SWEET AMFI: dyld policy call 90 -> allow all\n");
++		}
++		if (error == 0 && args[1] != 0) {
++			error = copyout(&allow, (user_addr_t)args[1], sizeof(allow));
++		}
++		return error;
++	}
++	return 0;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_policy_syscall,
+ };
+ 
+ /*
+@@ -360,7 +387,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",                     /* 0167: dyld looks up "AMFI" */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };

@@ -1,0 +1,26 @@
+0163-onc-video-console-mute -- make the VIDEO console honor sweet_console_muted.
+
+sweetfb_noconsole=1 mutes only the serial console; the video console keeps
+painting characters into the panel framebuffer and overwrites the GUI that
+present() copies there.  gc_putchar() now returns early when muted, matching
+_cnputs() in serial_console.c.  Default no change (mute stays 0 normally).
+Only osfmk/console/video_console.c changes.
+
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -501,6 +501,15 @@
+ static void
+ gc_putchar(char ch)
+ {
++	/* 0163: honor the framebuffer console mute set by AppleCLCD::present()
++	 * under sweetfb_noconsole=1.  Without this the video console keeps
++	 * painting over the GUI frames copied into the same panel memory. */
++	{
++		extern int sweet_console_muted;
++		if (sweet_console_muted) {
++			return;
++		}
++	}
+ 	if (!ch) {
+ 		return; /* ignore null characters */
+ 	}

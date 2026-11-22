@@ -1,0 +1,25 @@
+0169-onc-dyld-print -- inject DYLD_PRINT_LIBRARIES=1 and DYLD_PRINT_ENV=1
+alongside exec_inject's DYLD_INSERT_LIBRARIES, to show why the dylib is not
+loaded.  Diagnostic only.  Only bsd/kern/kern_exec.c.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5831,6 +5831,18 @@
+ 		if (error) {
+ 			goto bad;
+ 		}
++		/* 0169: dyld diagnostics (amfiFlags now allow-all honours these). */
++		{
++			static const char print_libs[] = "DYLD_PRINT_LIBRARIES=1";
++			static const char print_env[] = "DYLD_PRINT_ENV=1";
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(print_libs), UIO_SYSSPACE, TRUE);
++			if (error == 0) {
++				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(print_env), UIO_SYSSPACE, TRUE);
++			}
++			if (error) {
++				goto bad;
++			}
++		}
+ 	}
+ 
+ 	/* Save space for envv[] NULL terminator */

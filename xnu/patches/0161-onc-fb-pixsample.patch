@@ -1,0 +1,54 @@
+0161-onc-fb-pixsample -- boot-arg sweetfb_pixsample=N: log BGRA pixels sampled
+from the surface bound in AppleCLCD::present().  Decides "CA drew pixels" vs
+"surface empty" without dylib injection.  Default off (no boot-arg: no change).
+Only iokit/Kernel/arm/SweetFramebuffer.cpp changes.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -460,6 +460,46 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++
++		/* 0161: sweetfb_pixsample=N -- sample BGRA pixels from the bound
++		 * surface to tell "CA drew pixels" from "surface is black/empty".
++		 */
++		{
++			static uint32_t pix_left = 0xffffffffu;
++			if (pix_left == 0xffffffffu) {
++				uint32_t pv = 0;
++				pix_left = 0;
++				if (PE_parse_boot_argn("sweetfb_pixsample", &pv, sizeof(pv))) {
++					pix_left = pv;
++				}
++			}
++			if (pix_left > 0 && src != 0 && s->width > 0 && s->height > 0) {
++				pix_left--;
++				uint32_t cols[9];
++				uint32_t uniq = 0;
++				for (uint32_t gy = 0; gy < 3; gy++) {
++					for (uint32_t gx = 0; gx < 3; gx++) {
++						uint32_t px = (uint32_t)(((uint64_t)sx + (uint64_t)gx * (s->width - 1) / 2) & 0xffffffffu);
++						uint32_t py = (uint32_t)(((uint64_t)sy + (uint64_t)gy * (s->height - 1) / 2) & 0xffffffffu);
++						uint32_t v = *(const uint32_t *)(src + s->offset +
++						    (uint64_t)py * s->bytesPerRow + (uint64_t)px * 4);
++						cols[gy * 3 + gx] = v;
++					}
++				}
++				for (uint32_t i = 0; i < 9; i++) {
++					bool seen = false;
++					for (uint32_t j = 0; j < i; j++) {
++						if (cols[j] == cols[i]) { seen = true; break; }
++					}
++					if (!seen) uniq++;
++				}
++				IOLog("SWEET FB: PIXSAMPLE surface %u %ux%u bpr %u uniq=%u "
++				    "%08x %08x %08x | %08x %08x %08x | %08x %08x %08x\n",
++				    id, s->width, s->height, s->bytesPerRow, uniq,
++				    cols[0], cols[1], cols[2], cols[3], cols[4], cols[5],
++				    cols[6], cols[7], cols[8]);
++			}
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;

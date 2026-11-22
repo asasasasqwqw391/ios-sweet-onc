@@ -1,0 +1,40 @@
+0162-onc-fb-copydiag -- boot-arg sweetfb_copydiag=N: log the src=0 copy gate
+in AppleCLCD::present().  Decides why a surface with real pixels (PIXSAMPLE)
+still does not show on the panel.  Default off.  Only SweetFramebuffer.cpp.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -501,6 +501,33 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++
++		/* 0162: sweetfb_copydiag=N -- log the copy gate.  If src is cleared
++		 * here the surface has pixels but never reaches the panel.
++		 */
++		{
++			static uint32_t cd_left = 0xffffffffu;
++			if (cd_left == 0xffffffffu) {
++				uint32_t cv = 0;
++				cd_left = 0;
++				if (PE_parse_boot_argn("sweetfb_copydiag", &cv, sizeof(cv))) {
++					cd_left = cv;
++				}
++			}
++			if (cd_left > 0) {
++				cd_left--;
++				int saved = sweet_console_muted;
++				sweet_console_muted = 0;
++				IOLog("SWEET FB: COPYDIAG id=%u wh=%dx%d xy=%d,%d ew=%u eh=%u bpe=%u "
++				    "off=%llu bpr=%llu last=%llu len=%llu mem=%s src=%s bpp=%u\n",
++				    id, w, h, sx, sy, s->elementWidth, s->elementHeight, bpe,
++				    (unsigned long long)s->offset, (unsigned long long)s->bytesPerRow,
++				    (unsigned long long)last,
++				    (unsigned long long)(s->memory ? s->memory->getLength() : 0),
++				    s->memory ? "yes" : "NO", src ? "yes" : "ZERO", fPanelBpp);
++				sweet_console_muted = saved;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			if (fPanelBpp == 4) {
+ 				for (int32_t y = 0; y < h; y++) {

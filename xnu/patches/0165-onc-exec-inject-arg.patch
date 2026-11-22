@@ -1,0 +1,23 @@
+0165-onc-exec-inject-arg -- lazy-init kern.exec_inject from boot-arg.
+When the sysctl is empty, exec_inject_env() reads boot-arg "exec_inject="
+once; e.g. exec_inject=/lib/hk.dylib backboardd.  Only bsd/kern/kern_exec.c.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5586,7 +5586,15 @@
+ 	size_t namelen, used;
+ 	bool any = false;
+ 
+-	if (*p == 0 || imgp->ip_ndp == NULL) {
++	if (*p == 0) {
++		/* 0165: lazy-init from boot-arg exec_inject= (no custom init needed). */
++		if (!PE_parse_boot_argn("exec_inject", exec_inject_conf, sizeof(exec_inject_conf)) ||
++		    *exec_inject_conf == 0) {
++			return false;
++		}
++		p = exec_inject_conf;
++	}
++	if (imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;

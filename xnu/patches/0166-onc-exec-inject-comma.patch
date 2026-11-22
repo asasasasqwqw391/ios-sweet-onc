@@ -1,0 +1,23 @@
+0166-onc-exec-inject-comma -- boot-arg exec_inject uses ',' as word separator
+(converted to spaces after read) because PE_parse_boot_argn stops at spaces.
+e.g. exec_inject=/usr/lib/hk.dylib,backboardd.  Only bsd/kern/kern_exec.c.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5592,6 +5592,16 @@
+ 		    *exec_inject_conf == 0) {
+ 			return false;
+ 		}
++		/* 0166: boot-arg uses ',' (PE_parse_boot_argn stops at spaces);
++		 * exec_inject_env below expects space-separated words. */
++		{
++			char *cp;
++			for (cp = exec_inject_conf; *cp != 0; cp++) {
++				if (*cp == ',') {
++					*cp = ' ';
++				}
++			}
++		}
+ 		p = exec_inject_conf;
+ 	}
+ 	if (imgp->ip_ndp == NULL) {

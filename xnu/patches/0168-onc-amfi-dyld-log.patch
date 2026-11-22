@@ -1,0 +1,19 @@
+0168-onc-amfi-dyld-log -- log each __mac_syscall("AMFI", 90) with process
+name to confirm backboardd's dyld receives amfiFlags.  Only sweet_amfi.c.
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -319,9 +319,10 @@
+ 		uint64_t allow = ~0ULL;
+ 		int error = copyin(arg, args, sizeof(args));
+ 
+-		if (!(sweet_amfi_dyld_seen & 1)) {
+-			sweet_amfi_dyld_seen |= 1;
+-			printf("SWEET AMFI: dyld policy call 90 -> allow all\n");
++		{
++			char amfi_proc[32] = "";
++			proc_name(proc_pid(p), amfi_proc, sizeof(amfi_proc));
++			printf("SWEET AMFI: dyld policy call 90 for %s -> allow all\n", amfi_proc);
+ 		}
+ 		if (error == 0 && args[1] != 0) {
+ 			error = copyout(&allow, (user_addr_t)args[1], sizeof(allow));

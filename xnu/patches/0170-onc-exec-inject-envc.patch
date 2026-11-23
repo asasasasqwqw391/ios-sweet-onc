@@ -1,0 +1,47 @@
+0170-onc-exec-inject-envc -- THE FIX: register injected env vars.
+
+exec_add_user_string() writes the string but does not bump ip_envc; dyld walks
+envp[] using ip_envc so the injected DYLD_INSERT_LIBRARIES was invisible.
+Add ip_envc++/ip_argspace accounting for the injected var and the two print
+vars, matching R1's 0006-bsd-process.patch.  Only bsd/kern/kern_exec.c.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5831,13 +5831,36 @@
+ 		if (error) {
+ 			goto bad;
+ 		}
+-		/* 0169: dyld diagnostics (amfiFlags now allow-all honours these). */
++		/* 0170: THE FIX -- exec_add_user_string writes the bytes but does
++		 * not register the variable.  dyld walks envp[] using ip_envc;
++		 * without this bump the injected string is invisible to dyld. */
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++		/* 0169: dyld diagnostics (now correctly registered too). */
+ 		{
+ 			static const char print_libs[] = "DYLD_PRINT_LIBRARIES=1";
+ 			static const char print_env[] = "DYLD_PRINT_ENV=1";
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(print_libs), UIO_SYSSPACE, TRUE);
+ 			if (error == 0) {
++				if (imgp->ip_argspace < new_ptr_size) {
++					error = E2BIG;
++					goto bad;
++				}
++				imgp->ip_argspace -= new_ptr_size;
++				imgp->ip_envc++;
+ 				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(print_env), UIO_SYSSPACE, TRUE);
++			}
++			if (error == 0) {
++				if (imgp->ip_argspace < new_ptr_size) {
++					error = E2BIG;
++					goto bad;
++				}
++				imgp->ip_argspace -= new_ptr_size;
++				imgp->ip_envc++;
+ 			}
+ 			if (error) {
+ 				goto bad;

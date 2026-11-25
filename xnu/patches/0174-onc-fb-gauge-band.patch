@@ -1,0 +1,72 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -641,29 +641,49 @@
+ 				static uint32_t stamp = 0;
+ 				uint8_t *base = (uint8_t *)fPixels;
+ 				uint32_t bits = ++stamp;
+ 
+-				for (int cell = 0; cell < 12; cell++) {
+-					int bit = (cell < 8) ? (int)((bits >> cell) & 1) : ((cell - 8) & 1);
+-					uint8_t v = bit ? 0xff : 0x00;
+-					int32_t x0 = 4 + cell * 16;
+-					int32_t y0 = (cell < 8) ? 4 : 24;
+-					if (x0 + 14 > fWidth) {
+-						break;
++				/*
++				 * 0174: the 14x16 cells of 0173 are ~4 photo pixels wide on
++				 * a 1280x720 camera and cannot be read.  Use whole-width
++				 * bands instead: a 1/6-screen tall strip whose eight
++				 * equal-width cells are bits 0..7, plus a solid black
++				 * strip underneath as the writer signature.
++				 */
++				int32_t band = fHeight / 6;
++				int32_t cellw = fWidth / 8;
++				int32_t top = fHeight / 12;
++				int32_t xx;
++				int32_t yy;
++
++				for (yy = top; yy < top + band; yy++) {
++					uint8_t *row = base + (uint64_t)yy * fRowBytes;
++					for (xx = 0; xx < fWidth; xx++) {
++						uint8_t v = ((bits >> (xx / cellw)) & 1) ? 0xff : 0x00;
++						if (fPanelBpp == 3) {
++							row[xx * 3 + 0] = v;
++							row[xx * 3 + 1] = v;
++							row[xx * 3 + 2] = v;
++						} else {
++							row[xx * 4 + 0] = v;
++							row[xx * 4 + 1] = v;
++							row[xx * 4 + 2] = v;
++							row[xx * 4 + 3] = 0xff;
++						}
+ 					}
+-					for (int32_t yy = y0; yy < y0 + 16 && yy < fHeight; yy++) {
+-						uint8_t *row = base + (uint64_t)yy * fRowBytes;
+-						for (int32_t xx = x0; xx < x0 + 14; xx++) {
+-							if (fPanelBpp == 3) {
+-								row[xx * 3 + 0] = v;
+-								row[xx * 3 + 1] = v;
+-								row[xx * 3 + 2] = v;
+-							} else {
+-								row[xx * 4 + 0] = v;
+-								row[xx * 4 + 1] = v;
+-								row[xx * 4 + 2] = v;
+-								row[xx * 4 + 3] = 0xff;
+-							}
++				}
++				for (yy = top + band; yy < top + 2 * band && yy < fHeight; yy++) {
++					uint8_t *row = base + (uint64_t)yy * fRowBytes;
++					for (xx = 0; xx < fWidth; xx++) {
++						if (fPanelBpp == 3) {
++							row[xx * 3 + 0] = 0;
++							row[xx * 3 + 1] = 0;
++							row[xx * 3 + 2] = 0;
++						} else {
++							row[xx * 4 + 0] = 0;
++							row[xx * 4 + 1] = 0;
++							row[xx * 4 + 2] = 0;
++							row[xx * 4 + 3] = 0xff;
+ 						}
+ 					}
+ 				}
+ 			}

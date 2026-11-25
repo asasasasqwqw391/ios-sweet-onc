@@ -15,7 +15,8 @@
 +		 *
 +		 * White cell = 1, black = 0.  A frozen counter and a missing
 +		 * signature look completely different on a photo, which separates
-+		 * "copy never happens" from "copy happens but the surface is blank".
++		 * "the copy never happens" from "the copy happens but the surface
++		 * is blank".
 +		 */
 +		{
 +			static int gauge = -1;
@@ -23,8 +24,7 @@
 +				uint32_t gv = 0;
 +				gauge = PE_parse_boot_argn("sweetfb_gauge", &gv, sizeof(gv)) ? (int)gv : 0;
 +				if (gauge) {
-+					IOLog("SWEET FB: gauge on (panel %d bpp, stride %d)
-+",
++					IOLog("SWEET FB: gauge on (panel %d bpp, stride %d)\n",
 +					    fPanelBpp * 8, fRowBytes);
 +				}
 +			}

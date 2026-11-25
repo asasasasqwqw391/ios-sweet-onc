@@ -23,17 +23,26 @@
  extern int       disableConsoleOutput;
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -752,8 +752,18 @@
+@@ -67,8 +67,9 @@
+  */
+ extern "C" vm_address_t sweet_fb_early_va(void);
+ extern "C" uint64_t sweet_fb_early_pa(void);
+ extern "C" vm_size_t sweet_fb_early_size(void);
++extern "C" vm_offset_t sweet_vc_fb_va(void);   /* 0177: video console fb VA */
+ #define SWEET_FB_EARLY_BLOCK 0x200000ULL
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -752,8 +753,17 @@
  								after[i] = *(const volatile uint32_t *)(const void *)p;
  							}
  						}
  						rl++;
 +						{
-+							extern "C" vm_offset_t sweet_vc_fb_va(void);
 +							static uint32_t vcl;
 +							if (vcl < 3) {
 +								vcl++;
-+								IOLog("SWEET FB: VCFB console va=0x%llx panel va=0x%llx\n",
++								IOLog("SWEET FB: VCFB console=0x%llx panel=0x%llx\n",
 +								    (unsigned long long)sweet_vc_fb_va(),
 +								    (unsigned long long)sweet_fb_early_va());
 +							}

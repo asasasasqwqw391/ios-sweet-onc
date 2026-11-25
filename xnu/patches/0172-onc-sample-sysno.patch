@@ -1,0 +1,36 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1013,18 +1013,30 @@
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
++		char line[640];
+ 		int n;
+ 		uint64_t fp;
++		const arm_saved_state64_t *r;
+ 
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
++		r = const_saved_state64(ss);
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		/*
++		 * 0172: a thread parked in a syscall shows the libsystem_kernel
++		 * stub in pc, so the number in x16 names the syscall and x0..x3
++		 * its arguments (mach_msg_trap: msg/option/send/recv size,
++		 * __psynch_cvwait: cv/mutex/option/...).  Without this the
++		 * sample says "stuck at 0x1d8045030" and nothing else.
++		 */
++		n = snprintf(line, sizeof(line),
++		    "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx sysno 0x%llx a0 0x%llx a1 0x%llx a2 0x%llx a3 0x%llx bt",
++		    name, tn++, get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
++		    (uint64_t)r->x[16], (uint64_t)r->x[0], (uint64_t)r->x[1], (uint64_t)r->x[2],
++		    (uint64_t)r->x[3]);
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;

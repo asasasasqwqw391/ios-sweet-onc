@@ -1,0 +1,44 @@
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -116,8 +116,20 @@
+  */
+ 
+ struct vc_info vinfo;
+ 
++/*
++ * 0177: the video console maps the panel through its own ml_io_map_unmappable()
++ * VA (vinfo.v_baseaddr), which is not the alias AppleCLCD::present() writes
++ * through.  Export it so the framebuffer driver can log both and settle
++ * whether "the panel shows nothing we write" is a mapping mismatch.
++ */
++vm_offset_t
++sweet_vc_fb_va(void)
++{
++	return (vm_offset_t)(uintptr_t)vinfo.v_baseaddr;
++}
++
+ void noroot_icon_test(void);
+ 
+ 
+ extern int       disableConsoleOutput;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -752,8 +752,18 @@
+ 								after[i] = *(const volatile uint32_t *)(const void *)p;
+ 							}
+ 						}
+ 						rl++;
++						{
++							extern "C" vm_offset_t sweet_vc_fb_va(void);
++							static uint32_t vcl;
++							if (vcl < 3) {
++								vcl++;
++								IOLog("SWEET FB: VCFB console va=0x%llx panel va=0x%llx\n",
++								    (unsigned long long)sweet_vc_fb_va(),
++								    (unsigned long long)sweet_fb_early_va());
++							}
++						}
+ 						IOLog("SWEET FB: RDBK n=%u va=0x%llx stride=%d bpp=%d "
+ 						    "before %06x %06x %06x after %06x %06x %06x\n",
+ 						    bits, (unsigned long long)fPixels, fRowBytes, fPanelBpp,
+ 						    before[0], before[1], before[2],

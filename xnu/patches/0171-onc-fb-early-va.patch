@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -59,6 +59,17 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++/*
++ * 0171: the boot-time framebuffer alias built by sweet_early_map_final() is
++ * the only mapping proven to reach the panel (the console draws through it).
++ * AppleCLCD::present() uses it instead of its own IOMemoryDescriptor mapping,
++ * which never showed up on the panel.
++ */
++extern "C" vm_address_t sweet_fb_early_va(void);
++extern "C" uint64_t sweet_fb_early_pa(void);
++extern "C" vm_size_t sweet_fb_early_size(void);
++#define SWEET_FB_EARLY_BLOCK 0x200000ULL
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -237,6 +248,17 @@
+ 		    (vm_size_t)round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
+ 		fPanelMap = fPanelDesc != NULL ? fPanelDesc->map(kIOMapWriteCombineCache) : NULL;
+ 		fPixels = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
++		int early = 0;
++		if (sweet_fb_early_pa() != 0 &&
++		    (fPhys & ~(SWEET_FB_EARLY_BLOCK - 1)) == sweet_fb_early_pa() &&
++		    sweet_fb_early_size() >= (vm_size_t)fRowBytes * fHeight) {
++			fPixels = (uintptr_t)sweet_fb_early_va();
++			early = 1;
++		}
++		IOLog("SWEET FB: panel phys=0x%llx map=0x%llx early=0x%llx pa=0x%llx ok=%d\n",
++		    fPhys,
++		    fPanelMap != NULL ? (uint64_t)fPanelMap->getVirtualAddress() : 0,
++		    (uint64_t)sweet_fb_early_va(), sweet_fb_early_pa(), early);
+ 	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1840,10 +1840,16 @@ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
+ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
+ /*
+  * 4KB onc: alias VAs for the early-console log (0xBFFA0000) and the raw boot
+  * marker (0xBFEE0000) blocks; filled in by sweet_early_map_final().
+  */
+ static vm_map_address_t sweet_early_mk_va = 0xBFEE0000UL;
+ static vm_map_address_t sweet_early_log_va = 0xBFFA0000UL;
++
++/* 0171: expose the proven panel alias to AppleCLCD::present(). */
++static uint64_t sweet_early_fb_pa = 0;
++vm_address_t sweet_fb_early_va(void) { return (vm_address_t)sweet_early_fb_va; }
++uint64_t sweet_fb_early_pa(void) { return sweet_early_fb_pa; }
++vm_size_t sweet_fb_early_size(void) { return (vm_size_t)(3 * ARM_TT_L2_SIZE); }
+ 
+ static void
+ sweet_early_map_final(boot_args *args)
+@@ -1861,5 +1868,6 @@
+ 	uint64_t block = fb & ~((uint64_t)ARM_TT_L2_SIZE - 1);
+ 	sweet_early_fb_va = va + (vm_map_address_t)(fb - block);
++	sweet_early_fb_pa = block;
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));

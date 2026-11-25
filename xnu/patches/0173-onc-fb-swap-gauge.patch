@@ -1,0 +1,65 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -613,8 +613,62 @@
+ 					}
+ 				}
+ 			}
+ 		}
++		/*
++		 * 0173: paint the present counter onto the panel itself
++		 * (sweetfb_gauge=1).  The log tells us what we *think* we copied;
++		 * this tells the camera what actually reached the glass:
++		 *
++		 *   y 4..19   eight 14x16 cells = bits 0..7 of the present count
++		 *   y 24..39  fixed 1,0,1,0 signature: proves the writer runs at all
++		 *
++		 * White cell = 1, black = 0.  A frozen counter and a missing
++		 * signature look completely different on a photo, which separates
++		 * "copy never happens" from "copy happens but the surface is blank".
++		 */
++		{
++			static int gauge = -1;
++			if (gauge < 0) {
++				uint32_t gv = 0;
++				gauge = PE_parse_boot_argn("sweetfb_gauge", &gv, sizeof(gv)) ? (int)gv : 0;
++				if (gauge) {
++					IOLog("SWEET FB: gauge on (panel %d bpp, stride %d)
++",
++					    fPanelBpp * 8, fRowBytes);
++				}
++			}
++			if (gauge && fPixels != 0) {
++				static uint32_t stamp = 0;
++				uint8_t *base = (uint8_t *)fPixels;
++				uint32_t bits = ++stamp;
++
++				for (int cell = 0; cell < 12; cell++) {
++					int bit = (cell < 8) ? (int)((bits >> cell) & 1) : ((cell - 8) & 1);
++					uint8_t v = bit ? 0xff : 0x00;
++					int32_t x0 = 4 + cell * 16;
++					int32_t y0 = (cell < 8) ? 4 : 24;
++					if (x0 + 14 > fWidth) {
++						break;
++					}
++					for (int32_t yy = y0; yy < y0 + 16 && yy < fHeight; yy++) {
++						uint8_t *row = base + (uint64_t)yy * fRowBytes;
++						for (int32_t xx = x0; xx < x0 + 14; xx++) {
++							if (fPanelBpp == 3) {
++								row[xx * 3 + 0] = v;
++								row[xx * 3 + 1] = v;
++								row[xx * 3 + 2] = v;
++							} else {
++								row[xx * 4 + 0] = v;
++								row[xx * 4 + 1] = v;
++								row[xx * 4 + 2] = v;
++								row[xx * 4 + 3] = 0xff;
++							}
++						}
++					}
++				}
++			}
++		}
+ 		s->release();
+ 	}
+ }
+ 

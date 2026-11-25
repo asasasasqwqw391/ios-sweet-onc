@@ -1,7 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fc6fce7..9010064 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -59,6 +59,17 @@
+@@ -59,6 +59,17 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -19,7 +20,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -237,6 +248,17 @@
+@@ -237,6 +248,17 @@ AppleCLCD::start(IOService *provider)
  		    (vm_size_t)round_page((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
  		fPanelMap = fPanelDesc != NULL ? fPanelDesc->map(kIOMapWriteCombineCache) : NULL;
  		fPixels = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
@@ -38,29 +39,27 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fWorkLoop = IOWorkLoop::workLoop();
  	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index b566970..f001d14 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1840,10 +1840,16 @@ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
- static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
- /*
-  * 4KB onc: alias VAs for the early-console log (0xBFFA0000) and the raw boot
-  * marker (0xBFEE0000) blocks; filled in by sweet_early_map_final().
-  */
+@@ -1871,6 +1871,12 @@ static vm_map_address_t sweet_early_fb_va = SWEET_EARLY_FB_VA;
  static vm_map_address_t sweet_early_mk_va = 0xBFEE0000UL;
  static vm_map_address_t sweet_early_log_va = 0xBFFA0000UL;
-+
+ 
 +/* 0171: expose the proven panel alias to AppleCLCD::present(). */
 +static uint64_t sweet_early_fb_pa = 0;
 +vm_address_t sweet_fb_early_va(void) { return (vm_address_t)sweet_early_fb_va; }
 +uint64_t sweet_fb_early_pa(void) { return sweet_early_fb_pa; }
 +vm_size_t sweet_fb_early_size(void) { return (vm_size_t)(3 * ARM_TT_L2_SIZE); }
- 
++
  static void
  sweet_early_map_final(boot_args *args)
-@@ -1861,5 +1868,6 @@
+ {
+@@ -1894,6 +1900,7 @@ sweet_early_map_final(boot_args *args)
+ 		fb = args->Video.v_baseAddr;
+ 	}
  	uint64_t block = fb & ~((uint64_t)ARM_TT_L2_SIZE - 1);
- 	sweet_early_fb_va = va + (vm_map_address_t)(fb - block);
 +	sweet_early_fb_pa = block;
- 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
- 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
- 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ #if defined(ONC_SWEET_4K)
+ 	sweet_early_fb_va = va + (2 * ARM_TT_L2_SIZE) + (vm_map_address_t)(fb - block);
+ #else

@@ -1,0 +1,56 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -678,8 +678,24 @@
+ 			if (gauge && fPixels != 0) {
+ 				static uint32_t stamp = 0;
+ 				uint8_t *base = (uint8_t *)fPixels;
+ 				uint32_t bits = ++stamp;
++				uint32_t before[3] = { 0, 0, 0 };
++
++				/*
++				 * 0176: read the panel back.  "write landed in memory but
++				 * the LCD still shows something else" and "the write never
++				 * reached memory" need completely different fixes, and the
++				 * camera cannot tell them apart.
++				 */
++				for (int i = 0; i < 3; i++) {
++					const volatile uint8_t *p = base + (uint64_t)(4 + i * 8) * fRowBytes;
++					if (fPanelBpp == 3) {
++						before[i] = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
++					} else {
++						before[i] = *(const volatile uint32_t *)(const void *)p;
++					}
++				}
+ 
+ 				/*
+ 				 * 0174: the 14x16 cells of 0173 are ~4 photo pixels wide on
+ 				 * a 1280x720 camera and cannot be read.  Use whole-width
+@@ -721,8 +737,28 @@
+ 							row[xx * 4 + 1] = 0;
+ 							row[xx * 4 + 2] = 0;
+ 							row[xx * 4 + 3] = 0xff;
+ 						}
++					}
++				}
++				{
++					static uint32_t rl;
++					if (rl < 12) {
++						uint32_t after[3] = { 0, 0, 0 };
++						for (int i = 0; i < 3; i++) {
++							const volatile uint8_t *p = base + (uint64_t)(4 + i * 8) * fRowBytes;
++							if (fPanelBpp == 3) {
++								after[i] = (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
++							} else {
++								after[i] = *(const volatile uint32_t *)(const void *)p;
++							}
++						}
++						rl++;
++						IOLog("SWEET FB: RDBK n=%u va=0x%llx stride=%d bpp=%d "
++						    "before %06x %06x %06x after %06x %06x %06x\n",
++						    bits, (unsigned long long)fPixels, fRowBytes, fPanelBpp,
++						    before[0], before[1], before[2],
++						    after[0], after[1], after[2]);
+ 					}
+ 				}
+ 			}
+ 		}

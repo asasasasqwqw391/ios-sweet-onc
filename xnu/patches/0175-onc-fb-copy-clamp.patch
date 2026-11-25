@@ -1,0 +1,52 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -559,10 +559,48 @@
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
++		    s->memory == NULL) {
+ 			src = 0;
++		} else if (last > s->memory->getLength()) {
++			/*
++			 * 0175: the surface descriptor's length is often just
++			 * width*height*4, while bytesPerRow carries padding
++			 * (4608 vs 4500, 4544 vs 4500).  Comparing the last byte
++			 * of the *padded* layout against that length rejects every
++			 * frame, so nothing was ever copied and the panel kept
++			 * whatever iBoot left there.  Clamp the row count to what
++			 * the descriptor really holds instead of dropping the frame.
++			 */
++			uint64_t avail = s->memory->getLength();
++			uint64_t first = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			uint64_t room = avail > first ? avail - first : 0;
++			uint64_t rowneed = (uint64_t)w * 4;
++			int32_t maxh = 0;
++
++			if (s->bytesPerRow != 0 && room >= rowneed) {
++				maxh = (int32_t)((room - rowneed) / s->bytesPerRow) + 1;
++			}
++			if (maxh <= 0) {
++				src = 0;
++			} else if (h > maxh) {
++				h = maxh;
++			}
++			{
++				static uint32_t clamp_logged;
++				if (clamp_logged < 8) {
++					clamp_logged++;
++					IOLog("SWEET FB: COPYCLAMP id=%u h %d max %d bpr %llu "
++					    "off %llu len %llu last %llu alloc %llu\n",
++					    id, (int)(get32(b, 12)), (int)maxh,
++					    (unsigned long long)s->bytesPerRow,
++					    (unsigned long long)s->offset,
++					    (unsigned long long)avail,
++					    (unsigned long long)last,
++					    (unsigned long long)s->allocSize);
++				}
++			}
+ 		}
+ 
+ 		/* 0162: sweetfb_copydiag=N -- log the copy gate.  If src is cleared
+ 		 * here the surface has pixels but never reaches the panel.

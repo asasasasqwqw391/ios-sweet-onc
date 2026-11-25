@@ -1,0 +1,31 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -56,8 +56,9 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <vm/pmap.h>
+ #include <sys/proc.h>
+ 
+ /*
+  * 0171: the boot-time framebuffer alias built by sweet_early_map_final() is
+@@ -757,11 +758,16 @@
+ 							extern "C" vm_offset_t sweet_vc_fb_va(void);
+ 							static uint32_t vcl;
+ 							if (vcl < 3) {
+ 								vcl++;
+-								IOLog("SWEET FB: VCFB console va=0x%llx panel va=0x%llx\n",
++								IOLog("SWEET FB: VCFB console va=0x%llx pa=0x%llx "
++								    "panel va=0x%llx pa=0x%llx\n",
+ 								    (unsigned long long)sweet_vc_fb_va(),
+-								    (unsigned long long)sweet_fb_early_va());
++								    (unsigned long long)pmap_find_phys(kernel_pmap,
++								    (addr64_t)sweet_vc_fb_va()),
++								    (unsigned long long)sweet_fb_early_va(),
++								    (unsigned long long)pmap_find_phys(kernel_pmap,
++								    (addr64_t)sweet_fb_early_va()));
+ 							}
+ 						}
+ 						IOLog("SWEET FB: RDBK n=%u va=0x%llx stride=%d bpp=%d "
+ 						    "before %06x %06x %06x after %06x %06x %06x\n",

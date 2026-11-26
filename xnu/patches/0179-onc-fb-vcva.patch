@@ -1,0 +1,119 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,8 +68,9 @@
+ extern "C" vm_address_t sweet_fb_early_va(void);
+ extern "C" uint64_t sweet_fb_early_pa(void);
+ extern "C" vm_size_t sweet_fb_early_size(void);
+ extern "C" vm_offset_t sweet_vc_fb_va(void);   /* 0177: video console fb VA */
++static uintptr_t sweet_panel_dst(uintptr_t fallback);   /* 0179 */
+ extern "C" unsigned int pmap_find_phys(void *map, unsigned long long va);  /* returns ppnum_t */
+ #define SWEET_PA(v) (((uint64_t)pmap_find_phys((void *)kernel_pmap, (unsigned long long)(v))) << 12)
+ #define SWEET_FB_EARLY_BLOCK 0x200000ULL
+ 
+@@ -321,9 +322,9 @@
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				uint8_t *row = (uint8_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				uint8_t *row = (uint8_t *)(sweet_panel_dst(fb->fPixels) + (uint64_t)y * fb->fRowBytes);
+ 				if (fb->fPanelBpp == 4) {
+ 					volatile uint32_t *row32 = (volatile uint32_t *)row;
+ 					for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 						row32[x] = step < 6 ? (row32[x] >> 1) & 0x7f7f7f7f : 0;
+@@ -406,12 +407,49 @@
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++/*
++ * 0179: which kernel address do we actually write the panel through?
++ *
++ * The video console writes through vinfo.v_baseaddr, a mapping built by
++ * ml_io_map_unmappable(), and those writes demonstrably reach the glass.
++ * The 0171 alias resolves to the same physical page (proved by logging both
++ * page numbers) but nothing written through it ever appeared on the panel.
++ * The remaining difference is the memory attributes: the alias block is built
++ * with CACHE_ATTRINDX_WRITECOMB, so the stores can stay in the cache -- our
++ * own read-back sees them, DRAM keeps the old bytes, and the display
++ * controller scans the old bytes.  sweetfb_vcva=1 (default) makes every
++ * panel write go through the console's mapping instead.
++ */
++static uintptr_t
++sweet_panel_dst(uintptr_t fallback)
++{
++	static int usevc = -1;
++
++	if (usevc < 0) {
++		uint32_t v = 1;
++
++		usevc = PE_parse_boot_argn("sweetfb_vcva", &v, sizeof(v)) ? (int)v : 1;
++		IOLog("SWEET FB: vcva=%d console va=0x%llx alias va=0x%llx\n",
++		    usevc, (unsigned long long)sweet_vc_fb_va(),
++		    (unsigned long long)sweet_fb_early_va());
++	}
++	if (usevc) {
++		vm_offset_t vc = sweet_vc_fb_va();
++
++		if (vc != 0) {
++			return (uintptr_t)vc;
++		}
++	}
++	return fallback;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uintptr_t dst = sweet_panel_dst(fPixels);
+ 
+ 	/*
+ 	 * SWEET: sweetfb_swaplog=N prints the first N swap records' layer mask
+ 	 * and per-layer surface ids, temporarily lifting the console mute so
+@@ -633,18 +671,18 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			if (fPanelBpp == 4) {
+ 				for (int32_t y = 0; y < h; y++) {
+-					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					memcpy((void *)(dst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 					    (size_t)w * 4);
+ 				}
+ 			} else {
+ 				/* BGRA surface -> RGB888 panel: 4 bytes in, 3 bytes out. */
+ 				for (int32_t y = 0; y < h; y++) {
+ 					const uint8_t *sp = (const uint8_t *)(src + s->offset +
+ 					    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
+-					uint8_t *dp = (uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
++					uint8_t *dp = (uint8_t *)(dst + (uint64_t)(dy + y) * fRowBytes +
+ 					    (uint64_t)dx * 3);
+ 					for (int32_t x = 0; x < w; x++) {
+ 						dp[0] = sp[2];
+ 						dp[1] = sp[1];
+@@ -677,11 +715,11 @@
+ 					IOLog("SWEET FB: gauge on (panel %d bpp, stride %d)\n",
+ 					    fPanelBpp * 8, fRowBytes);
+ 				}
+ 			}
+-			if (gauge && fPixels != 0) {
++			if (gauge && dst != 0) {
+ 				static uint32_t stamp = 0;
+-				uint8_t *base = (uint8_t *)fPixels;
++				uint8_t *base = (uint8_t *)dst;
+ 				uint32_t bits = ++stamp;
+ 				uint32_t before[3] = { 0, 0, 0 };
+ 
+ 				/*
+@@ -769,9 +807,9 @@
+ 							}
+ 						}
+ 						IOLog("SWEET FB: RDBK n=%u va=0x%llx stride=%d bpp=%d "
+ 						    "before %06x %06x %06x after %06x %06x %06x\n",
+-						    bits, (unsigned long long)fPixels, fRowBytes, fPanelBpp,
++						    bits, (unsigned long long)dst, fRowBytes, fPanelBpp,
+ 						    before[0], before[1], before[2],
+ 						    after[0], after[1], after[2]);
+ 					}
+ 				}

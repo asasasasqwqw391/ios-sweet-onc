@@ -1,0 +1,115 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,4 @@
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/SweetAccel.cpp                                 optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,21 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorESLegacy;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorESLegacy;"
++    "   },"
++    "   {"
++    "     'IOClass'         = AGXAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AGXAccelerator;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccel.cpp
+@@ -0,0 +1,81 @@
++/*
++ * Minimal fake GPU accelerator services for SWEET.
++ *
++ * backboardd polls IOServiceMatching("IOAcceleratorES") hundreds of times per
++ * boot (also IOAcceleratorESLegacy / AGXAccelerator). On real iOS these are
++ * the AGX/IOGPU drivers that CoreAnimation's render server uses to composite
++ * layer trees into the fullscreen IOSurface. With no GPU kext at all, CA
++ * never even reaches its CPU sw_renderer() fallback and the framebuffer stays
++ * black while SpringBoard's own UI surfaces do contain pixels.
++ *
++ * Publish empty accelerator services so the matches succeed. Metal's device
++ * discovery (_MTLRegisterDevices) reads MetalPluginName and tries to load a
++ * plugin bundle; with no bundle present it falls back, and QuartzCore should
++ * select CA::WindowServer::Server::sw_renderer() (CPU raster) to draw.
++ *
++ * Every registration is logged so we can confirm the match actually fires.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSString.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++	/* Empty plugin name: let Metal discovery fall back to CPU renderer. */
++	setProperty("MetalPluginName", "");
++	setProperty("MetalPluginClassName", "");
++	registerService();
++	IOLog("SWEET ACCEL: IOAcceleratorES registered\n");
++	return true;
++}
++
++class IOAcceleratorESLegacy : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorESLegacy);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IOAcceleratorESLegacy, IOService);
++
++bool
++IOAcceleratorESLegacy::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++	setProperty("MetalPluginName", "");
++	setProperty("MetalPluginClassName", "");
++	registerService();
++	IOLog("SWEET ACCEL: IOAcceleratorESLegacy registered\n");
++	return true;
++}
++
++class AGXAccelerator : public IOService {
++	OSDeclareDefaultStructors(AGXAccelerator);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AGXAccelerator, IOService);
++
++bool
++AGXAccelerator::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++	setProperty("MetalPluginName", "");
++	setProperty("MetalPluginClassName", "");
++	registerService();
++	IOLog("SWEET ACCEL: AGXAccelerator registered\n");
++	return true;
++}
++
++#endif /* SWEET */

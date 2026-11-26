@@ -1,0 +1,41 @@
+0183-onc-ca-force-timer -- inject CA_FORCE_TIMER=1 into backboardd.
+
+CoreAnimation's render server only runs render_update/present on vsync-driven
+updates. Our IOMFB stand-in's vsync scheduling is incomplete, so after a few
+early swaps the present loop stalls (sys184: swaps 1/2/5/9/10/11 then nothing).
+QuartzCore's CA_FORCE_TIMER=1 (verified in the 16.7 binary, ca_renderer_analysis.md
+E2) bypasses VBL-driven updates and drives continuous rendering from a timer.
+Inject it into backboardd at exec time using the 0164/0170 exec_add_user_string
+path. Harmless for other processes (only QuartzCore-linked code reads it).
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5866,6 +5866,28 @@
+ 				goto bad;
+ 			}
+ 		}
++
++		/* 0183: CA_FORCE_TIMER=1 for backboardd -- drive render updates
++		 * from a timer instead of VBL/vsync (our IOMFB vsync is incomplete). */
++		if (imgp->ip_ndp != NULL) {
++			const char *pname = imgp->ip_ndp->ni_cnd.cn_nameptr;
++			size_t plen = (size_t)imgp->ip_ndp->ni_cnd.cn_namelen;
++			static const char caf[] = "CA_FORCE_TIMER=1";
++			static const char bb[] = "backboardd";
++			if (plen == sizeof(bb) - 1 && strncmp(pname, bb, plen) == 0) {
++				if (imgp->ip_argspace < new_ptr_size) {
++					error = E2BIG;
++					goto bad;
++				}
++				imgp->ip_argspace -= new_ptr_size;
++				imgp->ip_envc++;
++				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(caf), UIO_SYSSPACE, TRUE);
++				printf("SWEET exec: backboardd gets CA_FORCE_TIMER=1\n");
++				if (error) {
++					goto bad;
++				}
++			}
++		}
+ 	}
+ 
+ 	/* Save space for envv[] NULL terminator */

@@ -1,0 +1,35 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -952,8 +952,32 @@
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			int keepon;
++
++			/*
++			 * 0180: sweetfb_keepon=1 -- ignore "display off".  backboardd
++			 * blanks the panel a few minutes in (no user input ever
++			 * arrives), which hid everything the GUI drew from the
++			 * camera.  Keeping it lit makes a 20 minute run photographable
++			 * end to end.
++			 */
++			{
++				static int keepon_cached = -1;
++
++				if (keepon_cached < 0) {
++					uint32_t v = 0;
++
++					keepon_cached = PE_parse_boot_argn("sweetfb_keepon", &v,
++					    sizeof(v)) ? (int)v : 0;
++				}
++				keepon = keepon_cached;
++			}
++			if (keepon && off) {
++				IOLog("SWEET FB: display off suppressed (keepon)\n");
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;

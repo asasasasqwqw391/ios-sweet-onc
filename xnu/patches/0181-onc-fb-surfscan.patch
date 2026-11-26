@@ -1,0 +1,69 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -482,6 +482,66 @@
+ 	}
+ 
+ 
++	/*
++	 * 0181: sweetfb_surfscan=N -- every N present() calls, walk the live
++	 * surface table and print a 3x3 pixel signature for each surface.  This
++	 * tells whether SpringBoard's small UI surfaces (ids 4..8) actually
++	 * contain rendered pixels, or whether only backboardd's fullscreen
++	 * surfaces (2/3) exist and stay black.  Temporarily unmute console.
++	 */
++	{
++		static uint32_t scan_left = 0xffffffffu;
++		static uint32_t div = 0;
++		if (scan_left == 0xffffffffu) {
++			uint32_t v = 0;
++			scan_left = 0;
++			if (PE_parse_boot_argn("sweetfb_surfscan", &v, sizeof(v))) {
++				div = v;
++			}
++		}
++		if (div != 0 && (get32(rec, 0x50) % div) == 0 && scan_left < 8) {
++			scan_left++;
++			int saved = sweet_console_muted;
++			sweet_console_muted = 0;
++			IOLog("SWEET FB: SURFSCAN swap=%u begin\n", get32(rec, 0x50));
++			for (uint32_t sid = 1; sid < 24; sid++) {
++				SweetSurface *ds = sweet_surface_copy(sid);
++				if (ds == NULL) continue;
++				uintptr_t dsrc = ds->kernelAddress();
++				uint32_t uniq = 0;
++				uint32_t cols[9];
++				for (uint32_t i = 0; i < 9; i++) cols[i] = 0xdeadbeef;
++				if (dsrc != 0 && ds->width > 0 && ds->height > 0 && ds->bytesPerRow > 0) {
++					uint32_t bpe = ds->bytesPerElement ? ds->bytesPerElement : 4;
++					for (uint32_t gy = 0; gy < 3; gy++) {
++						for (uint32_t gx = 0; gx < 3; gx++) {
++							uint32_t px = (uint32_t)(((uint64_t)gx * (ds->width - 1)) / 2);
++							uint32_t py = (uint32_t)(((uint64_t)gy * (ds->height - 1)) / 2);
++							uint64_t off = (uint64_t)ds->offset + (uint64_t)py * ds->bytesPerRow + (uint64_t)px * bpe;
++							uint32_t v = (bpe == 2)
++							    ? *(const uint16_t *)(dsrc + off)
++							    : *(const uint32_t *)(dsrc + off);
++							cols[gy * 3 + gx] = v;
++						}
++					}
++					for (uint32_t i = 0; i < 9; i++) {
++						bool seen = false;
++						for (uint32_t j = 0; j < i; j++) if (cols[j] == cols[i]) { seen = true; break; }
++						if (!seen) uniq++;
++					}
++				}
++				IOLog("SWEET FB: SURFSCAN id=%u %ux%u fmt=0x%x bpe=%u bpr=%u size=%u uniq=%u "
++				    "%08x %08x %08x | %08x %08x %08x | %08x %08x %08x\n",
++				    ds->id, ds->width, ds->height, ds->pixelFormat, ds->bytesPerElement,
++				    ds->bytesPerRow, ds->allocSize, uniq,
++				    cols[0],cols[1],cols[2],cols[3],cols[4],cols[5],cols[6],cols[7],cols[8]);
++				ds->release();
++			}
++			IOLog("SWEET FB: SURFSCAN swap=%u end\n", get32(rec, 0x50));
++			sweet_console_muted = saved;
++		}
++	}
++
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
